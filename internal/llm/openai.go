@@ -466,13 +466,23 @@ func convertMessagesToOpenAI(messages []Message, system string) []openaiMessage 
                         Role: string(msg.Role),
                 }
 
+                // Normalize content to []ContentBlock (handles []any from JSON deserialization)
+                var blocks []ContentBlock
                 switch c := msg.Content.(type) {
                 case string:
                         oaiMsg.Content = c
                 case []ContentBlock:
+                        blocks = c
+                case []any:
+                        blocks = AsTextBlocks(c)
+                default:
+                        oaiMsg.Content = c
+                }
+
+                if blocks != nil {
                         var textParts []string
                         var toolCalls []openaiToolCall
-                        for _, block := range c {
+                        for _, block := range blocks {
                                 switch block.Type {
                                 case "text":
                                         textParts = append(textParts, block.Text)
@@ -504,8 +514,6 @@ func convertMessagesToOpenAI(messages []Message, system string) []openaiMessage 
                                         continue
                                 }
                         }
-                default:
-                        oaiMsg.Content = c
                 }
 
                 oaiMessages = append(oaiMessages, oaiMsg)
