@@ -393,20 +393,52 @@ func (m replModel) View() string {
                 endIdx = totalHeight
         }
 
-        // Build visible content
+        // Build visible content with scrollbar
         var b strings.Builder
-        for i := startIdx; i < endIdx; i++ {
-                b.WriteString(contentLines[i])
-                if i < endIdx-1 {
+        showScrollbar := totalHeight > viewportHeight
+        var thumbStart, thumbEnd int
+        if showScrollbar {
+                // Thumb height proportional to viewport/content ratio, min 1
+                thumbHeight := viewportHeight * viewportHeight / totalHeight
+                if thumbHeight < 1 {
+                        thumbHeight = 1
+                }
+                // Thumb position based on scroll offset
+                var ratio float64
+                if maxScroll > 0 {
+                        ratio = float64(m.scrollY) / float64(maxScroll)
+                }
+                thumbStart = int(ratio * float64(viewportHeight-thumbHeight))
+                thumbEnd = thumbStart + thumbHeight
+                if thumbEnd > viewportHeight {
+                        thumbEnd = viewportHeight
+                        thumbStart = thumbEnd - thumbHeight
+                }
+        }
+        scrollbarTrackStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+        scrollbarThumbStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("251"))
+        for row := 0; row < viewportHeight; row++ {
+                lineIdx := startIdx + row
+                if lineIdx < totalHeight {
+                        b.WriteString(contentLines[lineIdx])
+                }
+                if showScrollbar {
+                        if row >= thumbStart && row < thumbEnd {
+                                b.WriteString(scrollbarThumbStyle.Render("█"))
+                        } else {
+                                b.WriteString(scrollbarTrackStyle.Render("│"))
+                        }
+                }
+                if row < viewportHeight-1 {
                         b.WriteString("\n")
                 }
         }
 
-        // Scroll indicator
+        // Scroll indicator (text hint)
         if m.scrollY > 0 {
-                b.WriteString("\n" + systemStyle.Render("▲ scroll up (pgup/shift+up/home)"))
+                b.WriteString("\n" + systemStyle.Render("▲ pgup/shift+up/home"))
         } else if !m.atBottom && totalHeight > viewportHeight {
-                b.WriteString("\n" + systemStyle.Render("... scroll down (pgdown/shift+down/end)"))
+                b.WriteString("\n" + systemStyle.Render("▼ pgdown/shift+down/end"))
         }
 
         // Input prompt (always visible at bottom)
