@@ -1048,7 +1048,7 @@ func (m *replModel) renderBanner() string {
         logo := fmt.Sprintf("  ⚡ Cairn Code v%s", m.version)
         b.WriteString(border.Render("│"))
         b.WriteString(brandStyle.Bold(true).Render(logo))
-        b.WriteString(strings.Repeat(" ", innerWidth-len(logo)))
+        b.WriteString(strings.Repeat(" ", innerWidth-lipgloss.Width(logo)))
         b.WriteString(border.Render("│"))
         b.WriteString("\n")
 
@@ -1056,7 +1056,7 @@ func (m *replModel) renderBanner() string {
         tag := "  open terminal coding agent"
         b.WriteString(border.Render("│"))
         b.WriteString(systemStyle.Render(tag))
-        b.WriteString(strings.Repeat(" ", innerWidth-len(tag)))
+        b.WriteString(strings.Repeat(" ", innerWidth-lipgloss.Width(tag)))
         b.WriteString(border.Render("│"))
         b.WriteString("\n")
 
@@ -1069,11 +1069,11 @@ func (m *replModel) renderBanner() string {
         if m.agent != nil {
                 b.WriteString(border.Render("│"))
                 modelLine := fmt.Sprintf("  Model   %s / %s", m.agent.ProviderName(), m.agent.Model())
-                if len(modelLine) > innerWidth {
+                if lipgloss.Width(modelLine) > innerWidth {
                         modelLine = modelLine[:innerWidth-3] + "..."
                 }
                 b.WriteString(labelStyle.Render(modelLine))
-                b.WriteString(strings.Repeat(" ", innerWidth-len(modelLine)))
+                b.WriteString(strings.Repeat(" ", innerWidth-lipgloss.Width(modelLine)))
                 b.WriteString(border.Render("│"))
                 b.WriteString("\n")
         }
@@ -1081,11 +1081,11 @@ func (m *replModel) renderBanner() string {
         // Path line
         b.WriteString(border.Render("│"))
         pathLine := fmt.Sprintf("  Path    %s", m.workDir)
-        if len(pathLine) > innerWidth {
+        if lipgloss.Width(pathLine) > innerWidth {
                 pathLine = pathLine[:innerWidth-3] + "..."
         }
         b.WriteString(labelStyle.Render(pathLine))
-        b.WriteString(strings.Repeat(" ", innerWidth-len(pathLine)))
+        b.WriteString(strings.Repeat(" ", innerWidth-lipgloss.Width(pathLine)))
         b.WriteString(border.Render("│"))
         b.WriteString("\n")
 
