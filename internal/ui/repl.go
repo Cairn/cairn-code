@@ -201,7 +201,7 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                 m.input = ""
                         }
 
-                case "backspace", "ctrl+h":
+                case "backspace", "ctrl+h", "ctrl+?":
                         if m.cursor > 0 && m.cursor <= len(m.input) {
                                 m.input = m.input[:m.cursor-1] + m.input[m.cursor:]
                                 m.cursor--
