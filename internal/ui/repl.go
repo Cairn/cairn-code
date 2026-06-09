@@ -56,6 +56,7 @@ type replModel struct {
         streamingText string // text accumulating during streaming (rendered raw, no glamour yet)
         streamChunkCh  chan string          // channel for receiving streaming chunks from agent goroutine
         streamResultCh chan agentCompleteMsg // receives final agent result when goroutine finishes
+        agentCancel   context.CancelFunc    // cancels the agent goroutine context
         cursorBlink bool
         sessionDir string
         sessionID  string // current session ID for auto-save
@@ -245,7 +246,11 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                 return m, nil
                         }
                         if m.state == stateRunning {
-                                // Agent is running — quit immediately
+                                // Agent is running — cancel the goroutine and quit
+                                if m.agentCancel != nil {
+                                        m.agentCancel()
+                                }
+                                m.state = stateIdle
                                 m.quit = true
                                 return m, tea.Quit
                         }
@@ -279,6 +284,9 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         }
                         if m.showQuit {
                                 if m.quitChoice == 0 {
+                                        if m.agentCancel != nil {
+                                                m.agentCancel()
+                                        }
                                         m.quit = true
                                         return m, tea.Quit
                                 }
@@ -1413,9 +1421,13 @@ func (m replModel) runAgent(input string) tea.Cmd {
         resultCh := make(chan agentCompleteMsg, 1)
 
         return func() tea.Msg {
-                // Store channels in model for polling
+                // Create cancellable context for the agent goroutine
+                agentCtx, agentCancel := context.WithCancel(context.Background())
+
+                // Store channels and cancel func on model
                 m.streamChunkCh = chunkCh
                 m.streamResultCh = resultCh
+                m.agentCancel = agentCancel
 
                 // Start agent in background goroutine
                 go func() {
@@ -1475,7 +1487,7 @@ func (m replModel) runAgent(input string) tea.Cmd {
 
                         a := m.agent
                         a.SetCallbacks(cb)
-                        agentErr := a.Run(context.Background(), input)
+                        agentErr := a.Run(agentCtx, input)
 
                         resultCh <- agentCompleteMsg{
                                 output: collectedOutput,
