@@ -50,6 +50,9 @@ type replModel struct {
         spinner    int
         sessionDir string
         sessionID  string // current session ID for auto-save
+        scrollY    int     // current scroll offset (0 = bottom, newest)
+        maxViewY   int     // total rendered height of output
+        atBottom   bool    // whether viewport is at the bottom
 }
 
 var (
@@ -85,7 +88,7 @@ var (
 )
 
 // NewREPL creates a new REPL model.
-func NewREPL(a *agent.Agent, sessionDir string) replModel {
+func NewREPL(a *agent.Agent, sessionDir string) *replModel {
         renderer, err := glamour.NewTermRenderer(
                 glamour.WithAutoStyle(),
                 glamour.WithEmoji(),
@@ -94,27 +97,36 @@ func NewREPL(a *agent.Agent, sessionDir string) replModel {
                 renderer = nil
         }
 
-        return replModel{
+        return &replModel{
                 agent:      a,
                 state:      stateIdle,
                 histIdx:    -1,
                 renderer:   renderer,
                 sessionDir: sessionDir,
+                atBottom:   true,
         }
 }
 
 // Init initializes the model.
-func (m replModel) Init() tea.Cmd {
+func (m *replModel) Init() tea.Cmd {
         return tickSpinner()
 }
 
 // Update handles messages.
-func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         switch msg := msg.(type) {
         case tea.WindowSizeMsg:
                 m.width = msg.Width
                 m.height = msg.Height
                 return m, nil
+
+        case tea.MouseMsg:
+                switch msg.Type {
+                case tea.MouseWheelUp:
+                        m.scrollUp(3)
+                case tea.MouseWheelDown:
+                        m.scrollDown(3)
+                }
 
         case tea.KeyMsg:
                 switch msg.String() {
@@ -126,6 +138,18 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         }
                         m.quit = true
                         return m, tea.Quit
+
+                // Scrolling keys
+                case "pgup", "shift+up":
+                        m.scrollUp(m.height / 2)
+                case "pgdown", "shift+down":
+                        m.scrollDown(m.height / 2)
+                case "home":
+                        m.scrollY = m.maxViewY
+                        m.atBottom = false
+                case "end":
+                        m.scrollY = 0
+                        m.atBottom = true
 
                 case "enter":
                         if m.state == stateRunning {
@@ -292,46 +316,120 @@ func (m replModel) View() string {
                 return ""
         }
 
-        var b strings.Builder
+        // Render all output into full content
+        var content strings.Builder
 
         // Title
-        b.WriteString(titleStyle.Render("⚡ Cairn Code"))
+        content.WriteString(titleStyle.Render("⚡ Cairn Code"))
         if m.agent != nil {
-                b.WriteString(systemStyle.Render(fmt.Sprintf("  [%s / %s]", m.agent.ProviderName(), m.agent.Model())))
+                content.WriteString(systemStyle.Render(fmt.Sprintf("  [%s / %s]", m.agent.ProviderName(), m.agent.Model())))
         }
         if m.sessionID != "" {
-                b.WriteString(systemStyle.Render(fmt.Sprintf("  session: %s", m.sessionID[:8])))
+                content.WriteString(systemStyle.Render(fmt.Sprintf("  session: %s", m.sessionID[:8])))
         }
-        b.WriteString("\n\n")
+        content.WriteString("\n\n")
 
         // Output
         for _, line := range m.output {
-                b.WriteString(m.renderOutputLine(line))
+                content.WriteString(m.renderOutputLine(line))
         }
 
         // Spinner if running
         if m.state == stateRunning {
-                b.WriteString(fmt.Sprintf("%s Thinking...\n", spinnerChars[m.spinner]))
+                content.WriteString(fmt.Sprintf("%s Thinking...\n", spinnerChars[m.spinner]))
         }
 
         // Usage summary
         if m.totalUsage.InputTokens > 0 {
-                b.WriteString(usageStyle.Render(fmt.Sprintf(
+                content.WriteString(usageStyle.Render(fmt.Sprintf(
                         "\nTokens: %d in, %d out",
                         m.totalUsage.InputTokens,
                         m.totalUsage.OutputTokens,
                 )))
-                b.WriteString("\n")
+                content.WriteString("\n")
         }
 
-        // Input prompt
+        fullContent := content.String()
+        contentLines := strings.Split(fullContent, "\n")
+        // Remove trailing empty line from final newline
+        if len(contentLines) > 0 && contentLines[len(contentLines)-1] == "" {
+                contentLines = contentLines[:len(contentLines)-1]
+        }
+
+        // Calculate viewport height (leave room for header line + input line + padding)
+        viewportHeight := m.height - 4
+        if viewportHeight < 1 {
+                viewportHeight = 1
+        }
+
+        totalHeight := len(contentLines)
+
+        // Auto-scroll to bottom when new output arrives and user is at bottom
+        if m.atBottom || m.scrollY < 0 {
+                m.scrollY = 0
+                m.atBottom = true
+        }
+
+        // Clamp scrollY
+        maxScroll := totalHeight - viewportHeight
+        if maxScroll < 0 {
+                maxScroll = 0
+        }
+        if m.scrollY > maxScroll {
+                m.scrollY = maxScroll
+        }
+        m.maxViewY = maxScroll
+
+        // Determine visible window
+        // scrollY=0 means bottom (newest), scrollY=maxScroll means top (oldest)
+        startIdx := totalHeight - viewportHeight - m.scrollY
+        if startIdx < 0 {
+                startIdx = 0
+        }
+        endIdx := startIdx + viewportHeight
+        if endIdx > totalHeight {
+                endIdx = totalHeight
+        }
+
+        // Build visible content
+        var b strings.Builder
+        for i := startIdx; i < endIdx; i++ {
+                b.WriteString(contentLines[i])
+                if i < endIdx-1 {
+                        b.WriteString("\n")
+                }
+        }
+
+        // Scroll indicator
+        if m.scrollY > 0 {
+                b.WriteString("\n" + systemStyle.Render("▲ scroll up (pgup/shift+up/home)"))
+        } else if !m.atBottom && totalHeight > viewportHeight {
+                b.WriteString("\n" + systemStyle.Render("... scroll down (pgdown/shift+down/end)"))
+        }
+
+        // Input prompt (always visible at bottom)
         if !m.quit {
+                b.WriteString("\n")
                 b.WriteString(promptStyle.Render("⟩ "))
                 b.WriteString(m.input)
-                b.WriteString("\n")
         }
 
         return b.String()
+}
+
+// scrollUp moves the viewport toward older content (increases scrollY).
+func (m *replModel) scrollUp(amount int) {
+        m.scrollY += amount
+        m.atBottom = false
+}
+
+// scrollDown moves the viewport toward newer content (decreases scrollY).
+func (m *replModel) scrollDown(amount int) {
+        m.scrollY -= amount
+        if m.scrollY <= 0 {
+                m.scrollY = 0
+                m.atBottom = true
+        }
 }
 
 // renderOutputLine renders a single output line.
@@ -395,7 +493,7 @@ func (m *replModel) renderOutputLine(line OutputLine) string {
 }
 
 // handleCommand processes slash commands.
-func (m replModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
+func (m *replModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
         parts := strings.Fields(cmd)
         if len(parts) == 0 {
                 return m, nil
