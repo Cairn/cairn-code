@@ -136,6 +136,7 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
                         input := strings.TrimSpace(m.input)
                         m.input = ""
+                        m.cursor = 0
 
                         // Handle commands
                         if strings.HasPrefix(input, "/") {
