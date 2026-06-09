@@ -153,7 +153,6 @@ var (
                 {"/resume", "Resume a session"},
                 {"/sessions", "List saved sessions"},
                 {"/tools", "List available tools"},
-                {"/quit", "Exit application"},
                 {"/exit", "Exit application"},
         }
 )
@@ -1250,7 +1249,7 @@ func (m *replModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
                 })
                 return m, nil
 
-        case "/quit", "/exit", "/q":
+        case "/exit", "/q":
                 m.quit = true
                 return m, tea.Quit
 
