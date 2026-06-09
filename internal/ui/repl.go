@@ -154,9 +154,9 @@ func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                 Content: input,
                         })
 
-                        // Run agent
+                        // Run agent (with spinner)
                         m.state = stateRunning
-                        return m, m.runAgent(input)
+                        return m, tea.Sequence(m.runAgent(input), tickSpinner())
 
                 case "up":
                         if m.histIdx > 0 {
@@ -435,7 +435,7 @@ Available commands:
 
         case "/compact":
                 m.state = stateRunning
-                return m, m.runCompact()
+                return m, tea.Sequence(m.runCompact(), tickSpinner())
 
         case "/model":
                 if len(parts) > 1 {
@@ -478,11 +478,11 @@ Available commands:
                         resumeID = parts[1]
                 }
                 m.state = stateRunning
-                return m, m.resumeSession(resumeID)
+                return m, tea.Sequence(m.resumeSession(resumeID), tickSpinner())
 
         case "/sessions":
                 m.state = stateRunning
-                return m, m.listSessions()
+                return m, tea.Sequence(m.listSessions(), tickSpinner())
 
         case "/tools":
                 m.output = append(m.output, OutputLine{
