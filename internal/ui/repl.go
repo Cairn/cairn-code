@@ -4,6 +4,8 @@ import (
         "context"
         "encoding/json"
         "fmt"
+        "html"
+        "regexp"
         "strings"
         "time"
 
@@ -441,7 +443,8 @@ func (m *replModel) renderOutputLine(line OutputLine) string {
         case "text":
                 rendered := line.Content
                 if m.renderer != nil {
-                        md, err := m.renderer.Render(line.Content)
+                        clean := stripHTMLTags(line.Content)
+                        md, err := m.renderer.Render(clean)
                         if err == nil {
                                 rendered = md
                         }
@@ -907,4 +910,32 @@ func indent(text, prefix string) string {
                 lines[i] = prefix + line
         }
         return strings.Join(lines, "\n")
+}
+
+// htmlTagRe matches HTML tags for stripping.
+var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
+
+// stripHTMLTags removes HTML tags from text, replacing common block elements
+// with newlines to preserve some structure.
+func stripHTMLTags(s string) string {
+        // Replace block-level closing tags with newlines
+        s = strings.ReplaceAll(s, "</p>", "\n")
+        s = strings.ReplaceAll(s, "</div>", "\n")
+        s = strings.ReplaceAll(s, "</li>", "\n")
+        s = strings.ReplaceAll(s, "<br>", "\n")
+        s = strings.ReplaceAll(s, "<br/>", "\n")
+        s = strings.ReplaceAll(s, "<br />", "\n")
+        s = strings.ReplaceAll(s, "</h1>", "\n")
+        s = strings.ReplaceAll(s, "</h2>", "\n")
+        s = strings.ReplaceAll(s, "</h3>", "\n")
+        s = strings.ReplaceAll(s, "</h4>", "\n")
+        s = strings.ReplaceAll(s, "</tr>", "\n")
+        // Replace <hr> with a divider
+        s = strings.ReplaceAll(s, "<hr>", "\n---\n")
+        s = strings.ReplaceAll(s, "<hr/>", "\n---\n")
+        // Strip all remaining HTML tags
+        s = htmlTagRe.ReplaceAllString(s, "")
+        // Unescape HTML entities
+        s = html.UnescapeString(s)
+        return s
 }
