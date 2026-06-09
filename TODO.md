@@ -2,7 +2,7 @@
 
 ## Priority: Critical
 - [x] Fix "stuck on thinking" bug — agent hangs during thinking step, suspected streaming channel lifecycle issue in non-streaming path (channels not closed properly)
-- [ ] Add comprehensive test suite — currently only 14 tests, need coverage for: UI spinner lifecycle, session replay, streaming drain, tool execution, error recovery, all tool implementations
+- [x] Add comprehensive test suite — currently only 14 tests, need coverage for: UI spinner lifecycle, session replay, streaming drain, tool execution, error recovery, all tool implementations
 
 ## Priority: High
 - [ ] Fix middleware.test.ts audit log failures — 3 tests fail with "Cannot use a closed database" in middleware.test.ts (note: this is Synapse CRM, reference for pattern)
