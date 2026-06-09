@@ -52,7 +52,6 @@ type replModel struct {
         quit       bool
         renderer   *glamour.TermRenderer
         spinner    int
-        spinnerDir int  // +1 forward, -1 backward (ping-pong)
         currentVerb string // picked once per turn, stays fixed (Claude Code style)
         cursorBlink bool
         sessionDir string
@@ -113,8 +112,8 @@ var (
         successStyle = lipgloss.NewStyle().
                         Foreground(lipgloss.Color("78")) // green ●
 
-        // Spinner: braille bounce pattern (ping-pong like Claude Code)
-        spinnerChars = []string{"⠂", "⠐", "⠄", "⠅", "⠆", "⠇", "⠈", "⠠", "⠠", "⠠"}
+        // Spinner: smooth braille wave pattern
+        spinnerChars = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
         // Playful spinner verbs (Claude Code style) — picked once per turn at random
         spinnerVerbs = []string{
@@ -208,7 +207,6 @@ func NewREPL(a *agent.Agent, sessionDir, workDir, version string) *replModel {
                 sessionDir: sessionDir,
                 workDir:    workDir,
                 version:    version,
-                spinnerDir: 1,
         }
 }
 
@@ -575,18 +573,7 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 m.totalUsage.CacheCreate += msg.usage.CacheCreate
 
         case spinnerTickMsg:
-                m.spinner += m.spinnerDir
-                if m.spinner >= len(spinnerChars)-1 {
-                        m.spinnerDir = -1
-                } else if m.spinner <= 0 {
-                        m.spinnerDir = 1
-                }
-                if m.spinner < 0 {
-                        m.spinner = 0
-                }
-                if m.spinner >= len(spinnerChars) {
-                        m.spinner = len(spinnerChars) - 1
-                }
+                m.spinner = (m.spinner + 1) % len(spinnerChars)
                 if m.state == stateRunning {
                         return m, tickSpinner()
                 }
