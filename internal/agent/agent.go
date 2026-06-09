@@ -116,10 +116,13 @@ func (a *Agent) Run(ctx context.Context, prompt string) error {
                                 assistantBlocks = append(assistantBlocks, block)
                         }
                 }
-                a.messages = append(a.messages, llm.Message{
-                        Role:    llm.RoleAssistant,
-                        Content: assistantBlocks,
-                })
+                // Only append if there's actual content — empty assistant messages cause API errors
+                if len(assistantBlocks) > 0 {
+                        a.messages = append(a.messages, llm.Message{
+                                Role:    llm.RoleAssistant,
+                                Content: assistantBlocks,
+                        })
+                }
 
                 // Process response (text display + tool execution)
                 hasToolUse := false

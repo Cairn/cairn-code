@@ -499,6 +499,10 @@ func convertMessagesToOpenAI(messages []Message, system string) []openaiMessage 
                                 if len(toolCalls) > 0 {
                                         oaiMsg.ToolCalls = toolCalls
                                 }
+                                // Skip empty assistant messages (no content, no tool_calls)
+                                if oaiMsg.Role == "assistant" && oaiMsg.Content == nil && len(oaiMsg.ToolCalls) == 0 {
+                                        continue
+                                }
                         }
                 default:
                         oaiMsg.Content = c
