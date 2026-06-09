@@ -71,6 +71,7 @@ func main() {
         registry.Register(tools.NewTodoWriteTool(todoStore))
         registry.Register(tools.NewWebSearchTool())
         registry.Register(tools.NewWebFetchTool())
+        registry.Register(tools.NewPullRequestTool())
 
         // Create agent
         ag := agent.NewAgent(provider, registry, cfg, todoStore)
