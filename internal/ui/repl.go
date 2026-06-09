@@ -56,6 +56,7 @@ type replModel struct {
         lastCtrlC  time.Time
         showQuit   bool   // whether quit confirmation is showing
         quitChoice int    // 0 = yes, 1 = no
+        cmdSelect  int    // selected index in command autocomplete
 }
 
 var (
@@ -88,7 +89,45 @@ var (
                         Foreground(lipgloss.Color("63"))
 
         spinnerChars = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+        // Command definitions for autocomplete
+        commands = []cmdDef{
+                {"/help", "Show help message"},
+                {"/clear", "Clear conversation history"},
+                {"/model", "Show or change model"},
+                {"/compact", "Compact conversation"},
+                {"/cost", "Show token usage"},
+                {"/provider", "Show current provider"},
+                {"/save", "Save session"},
+                {"/resume", "Resume a session"},
+                {"/sessions", "List saved sessions"},
+                {"/tools", "List available tools"},
+                {"/quit", "Exit application"},
+                {"/exit", "Exit application"},
+        }
 )
+
+type cmdDef struct {
+        name string
+        desc string
+}
+
+// filteredCommands returns commands matching the given prefix.
+func filteredCommands(prefix string) []cmdDef {
+        prefix = strings.ToLower(prefix)
+        var matches []cmdDef
+        for _, c := range commands {
+                if strings.HasPrefix(strings.ToLower(c.name), prefix) {
+                        matches = append(matches, c)
+                }
+        }
+        return matches
+}
+
+// showAutocomplete returns true if we should show the command palette.
+func (m *replModel) showAutocomplete() bool {
+        return strings.HasPrefix(m.input, "/") && !m.showQuit
+}
 
 // NewREPL creates a new REPL model.
 func NewREPL(a *agent.Agent, sessionDir string) *replModel {
@@ -156,6 +195,16 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                 m.showQuit = false
                                 return m, nil
                         }
+                        // Autocomplete: select command and execute
+                        if m.showAutocomplete() {
+                                matches := filteredCommands(m.input)
+                                if m.cmdSelect < len(matches) {
+                                        m.input = matches[m.cmdSelect].name + " "
+                                        m.cursor = len(m.input)
+                                        m.cmdSelect = 0
+                                        return m, nil
+                                }
+                        }
                         if m.state == stateRunning {
                                 return m, nil
                         }
@@ -163,6 +212,7 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         input := strings.TrimSpace(m.input)
                         m.input = ""
                         m.cursor = 0
+                        m.cmdSelect = 0
 
                         // Handle commands
                         if strings.HasPrefix(input, "/") {
@@ -188,6 +238,16 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         return m, tea.Batch(m.runAgent(input), tickSpinner())
 
                 case "up":
+                        if m.showAutocomplete() {
+                                matches := filteredCommands(m.input)
+                                if len(matches) > 0 {
+                                        m.cmdSelect--
+                                        if m.cmdSelect < 0 {
+                                                m.cmdSelect = len(matches) - 1
+                                        }
+                                }
+                                return m, nil
+                        }
                         if m.histIdx > 0 {
                                 m.histIdx--
                                 m.input = m.history[m.histIdx]
@@ -196,12 +256,33 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         }
 
                 case "down":
+                        if m.showAutocomplete() {
+                                matches := filteredCommands(m.input)
+                                if len(matches) > 0 {
+                                        m.cmdSelect++
+                                        if m.cmdSelect >= len(matches) {
+                                                m.cmdSelect = 0
+                                        }
+                                }
+                                return m, nil
+                        }
                         if m.histIdx < len(m.history)-1 {
                                 m.histIdx++
                                 m.input = m.history[m.histIdx]
                         } else {
                                 m.histIdx = len(m.history)
                                 m.input = ""
+                        }
+
+                case "tab":
+                        if m.showAutocomplete() {
+                                matches := filteredCommands(m.input)
+                                if m.cmdSelect < len(matches) {
+                                        m.input = matches[m.cmdSelect].name + " "
+                                        m.cursor = len(m.input)
+                                        m.cmdSelect = 0
+                                }
+                                return m, nil
                         }
 
                 case "backspace", "ctrl+h", "ctrl+?":
@@ -260,6 +341,13 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                 m.showQuit = false
                                 return m, nil
                         }
+                        // Dismiss autocomplete
+                        if m.showAutocomplete() {
+                                m.input = ""
+                                m.cursor = 0
+                                m.cmdSelect = 0
+                                return m, nil
+                        }
 
                 default:
                         // Insert character at cursor position (skip control chars)
@@ -270,6 +358,7 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                         m.input += msg.String()
                                 }
                                 m.cursor++
+                                m.cmdSelect = 0
                         }
                 }
 
@@ -379,9 +468,38 @@ func (m replModel) View() string {
                 content.WriteString("\n")
         }
 
-        // Input prompt with cursor
+        // Input prompt with cursor and autocomplete
         if !m.quit {
                 content.WriteString("\n")
+
+                // Command autocomplete dropdown
+                if m.showAutocomplete() {
+                        matches := filteredCommands(m.input)
+                        if len(matches) > 0 {
+                                if m.cmdSelect >= len(matches) {
+                                        m.cmdSelect = 0
+                                }
+                                dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+                                selectedStyle := promptStyle.Bold(true)
+                                for i, cmd := range matches {
+                                        if i == m.cmdSelect {
+                                                content.WriteString(selectedStyle.Render("  ▸ " + cmd.name))
+                                        } else {
+                                                content.WriteString(dimStyle.Render("    " + cmd.name))
+                                        }
+                                        // Pad description
+                                        desc := "  " + cmd.desc
+                                        // Truncate description to fit
+                                        maxDesc := 30
+                                        if len(desc) > maxDesc {
+                                                desc = desc[:maxDesc-3] + "..."
+                                        }
+                                        content.WriteString(dimStyle.Render(desc))
+                                        content.WriteString("\n")
+                                }
+                        }
+                }
+
                 content.WriteString(promptStyle.Render("⟩ "))
                 // Render input with cursor indicator
                 before := m.input[:m.cursor]
