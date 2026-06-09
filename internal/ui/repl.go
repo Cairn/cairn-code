@@ -97,7 +97,6 @@ var (
 
         // Command definitions for autocomplete
         commands = []cmdDef{
-                {"/help", "Show help message"},
                 {"/clear", "Clear conversation history"},
                 {"/model", "Show or change model"},
                 {"/compact", "Compact conversation"},
@@ -1027,27 +1026,6 @@ func (m *replModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
         }
 
         switch parts[0] {
-        case "/help", "/?":
-                helpText := `
-Available commands:
-  /help              Show this help message
-  /clear             Clear conversation history
-  /model [name]      Show or change the current model
-  /compact           Summarize and compact the conversation using the LLM
-  /cost              Show token usage summary
-  /provider          Show current provider
-  /save              Save current session to disk
-  /resume [id]       Resume a saved session (picks from list if no ID given)
-  /sessions          List all saved sessions
-  /tools             List available tools
-  /quit, /exit       Exit the application
-`
-                m.output = append(m.output, OutputLine{
-                        Type:    "system",
-                        Content: helpText,
-                })
-                return m, nil
-
         case "/clear":
                 m.agent.Reset()
                 m.totalUsage = llm.Usage{}
