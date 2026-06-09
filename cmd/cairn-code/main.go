@@ -19,7 +19,7 @@ import (
         "github.com/cairn/cairn-code/internal/ui"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 func main() {
         // Parse flags
@@ -131,10 +131,10 @@ func main() {
                                 fmt.Print(text)
                         },
                         OnToolUse: func(name string, input any) {
-                                fmt.Fprintf(os.Stderr, "▸ %s\n", name)
+                                fmt.Fprintf(os.Stderr, "● %s\n", name)
                         },
                         OnToolResult: func(name string, output string, duration time.Duration) {
-                                fmt.Fprintf(os.Stderr, "  ✓ %s (%.1fs)\n", name, duration.Seconds())
+                                fmt.Fprintf(os.Stderr, "● %s (%.1fs)\n", name, duration.Seconds())
                         },
                         OnPermission: func(tool string, input any) bool {
                                 return true // Auto-allow in print mode
@@ -162,8 +162,9 @@ func main() {
                 return
         }
 
-        // Interactive REPL mode — pass session dir to the REPL
-        p := tea.NewProgram(ui.NewREPL(ag, sessDir))
+        // Interactive REPL mode — pass session dir, working dir, and version to the REPL
+        workDir, _ := os.Getwd()
+        p := tea.NewProgram(ui.NewREPL(ag, sessDir, workDir, version))
         if _, err := p.Run(); err != nil {
                 fmt.Fprintf(os.Stderr, "Error: %v\n", err)
                 os.Exit(1)

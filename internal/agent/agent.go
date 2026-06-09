@@ -342,6 +342,11 @@ func (a *Agent) ProviderName() string {
         return a.provider.Name()
 }
 
+// ToolNames returns the names of all registered tools.
+func (a *Agent) ToolNames() []string {
+        return a.tools.Names()
+}
+
 // Compact summarizes the conversation history using the LLM and replaces it with a compact summary.
 func (a *Agent) Compact(ctx context.Context) error {
         if len(a.messages) == 0 {

@@ -5,6 +5,7 @@ import (
         "encoding/json"
         "fmt"
         "html"
+        "os/exec"
         "regexp"
         "strings"
         "time"
@@ -50,6 +51,7 @@ type replModel struct {
         quit       bool
         renderer   *glamour.TermRenderer
         spinner    int
+        spinnerDir int  // +1 forward, -1 backward (ping-pong)
         cursorBlink bool
         sessionDir string
         sessionID  string // current session ID for auto-save
@@ -57,6 +59,8 @@ type replModel struct {
         showQuit   bool   // whether quit confirmation is showing
         quitChoice int    // 0 = yes, 1 = no
         cmdSelect  int    // selected index in command autocomplete
+        workDir    string
+        version    string
         // Session picker
         showSessionPicker bool              // whether session picker is showing
         pickerSessions    []session.Session // sessions to pick from
@@ -65,17 +69,18 @@ type replModel struct {
 }
 
 var (
-        // Styles
+        // Styles — Claude Code inspired color palette
         promptStyle = lipgloss.NewStyle().
                         Bold(true).
-                        Foreground(lipgloss.Color("63")) // cyan-ish
+                        Foreground(lipgloss.Color("215")) // Claude orange
 
         userStyle = lipgloss.NewStyle().
                         Bold(true).
-                        Foreground(lipgloss.Color("221")) // warm yellow
+                        Foreground(lipgloss.Color("215")) // Claude orange for user messages
 
         toolNameStyle = lipgloss.NewStyle().
-                        Foreground(lipgloss.Color("6")) // cyan
+                        Bold(true).
+                        Foreground(lipgloss.Color("252")) // bright white for tool names
 
         toolResultStyle = lipgloss.NewStyle().
                         Foreground(lipgloss.Color("245")) // dim
@@ -91,10 +96,52 @@ var (
 
         titleStyle = lipgloss.NewStyle().
                         Bold(true).
-                        Foreground(lipgloss.Color("63"))
+                        Foreground(lipgloss.Color("215")) // Claude orange
 
-        spinnerChars = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+        brandStyle = lipgloss.NewStyle().
+                        Bold(true).
+                        Foreground(lipgloss.Color("215")) // Claude orange
 
+        dimBorderStyle = lipgloss.NewStyle().
+                        Foreground(lipgloss.Color("245")) // dim border
+
+        labelStyle = lipgloss.NewStyle().
+                        Foreground(lipgloss.Color("245")) // dim labels
+
+        successStyle = lipgloss.NewStyle().
+                        Foreground(lipgloss.Color("78")) // green ●
+
+        // Spinner: braille bounce pattern (ping-pong like Claude Code)
+        spinnerChars = []string{"⠂", "⠐", "⠄", "⠅", "⠆", "⠇", "⠈", "⠠", "⠠", "⠠"}
+
+        // Playful spinner verbs (Claude Code style)
+        spinnerVerbs = []string{
+                "Thinking", "Clauding", "Cogitating", "Crafting", "Analyzing",
+                "Reasoning", "Deliberating", "Reflecting", "Processing", "Computing",
+                "Exploring", "Investigating", "Synthesizing", "Constructing", "Pondering",
+                "Examining", "Evaluating", "Generating", "Assembling", "Navigating",
+                "Researching", "Resolving", "Orchestrating", "Optimizing", "Refining",
+                "Brainstorming", "Architecting", "Implementing", "Tracing", "Modeling",
+        }
+
+        toolDescriptions = map[string]string{
+                "bash":               "shell command",
+                "file_read":          "read file",
+                "file_write":         "write file",
+                "file_edit":          "edit file",
+                "git":                "git operation",
+                "glob":               "find files",
+                "grep":               "search files",
+                "todo_write":         "update todos",
+                "memory":             "memory operation",
+                "web_search":         "web search",
+                "web_fetch":          "fetch URL",
+                "create_pull_request": "create PR",
+                "github_issue":       "GitHub issue",
+        }
+)
+
+var (
         // Command definitions for autocomplete
         commands = []cmdDef{
                 {"/clear", "Clear conversation history"},
@@ -134,7 +181,7 @@ func (m *replModel) showAutocomplete() bool {
 }
 
 // NewREPL creates a new REPL model.
-func NewREPL(a *agent.Agent, sessionDir string) *replModel {
+func NewREPL(a *agent.Agent, sessionDir, workDir, version string) *replModel {
         renderer, err := glamour.NewTermRenderer(
                 glamour.WithAutoStyle(),
                 glamour.WithEmoji(),
@@ -149,6 +196,9 @@ func NewREPL(a *agent.Agent, sessionDir string) *replModel {
                 histIdx:    -1,
                 renderer:   renderer,
                 sessionDir: sessionDir,
+                workDir:    workDir,
+                version:    version,
+                spinnerDir: 1,
         }
 }
 
@@ -245,6 +295,23 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         }
 
                         if input == "" {
+                                return m, nil
+                        }
+
+                        // Bash mode: ! prefix runs shell command directly
+                        if strings.HasPrefix(input, "!") {
+                                bashCmd := strings.TrimPrefix(input, "!")
+                                bashCmd = strings.TrimSpace(bashCmd)
+                                if bashCmd != "" {
+                                        m.history = append(m.history, input)
+                                        m.histIdx = len(m.history)
+                                        m.output = append(m.output, OutputLine{
+                                                Type:    "user",
+                                                Content: input,
+                                        })
+                                        m.state = stateRunning
+                                        return m, tea.Batch(m.runBashCommand(bashCmd), tickSpinner())
+                                }
                                 return m, nil
                         }
 
@@ -495,7 +562,18 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 m.totalUsage.CacheCreate += msg.usage.CacheCreate
 
         case spinnerTickMsg:
-                m.spinner = (m.spinner + 1) % len(spinnerChars)
+                m.spinner += m.spinnerDir
+                if m.spinner >= len(spinnerChars)-1 {
+                        m.spinnerDir = -1
+                } else if m.spinner <= 0 {
+                        m.spinnerDir = 1
+                }
+                if m.spinner < 0 {
+                        m.spinner = 0
+                }
+                if m.spinner >= len(spinnerChars) {
+                        m.spinner = len(spinnerChars) - 1
+                }
                 if m.state == stateRunning {
                         return m, tickSpinner()
                 }
@@ -541,15 +619,11 @@ func (m replModel) View() string {
         // Render all output into full content
         var content strings.Builder
 
-        // Title
-        content.WriteString(titleStyle.Render("⚡ Cairn Code"))
-        if m.agent != nil {
-                content.WriteString(systemStyle.Render(fmt.Sprintf("  [%s / %s]", m.agent.ProviderName(), m.agent.Model())))
+        // Welcome banner (shown once at start, before any output)
+        if len(m.output) == 0 && m.state == stateIdle {
+                content.WriteString(m.renderBanner())
+                content.WriteString("\n")
         }
-        if m.sessionID != "" {
-                content.WriteString(systemStyle.Render(fmt.Sprintf("  session: %s", m.sessionID[:8])))
-        }
-        content.WriteString("\n\n")
 
         // Output
         for _, line := range m.output {
@@ -558,10 +632,12 @@ func (m replModel) View() string {
 
         // Spinner if running
         if m.state == stateRunning {
-                content.WriteString(fmt.Sprintf("%s Thinking...", spinnerChars[m.spinner]))
+                verbIdx := (m.spinner + len(m.output)) % len(spinnerVerbs)
+                verb := spinnerVerbs[verbIdx]
+                content.WriteString(fmt.Sprintf("%s %s…", spinnerChars[m.spinner], verb))
         }
 
-        // Usage summary
+        // Token usage
         if m.totalUsage.InputTokens > 0 {
                 content.WriteString(usageStyle.Render(fmt.Sprintf(
                         "\nTokens: %d in, %d out",
@@ -603,7 +679,7 @@ func (m replModel) View() string {
                         }
                 }
 
-                content.WriteString(promptStyle.Render("⟩ "))
+                content.WriteString(promptStyle.Render("❯ "))
                 // Render input with cursor indicator
                 before := m.input[:m.cursor]
                 after := m.input[m.cursor:]
@@ -957,11 +1033,85 @@ func (m *replModel) renderQuitDialog() string {
         return b.String()
 }
 
+// renderBanner renders the welcome banner (Claude Code style).
+func (m *replModel) renderBanner() string {
+        var b strings.Builder
+        border := dimBorderStyle
+
+        // Top border
+        b.WriteString(border.Render("╭──────────────────────────────────────────────────────────╮"))
+        b.WriteString("\n")
+
+        // Logo line
+        b.WriteString(border.Render("│"))
+        b.WriteString(brandStyle.Render("  ⚡ "))
+        b.WriteString(brandStyle.Bold(true).Render("Cairn Code"))
+        b.WriteString(brandStyle.Bold(false).Render(fmt.Sprintf(" v%s", m.version)))
+        pad := 50 - 10 - len(m.version)
+        if pad > 0 {
+                b.WriteString(strings.Repeat(" ", pad))
+        }
+        b.WriteString(border.Render("│"))
+        b.WriteString("\n")
+
+        // Tagline
+        b.WriteString(border.Render("│"))
+        tagline := systemStyle.Render("  open terminal coding agent")
+        tagPad := 50 - len("  open terminal coding agent")
+        if tagPad > 0 {
+                b.WriteString(strings.Repeat(" ", tagPad))
+        }
+        b.WriteString(tagline)
+        b.WriteString(strings.Repeat(" ", max(0, tagPad-len(tagline))))
+        b.WriteString(border.Render("│"))
+        b.WriteString("\n")
+
+        // Separator
+        b.WriteString(border.Render("├──────────────────────────────────────────────────────────┤"))
+        b.WriteString("\n")
+
+        // Model line
+        if m.agent != nil {
+                b.WriteString(border.Render("│"))
+                modelLine := fmt.Sprintf("  Model   %s / %s", m.agent.ProviderName(), m.agent.Model())
+                // Truncate to fit
+                if len(modelLine) > 48 {
+                        modelLine = modelLine[:45] + "..."
+                }
+                b.WriteString(labelStyle.Render(modelLine))
+                modelPad := 50 - len(modelLine)
+                if modelPad > 0 {
+                        b.WriteString(strings.Repeat(" ", modelPad))
+                }
+                b.WriteString(border.Render("│"))
+                b.WriteString("\n")
+        }
+
+        // Path line
+        b.WriteString(border.Render("│"))
+        pathLine := fmt.Sprintf("  Path    %s", m.workDir)
+        if len(pathLine) > 48 {
+                pathLine = pathLine[:45] + "..."
+        }
+        b.WriteString(labelStyle.Render(pathLine))
+        pathPad := 50 - len(pathLine)
+        if pathPad > 0 {
+                b.WriteString(strings.Repeat(" ", pathPad))
+        }
+        b.WriteString(border.Render("│"))
+        b.WriteString("\n")
+
+        // Bottom border
+        b.WriteString(border.Render("╰──────────────────────────────────────────────────────────╯"))
+
+        return b.String()
+}
+
 // renderOutputLine renders a single output line.
 func (m *replModel) renderOutputLine(line OutputLine) string {
         switch line.Type {
         case "user":
-                return userStyle.Render("⟩ " + line.Content) + "\n\n"
+                return userStyle.Render("❯ " + line.Content) + "\n\n"
 
         case "text":
                 rendered := line.Content
@@ -976,39 +1126,43 @@ func (m *replModel) renderOutputLine(line OutputLine) string {
 
         case "tool_use":
                 var b strings.Builder
-                b.WriteString(toolNameStyle.Render(fmt.Sprintf("▸ %s", line.ToolName)))
+                // ● ToolName(description)
+                b.WriteString(toolNameStyle.Render("● "))
+                b.WriteString(toolNameStyle.Render(line.ToolName))
                 if line.Content != "" {
-                        b.WriteString("\n")
                         // Truncate long tool inputs for display
-                        if len(line.Content) > 500 {
-                                b.WriteString(toolResultStyle.Render(line.Content[:500] + "..."))
-                        } else {
-                                b.WriteString(toolResultStyle.Render(line.Content))
+                        desc := line.Content
+                        if len(desc) > 80 {
+                                desc = desc[:77] + "..."
                         }
+                        b.WriteString("(")
+                        b.WriteString(toolResultStyle.Render(desc))
+                        b.WriteString(")")
                 }
                 b.WriteString("\n")
                 return b.String()
 
         case "tool_result":
                 var b strings.Builder
-                b.WriteString(toolResultStyle.Render(fmt.Sprintf("  ✓ %s", line.ToolName)))
+                b.WriteString(successStyle.Render("● "))
+                b.WriteString(toolResultStyle.Render(fmt.Sprintf("%s", line.ToolName)))
                 if line.Duration > 0 {
                         b.WriteString(usageStyle.Render(fmt.Sprintf(" (%.1fs)", line.Duration.Seconds())))
                 }
                 b.WriteString("\n")
-                // Truncate long tool results for display
+                // Show truncated output for tool results
                 content := strings.TrimSpace(line.Content)
-                if len(content) > 2000 {
-                        content = content[:2000] + "\n... [output truncated]"
-                }
                 if content != "" {
-                        b.WriteString(toolResultStyle.Render(indent(content, "    ")))
+                        if len(content) > 500 {
+                                content = content[:500] + "\n  ... [truncated]"
+                        }
+                        b.WriteString(toolResultStyle.Render(indent(content, "  ")))
                         b.WriteString("\n")
                 }
                 return b.String()
 
         case "error":
-                return errorStyle.Render("✗ " + line.Content) + "\n\n"
+                return errorStyle.Render("● " + line.Content) + "\n\n"
 
         case "system":
                 return systemStyle.Render(line.Content) + "\n"
@@ -1091,9 +1245,19 @@ func (m *replModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
                 return m, tea.Batch(m.listSessions(), tickSpinner())
 
         case "/tools":
+                var buf strings.Builder
+                toolNames := m.agent.ToolNames()
+                buf.WriteString(fmt.Sprintf("Available tools (%d):\n\n", len(toolNames)))
+                for _, name := range toolNames {
+                        desc := toolDescriptions[name]
+                        if desc == "" {
+                                desc = "(no description)"
+                        }
+                        buf.WriteString(fmt.Sprintf("  ● %-25s %s\n", name, desc))
+                }
                 m.output = append(m.output, OutputLine{
                         Type:    "system",
-                        Content: "Available tools: file_read, file_write, file_edit, bash, glob, grep, todo_write, web_search, web_fetch",
+                        Content: buf.String(),
                 })
                 return m, nil
 
@@ -1107,6 +1271,55 @@ func (m *replModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
                         Content: fmt.Sprintf("Unknown command: %s (type /help for available commands)", parts[0]),
                 })
                 return m, nil
+        }
+}
+
+// runBashCommand runs a shell command directly (bash mode via ! prefix).
+func (m replModel) runBashCommand(cmd string) tea.Cmd {
+        return func() tea.Msg {
+                start := time.Now()
+                c := exec.CommandContext(context.Background(), "bash", "-c", cmd)
+                output, err := c.CombinedOutput()
+                duration := time.Since(start)
+
+                var lines []OutputLine
+                lines = append(lines, OutputLine{
+                        Type:     "tool_use",
+                        ToolName: "bash",
+                        Content:  cmd,
+                })
+
+                resultStr := string(output)
+                if len(resultStr) > 2000 {
+                        resultStr = resultStr[:2000] + "\n  ... [truncated]"
+                }
+
+                if err != nil {
+                        lines = append(lines, OutputLine{
+                                Type:     "error",
+                                Content:  fmt.Sprintf("bash: %s", err.Error()),
+                        })
+                        if resultStr != "" {
+                                lines = append(lines, OutputLine{
+                                        Type:     "tool_result",
+                                        ToolName: "bash",
+                                        Content:  resultStr,
+                                        Duration: duration,
+                                })
+                        }
+                } else {
+                        lines = append(lines, OutputLine{
+                                Type:     "tool_result",
+                                ToolName: "bash",
+                                Content:  resultStr,
+                                Duration: duration,
+                        })
+                }
+
+                return agentCompleteMsg{
+                        output: lines,
+                        usage:  llm.Usage{},
+                }
         }
 }
 
