@@ -207,28 +207,14 @@ func (a *Agent) processToolUse(ctx context.Context, block llm.ContentBlock) erro
         // Check if tool exists
         t, ok := a.tools.Get(toolName)
         if !ok {
-                errMsg := fmt.Sprintf("unknown tool: %s", toolName)
-                a.messages = append(a.messages, llm.Message{
-                        Role: llm.RoleAssistant,
-                        Content: []llm.ContentBlock{
-                                llm.ToolResultBlock(block.ID, errMsg, true),
-                        },
-                })
-                return fmt.Errorf("%s", errMsg)
+                return fmt.Errorf("unknown tool: %s", toolName)
         }
 
         // Check permissions
         if t.NeedsPermission() && a.callbacks.OnPermission != nil {
                 allowed := a.callbacks.OnPermission(toolName, toolInput)
                 if !allowed {
-                        errMsg := fmt.Sprintf("permission denied for tool: %s", toolName)
-                        a.messages = append(a.messages, llm.Message{
-                                Role: llm.RoleAssistant,
-                                Content: []llm.ContentBlock{
-                                        llm.ToolResultBlock(block.ID, errMsg, true),
-                                },
-                        })
-                        return fmt.Errorf("%s", errMsg)
+                        return fmt.Errorf("permission denied for tool: %s", toolName)
                 }
         }
 
