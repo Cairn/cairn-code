@@ -597,6 +597,7 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         case drainStreamMsg:
                 // Non-blocking drain: read all pending chunks from channel
                 if m.streamChunkCh != nil {
+                drainLoop:
                         for {
                                 select {
                                 case chunk, ok := <-m.streamChunkCh:
@@ -622,7 +623,7 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                                                 m.autoSaveSession()
                                                         }
                                                 }
-                                                break
+                                                break drainLoop
                                         }
                                         m.streamingText += chunk
                                         // Check for stream clear sentinel (from OnText commit)
@@ -631,7 +632,7 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                         }
                                 default:
                                         // No more chunks available right now
-                                        break
+                                        break drainLoop
                                 }
                         }
                 }
@@ -1429,8 +1430,25 @@ func (m replModel) runAgent(input string) tea.Cmd {
                 m.streamResultCh = resultCh
                 m.agentCancel = agentCancel
 
-                // Start agent in background goroutine
+                // Start agent in background goroutine with panic protection.
+                // Using defer close(chunkCh) ensures the drain loop always unblocks,
+                // even if Agent.Run() panics. We also send resultCh before closing
+                // chunkCh so the drain loop can read the result.
                 go func() {
+                        defer func() {
+                                // If agent panics, send an error result so the UI
+                                // doesn't hang forever waiting on chunkCh.
+                                if r := recover(); r != nil {
+                                        select {
+                                        case resultCh <- agentCompleteMsg{
+                                                err: fmt.Errorf("agent panic: %v", r),
+                                        }:
+                                        default:
+                                        }
+                                }
+                                close(chunkCh)
+                        }()
+
                         var collectedOutput []OutputLine
                         var totalUsage llm.Usage
 
@@ -1494,7 +1512,6 @@ func (m replModel) runAgent(input string) tea.Cmd {
                                 usage:  totalUsage,
                                 err:    agentErr,
                         }
-                        close(chunkCh)
                 }()
 
                 // Start draining chunks immediately
