@@ -1035,54 +1035,45 @@ func (m *replModel) renderQuitDialog() string {
 
 // renderBanner renders the welcome banner (Claude Code style).
 func (m *replModel) renderBanner() string {
+        const innerWidth = 58 // matches the 58-dash border
+
         var b strings.Builder
         border := dimBorderStyle
 
-        // Top border
-        b.WriteString(border.Render("╭──────────────────────────────────────────────────────────╮"))
+        top := "╭" + strings.Repeat("─", innerWidth) + "╮"
+        b.WriteString(border.Render(top))
         b.WriteString("\n")
 
-        // Logo line
+        // Logo line: "  ⚡ Cairn Code v0.3.0"
+        logo := fmt.Sprintf("  ⚡ Cairn Code v%s", m.version)
         b.WriteString(border.Render("│"))
-        b.WriteString(brandStyle.Render("  ⚡ "))
-        b.WriteString(brandStyle.Bold(true).Render("Cairn Code"))
-        b.WriteString(brandStyle.Bold(false).Render(fmt.Sprintf(" v%s", m.version)))
-        pad := 50 - 10 - len(m.version)
-        if pad > 0 {
-                b.WriteString(strings.Repeat(" ", pad))
-        }
+        b.WriteString(brandStyle.Bold(true).Render(logo))
+        b.WriteString(strings.Repeat(" ", innerWidth-len(logo)))
         b.WriteString(border.Render("│"))
         b.WriteString("\n")
 
         // Tagline
+        tag := "  open terminal coding agent"
         b.WriteString(border.Render("│"))
-        tagline := systemStyle.Render("  open terminal coding agent")
-        tagPad := 50 - len("  open terminal coding agent")
-        if tagPad > 0 {
-                b.WriteString(strings.Repeat(" ", tagPad))
-        }
-        b.WriteString(tagline)
-        b.WriteString(strings.Repeat(" ", max(0, tagPad-len(tagline))))
+        b.WriteString(systemStyle.Render(tag))
+        b.WriteString(strings.Repeat(" ", innerWidth-len(tag)))
         b.WriteString(border.Render("│"))
         b.WriteString("\n")
 
         // Separator
-        b.WriteString(border.Render("├──────────────────────────────────────────────────────────┤"))
+        mid := "├" + strings.Repeat("─", innerWidth) + "┤"
+        b.WriteString(border.Render(mid))
         b.WriteString("\n")
 
         // Model line
         if m.agent != nil {
                 b.WriteString(border.Render("│"))
                 modelLine := fmt.Sprintf("  Model   %s / %s", m.agent.ProviderName(), m.agent.Model())
-                // Truncate to fit
-                if len(modelLine) > 48 {
-                        modelLine = modelLine[:45] + "..."
+                if len(modelLine) > innerWidth {
+                        modelLine = modelLine[:innerWidth-3] + "..."
                 }
                 b.WriteString(labelStyle.Render(modelLine))
-                modelPad := 50 - len(modelLine)
-                if modelPad > 0 {
-                        b.WriteString(strings.Repeat(" ", modelPad))
-                }
+                b.WriteString(strings.Repeat(" ", innerWidth-len(modelLine)))
                 b.WriteString(border.Render("│"))
                 b.WriteString("\n")
         }
@@ -1090,19 +1081,17 @@ func (m *replModel) renderBanner() string {
         // Path line
         b.WriteString(border.Render("│"))
         pathLine := fmt.Sprintf("  Path    %s", m.workDir)
-        if len(pathLine) > 48 {
-                pathLine = pathLine[:45] + "..."
+        if len(pathLine) > innerWidth {
+                pathLine = pathLine[:innerWidth-3] + "..."
         }
         b.WriteString(labelStyle.Render(pathLine))
-        pathPad := 50 - len(pathLine)
-        if pathPad > 0 {
-                b.WriteString(strings.Repeat(" ", pathPad))
-        }
+        b.WriteString(strings.Repeat(" ", innerWidth-len(pathLine)))
         b.WriteString(border.Render("│"))
         b.WriteString("\n")
 
         // Bottom border
-        b.WriteString(border.Render("╰──────────────────────────────────────────────────────────╯"))
+        bot := "╰" + strings.Repeat("─", innerWidth) + "╯"
+        b.WriteString(border.Render(bot))
 
         return b.String()
 }
