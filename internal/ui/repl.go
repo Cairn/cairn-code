@@ -336,7 +336,35 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                 m.quit = true
                                 return m, tea.Quit
                         }
-                case "n", "N", "esc":
+                        // Not in quit dialog — insert as normal character
+                        if m.cursor < len(m.input) {
+                                m.input = m.input[:m.cursor] + msg.String() + m.input[m.cursor:]
+                        } else {
+                                m.input += msg.String()
+                        }
+                        m.cursor++
+                        m.cmdSelect = 0
+                case "n", "N":
+                        if m.showQuit {
+                                m.showQuit = false
+                                return m, nil
+                        }
+                        // Dismiss autocomplete if showing
+                        if m.showAutocomplete() {
+                                m.input = ""
+                                m.cursor = 0
+                                m.cmdSelect = 0
+                                return m, nil
+                        }
+                        // Not in quit dialog or autocomplete — insert as normal character
+                        if m.cursor < len(m.input) {
+                                m.input = m.input[:m.cursor] + msg.String() + m.input[m.cursor:]
+                        } else {
+                                m.input += msg.String()
+                        }
+                        m.cursor++
+                        m.cmdSelect = 0
+                case "esc":
                         if m.showQuit {
                                 m.showQuit = false
                                 return m, nil
