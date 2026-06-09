@@ -1610,6 +1610,8 @@ func (m replModel) resumeSession(id string) tea.Cmd {
                 // Rebuild output buffer from session history so it looks like
                 // the conversation happened in this terminal session
                 var historyOutput []OutputLine
+                lastToolName := "unknown" // track across message boundaries
+
                 for _, sm := range sess.Messages {
                         switch sm.Role {
                         case "user":
@@ -1621,8 +1623,38 @@ func (m replModel) resumeSession(id string) tea.Cmd {
                                         })
                                 }
                         case "assistant":
-                                lines := renderAssistantMessage(sm.Content)
-                                historyOutput = append(historyOutput, lines...)
+                                blocks := contentToBlocks(sm.Content)
+                                for _, b := range blocks {
+                                        switch b.Type {
+                                        case "text":
+                                                if b.Text != "" {
+                                                        historyOutput = append(historyOutput, OutputLine{Type: "text", Content: b.Text})
+                                                }
+                                        case "tool_use":
+                                                name := b.Name
+                                                if name != "" {
+                                                        lastToolName = name
+                                                }
+                                                inputStr := formatToolInput(b.Input)
+                                                historyOutput = append(historyOutput, OutputLine{
+                                                        Type:     "tool_use",
+                                                        ToolName: name,
+                                                        Content:  inputStr,
+                                                })
+                                        case "tool_result":
+                                                resultText := b.Content
+                                                if resultText != "" {
+                                                        if len(resultText) > 2000 {
+                                                                resultText = resultText[:2000] + "\n  ... [truncated]"
+                                                        }
+                                                        historyOutput = append(historyOutput, OutputLine{
+                                                                Type:     "tool_result",
+                                                                ToolName: lastToolName,
+                                                                Content:  resultText,
+                                                        })
+                                                }
+                                        }
+                                }
                         }
                 }
 
@@ -1795,6 +1827,22 @@ func extractTextFromContent(content any) string {
         }
 }
 
+// contentToBlocks normalizes a message content field to []llm.ContentBlock.
+// Handles string, []ContentBlock (in-memory), and []any (JSON deserialized).
+func contentToBlocks(content any) []llm.ContentBlock {
+        switch c := content.(type) {
+        case []llm.ContentBlock:
+                return c
+        case []any:
+                return llm.AsTextBlocks(c)
+        case string:
+                if c != "" {
+                        return []llm.ContentBlock{{Type: "text", Text: c}}
+                }
+        }
+        return nil
+}
+
 // renderAssistantMessage converts an assistant message's content into OutputLines
 // for replay in the terminal buffer (text and tool use/result blocks).
 func renderAssistantMessage(content any) []OutputLine {
@@ -1814,6 +1862,7 @@ func renderAssistantMessage(content any) []OutputLine {
         }
 
         var lines []OutputLine
+        lastToolName := "unknown" // track last tool_use name for tool_result display
         for _, b := range blocks {
                 switch b.Type {
                 case "text":
@@ -1822,8 +1871,8 @@ func renderAssistantMessage(content any) []OutputLine {
                         }
                 case "tool_use":
                         name := b.Name
-                        if name == "" {
-                                name = "unknown"
+                        if name != "" {
+                                lastToolName = name
                         }
                         inputStr := formatToolInput(b.Input)
                         lines = append(lines, OutputLine{
@@ -1832,7 +1881,6 @@ func renderAssistantMessage(content any) []OutputLine {
                                 Content:  inputStr,
                         })
                 case "tool_result":
-                        name := b.ID // tool_result uses ID as the tool call ID reference
                         resultText := b.Content
                         if resultText != "" {
                                 if len(resultText) > 500 {
@@ -1840,7 +1888,7 @@ func renderAssistantMessage(content any) []OutputLine {
                                 }
                                 lines = append(lines, OutputLine{
                                         Type:     "tool_result",
-                                        ToolName: name,
+                                        ToolName: lastToolName,
                                         Content:  resultText,
                                 })
                         }
