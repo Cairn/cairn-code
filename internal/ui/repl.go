@@ -52,9 +52,6 @@ type replModel struct {
         spinner    int
         sessionDir string
         sessionID  string // current session ID for auto-save
-        scrollY    int    // current scroll offset (0 = bottom, newest)
-        maxViewY   int    // total rendered height of output
-        atBottom   bool   // whether viewport is at the bottom
 }
 
 var (
@@ -105,7 +102,6 @@ func NewREPL(a *agent.Agent, sessionDir string) *replModel {
                 histIdx:    -1,
                 renderer:   renderer,
                 sessionDir: sessionDir,
-                atBottom:   true,
         }
 }
 
@@ -122,14 +118,6 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 m.height = msg.Height
                 return m, nil
 
-        case tea.MouseMsg:
-                switch msg.Type {
-                case tea.MouseWheelUp:
-                        m.scrollUp(3)
-                case tea.MouseWheelDown:
-                        m.scrollDown(3)
-                }
-
         case tea.KeyMsg:
                 switch msg.String() {
                 case "ctrl+c":
@@ -140,18 +128,6 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         }
                         m.quit = true
                         return m, tea.Quit
-
-                // Scrolling keys
-                case "pgup", "shift+up":
-                        m.scrollUp(m.height / 2)
-                case "pgdown", "shift+down":
-                        m.scrollDown(m.height / 2)
-                case "home":
-                        m.scrollY = m.maxViewY
-                        m.atBottom = false
-                case "end":
-                        m.scrollY = 0
-                        m.atBottom = true
 
                 case "enter":
                         if m.state == stateRunning {
@@ -351,83 +327,14 @@ func (m replModel) View() string {
                 content.WriteString("\n")
         }
 
-        fullContent := content.String()
-        contentLines := strings.Split(fullContent, "\n")
-        // Remove trailing empty line from final newline
-        if len(contentLines) > 0 && contentLines[len(contentLines)-1] == "" {
-                contentLines = contentLines[:len(contentLines)-1]
-        }
-
-        // Calculate viewport height (leave room for header line + input line + padding)
-        viewportHeight := m.height - 4
-        if viewportHeight < 1 {
-                viewportHeight = 1
-        }
-
-        totalHeight := len(contentLines)
-
-        // Auto-scroll to bottom when new output arrives and user is at bottom
-        if m.atBottom || m.scrollY < 0 {
-                m.scrollY = 0
-                m.atBottom = true
-        }
-
-        // Clamp scrollY
-        maxScroll := totalHeight - viewportHeight
-        if maxScroll < 0 {
-                maxScroll = 0
-        }
-        if m.scrollY > maxScroll {
-                m.scrollY = maxScroll
-        }
-        m.maxViewY = maxScroll
-
-        // Determine visible window
-        // scrollY=0 means bottom (newest), scrollY=maxScroll means top (oldest)
-        startIdx := totalHeight - viewportHeight - m.scrollY
-        if startIdx < 0 {
-                startIdx = 0
-        }
-        endIdx := startIdx + viewportHeight
-        if endIdx > totalHeight {
-                endIdx = totalHeight
-        }
-
-        // Build visible content (no custom scrollbar)
-        // Pad to fill viewport so prompt is always at the bottom
-        var b strings.Builder
-        visibleLines := endIdx - startIdx
-        padLines := viewportHeight - visibleLines
-        for i := 0; i < padLines; i++ {
-                b.WriteString("\n")
-        }
-        for i := startIdx; i < endIdx; i++ {
-                b.WriteString(contentLines[i])
-                b.WriteString("\n")
-        }
-
-        // Input prompt (always at bottom of screen)
+        // Input prompt
         if !m.quit {
-                b.WriteString(promptStyle.Render("⟩ "))
-                b.WriteString(m.input)
+                content.WriteString("\n")
+                content.WriteString(promptStyle.Render("⟩ "))
+                content.WriteString(m.input)
         }
 
-        return b.String()
-}
-
-// scrollUp moves the viewport toward older content (increases scrollY).
-func (m *replModel) scrollUp(amount int) {
-        m.scrollY += amount
-        m.atBottom = false
-}
-
-// scrollDown moves the viewport toward newer content (decreases scrollY).
-func (m *replModel) scrollDown(amount int) {
-        m.scrollY -= amount
-        if m.scrollY <= 0 {
-                m.scrollY = 0
-                m.atBottom = true
-        }
+        return content.String()
 }
 
 // renderOutputLine renders a single output line.
