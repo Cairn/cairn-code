@@ -66,12 +66,15 @@ func main() {
         registry.Register(tools.NewFileWriteTool())
         registry.Register(tools.NewFileEditTool())
         registry.Register(tools.NewBashTool())
+        registry.Register(tools.NewGitTool())
         registry.Register(tools.NewGlobTool())
         registry.Register(tools.NewGrepTool())
         registry.Register(tools.NewTodoWriteTool(todoStore))
+        registry.Register(tools.NewMemoryTool())
         registry.Register(tools.NewWebSearchTool())
         registry.Register(tools.NewWebFetchTool())
         registry.Register(tools.NewPullRequestTool())
+        registry.Register(tools.NewGitHubIssueTool())
 
         // Create agent
         ag := agent.NewAgent(provider, registry, cfg, todoStore)
