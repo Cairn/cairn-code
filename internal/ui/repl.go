@@ -1607,10 +1607,34 @@ func (m replModel) resumeSession(id string) tea.Cmd {
                 }
                 m.sessionID = sess.ID
 
+                // Rebuild output buffer from session history so it looks like
+                // the conversation happened in this terminal session
+                var historyOutput []OutputLine
+                for _, sm := range sess.Messages {
+                        switch sm.Role {
+                        case "user":
+                                text := extractTextFromContent(sm.Content)
+                                if text != "" {
+                                        historyOutput = append(historyOutput, OutputLine{
+                                                Type:    "user",
+                                                Content: text,
+                                        })
+                                }
+                        case "assistant":
+                                lines := renderAssistantMessage(sm.Content)
+                                historyOutput = append(historyOutput, lines...)
+                        }
+                }
+
+                // Build result: history lines + resume confirmation
+                allOutput := historyOutput
+                allOutput = append(allOutput, OutputLine{
+                        Type:    "system",
+                        Content: fmt.Sprintf("Resumed session %s (model: %s, messages: %d)", sess.ID, sess.Model, len(sess.Messages)),
+                })
+
                 return agentCompleteMsg{
-                        output: []OutputLine{
-                                {Type: "system", Content: fmt.Sprintf("Resumed session %s (model: %s, messages: %d)", sess.ID, sess.Model, len(sess.Messages))},
-                        },
+                        output: allOutput,
                 }
         }
 }
@@ -1737,6 +1761,92 @@ func tickSpinner() tea.Cmd {
 // pickSpinnerVerb randomly selects a spinner verb (once per turn, Claude Code style).
 func pickSpinnerVerb() string {
         return spinnerVerbs[rand.IntN(len(spinnerVerbs))]
+}
+
+// extractTextFromContent extracts plain text from a message content field.
+// Content can be a string, []llm.ContentBlock, or []any (from JSON unmarshal).
+func extractTextFromContent(content any) string {
+        switch c := content.(type) {
+        case string:
+                return c
+        case []llm.ContentBlock:
+                var parts []string
+                for _, b := range c {
+                        if b.Type == "text" && b.Text != "" {
+                                parts = append(parts, b.Text)
+                        }
+                }
+                return strings.Join(parts, "\n")
+        case []any:
+                // From JSON deserialization — ContentBlock as maps
+                var parts []string
+                for _, item := range c {
+                        if m, ok := item.(map[string]any); ok {
+                                if t, ok := m["type"].(string); ok && t == "text" {
+                                        if text, ok := m["text"].(string); ok && text != "" {
+                                                parts = append(parts, text)
+                                        }
+                                }
+                        }
+                }
+                return strings.Join(parts, "\n")
+        default:
+                return fmt.Sprintf("%v", c)
+        }
+}
+
+// renderAssistantMessage converts an assistant message's content into OutputLines
+// for replay in the terminal buffer (text and tool use/result blocks).
+func renderAssistantMessage(content any) []OutputLine {
+        var blocks []llm.ContentBlock
+        switch c := content.(type) {
+        case []llm.ContentBlock:
+                blocks = c
+        case []any:
+                blocks = llm.AsTextBlocks(c)
+        case string:
+                if c != "" {
+                        return []OutputLine{{Type: "text", Content: c}}
+                }
+                return nil
+        default:
+                return nil
+        }
+
+        var lines []OutputLine
+        for _, b := range blocks {
+                switch b.Type {
+                case "text":
+                        if b.Text != "" {
+                                lines = append(lines, OutputLine{Type: "text", Content: b.Text})
+                        }
+                case "tool_use":
+                        name := b.Name
+                        if name == "" {
+                                name = "unknown"
+                        }
+                        inputStr := formatToolInput(b.Input)
+                        lines = append(lines, OutputLine{
+                                Type:     "tool_use",
+                                ToolName: name,
+                                Content:  inputStr,
+                        })
+                case "tool_result":
+                        name := b.ID // tool_result uses ID as the tool call ID reference
+                        resultText := b.Content
+                        if resultText != "" {
+                                if len(resultText) > 500 {
+                                        resultText = resultText[:500] + "\n  ... [truncated]"
+                                }
+                                lines = append(lines, OutputLine{
+                                        Type:     "tool_result",
+                                        ToolName: name,
+                                        Content:  resultText,
+                                })
+                        }
+                }
+        }
+        return lines
 }
 
 // tickCursorBlink returns a command that blinks the cursor every 530ms.
