@@ -180,19 +180,18 @@ func (a *Agent) callStreaming(ctx context.Context, sp llm.StreamingProvider, too
         resp, err := sp.StreamMessage(ctx, a.messages, tools, system, a.model, func(chunk string, done bool) {
                 if !done && chunk != "" {
                         streamedText.WriteString(chunk)
-                        if a.callbacks.OnText != nil {
-                                a.callbacks.OnText(chunk)
-                        }
                 }
         })
         if err != nil {
                 return nil, err
         }
 
-        // For streaming responses, the text was already sent via callback chunk-by-chunk.
-        // We still need to make sure the response Content blocks have the full text.
-        // The StreamMessage implementation already assembles the full response, so resp.Content
-        // should contain the complete text block(s) and tool_use blocks.
+        // Emit the complete streamed text as a single OnText call.
+        // This prevents the UI from rendering each token through glamour
+        // separately, which would break markdown into fragmented paragraphs.
+        if streamedText.Len() > 0 && a.callbacks.OnText != nil {
+                a.callbacks.OnText(streamedText.String())
+        }
 
         // Tool_use blocks will be handled by processToolUse in Run(),
         // which also fires the OnToolUse callback. Don't double-fire here.
