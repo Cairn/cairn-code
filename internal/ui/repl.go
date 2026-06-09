@@ -50,6 +50,7 @@ type replModel struct {
         quit       bool
         renderer   *glamour.TermRenderer
         spinner    int
+        cursorBlink bool
         sessionDir string
         sessionID  string // current session ID for auto-save
 }
@@ -107,7 +108,7 @@ func NewREPL(a *agent.Agent, sessionDir string) *replModel {
 
 // Init initializes the model.
 func (m *replModel) Init() tea.Cmd {
-        return tickSpinner()
+        return tea.Batch(tickSpinner(), tickCursorBlink())
 }
 
 // Update handles messages.
@@ -284,6 +285,10 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         return m, tickSpinner()
                 }
                 return m, nil
+
+        case cursorBlinkMsg:
+                m.cursorBlink = !m.cursorBlink
+                return m, tickCursorBlink()
         }
 
         return m, nil
@@ -328,11 +333,18 @@ func (m replModel) View() string {
                 content.WriteString("\n")
         }
 
-        // Input prompt
+        // Input prompt with cursor
         if !m.quit {
                 content.WriteString("\n")
                 content.WriteString(promptStyle.Render("⟩ "))
-                content.WriteString(m.input)
+                // Render input with cursor indicator
+                before := m.input[:m.cursor]
+                after := m.input[m.cursor:]
+                content.WriteString(before)
+                if m.cursorBlink && m.state != stateRunning {
+                        content.WriteString(promptStyle.Render("▋"))
+                }
+                content.WriteString(after)
         }
 
         return content.String()
@@ -774,6 +786,8 @@ type agentTurnEndMsg struct {
 
 type spinnerTickMsg time.Time
 
+type cursorBlinkMsg time.Time
+
 type agentCompleteMsg struct {
         output []OutputLine
         usage  llm.Usage
@@ -784,6 +798,13 @@ type agentCompleteMsg struct {
 func tickSpinner() tea.Cmd {
         return tea.Tick(time.Millisecond*80, func(t time.Time) tea.Msg {
                 return spinnerTickMsg(t)
+        })
+}
+
+// tickCursorBlink returns a command that blinks the cursor every 530ms.
+func tickCursorBlink() tea.Cmd {
+        return tea.Tick(time.Millisecond*530, func(t time.Time) tea.Msg {
+                return cursorBlinkMsg(t)
         })
 }
 
