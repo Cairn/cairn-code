@@ -394,17 +394,20 @@ func (m replModel) View() string {
         }
 
         // Build visible content (no custom scrollbar)
+        // Pad to fill viewport so prompt is always at the bottom
         var b strings.Builder
+        visibleLines := endIdx - startIdx
+        padLines := viewportHeight - visibleLines
+        for i := 0; i < padLines; i++ {
+                b.WriteString("\n")
+        }
         for i := startIdx; i < endIdx; i++ {
                 b.WriteString(contentLines[i])
-                if i < endIdx-1 {
-                        b.WriteString("\n")
-                }
+                b.WriteString("\n")
         }
 
-        // Input prompt (always visible at bottom)
+        // Input prompt (always at bottom of screen)
         if !m.quit {
-                b.WriteString("\n")
                 b.WriteString(promptStyle.Render("⟩ "))
                 b.WriteString(m.input)
         }
