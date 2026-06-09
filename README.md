@@ -50,10 +50,10 @@
 
 ## Quick Start
 
-### Build
+### Install
 
 ```bash
-go build -o cairn-code ./cmd/cairn-code
+go install ./cmd/...
 ```
 
 ### Configure

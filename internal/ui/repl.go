@@ -1,389 +1,409 @@
 package ui
 
 import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"strings"
-	"time"
+        "context"
+        "encoding/json"
+        "fmt"
+        "strings"
+        "time"
 
-	"github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/glamour"
-	"github.com/charmbracelet/lipgloss"
+        "github.com/charmbracelet/bubbletea"
+        "github.com/charmbracelet/glamour"
+        "github.com/charmbracelet/lipgloss"
 
-	"github.com/cairn/cairn-code/internal/agent"
-	"github.com/cairn/cairn-code/internal/llm"
-	"github.com/cairn/cairn-code/internal/session"
+        "github.com/cairn/cairn-code/internal/agent"
+        "github.com/cairn/cairn-code/internal/llm"
+        "github.com/cairn/cairn-code/internal/session"
 )
 
 // State represents the REPL state.
 type state int
 
 const (
-	stateIdle state = iota
-	stateRunning
+        stateIdle state = iota
+        stateRunning
 )
 
 // OutputLine represents a line of output from the agent.
 type OutputLine struct {
-	Type     string // "text", "tool_use", "tool_result", "error", "system"
-	Content  string
-	ToolName string
-	Duration time.Duration
+        Type     string // "text", "tool_use", "tool_result", "error", "system"
+        Content  string
+        ToolName string
+        Duration time.Duration
 }
 
 // replModel is the bubbletea Model for the terminal REPL.
 type replModel struct {
-	agent      *agent.Agent
-	state      state
-	input      string
-	cursor     int
-	output     []OutputLine
-	history    []string
-	histIdx    int
-	width      int
-	height     int
-	totalUsage llm.Usage
-	err        error
-	quit       bool
-	renderer   *glamour.TermRenderer
-	spinner    int
-	sessionDir string
-	sessionID  string // current session ID for auto-save
+        agent      *agent.Agent
+        state      state
+        input      string
+        cursor     int
+        output     []OutputLine
+        history    []string
+        histIdx    int
+        width      int
+        height     int
+        totalUsage llm.Usage
+        err        error
+        quit       bool
+        renderer   *glamour.TermRenderer
+        spinner    int
+        sessionDir string
+        sessionID  string // current session ID for auto-save
 }
 
 var (
-	// Styles
-	promptStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("63")) // cyan-ish
+        // Styles
+        promptStyle = lipgloss.NewStyle().
+                        Bold(true).
+                        Foreground(lipgloss.Color("63")) // cyan-ish
 
-	userStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("221")) // warm yellow
+        userStyle = lipgloss.NewStyle().
+                        Bold(true).
+                        Foreground(lipgloss.Color("221")) // warm yellow
 
-	toolNameStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("6")) // cyan
+        toolNameStyle = lipgloss.NewStyle().
+                        Foreground(lipgloss.Color("6")) // cyan
 
-	toolResultStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("245")) // dim
+        toolResultStyle = lipgloss.NewStyle().
+                        Foreground(lipgloss.Color("245")) // dim
 
-	errorStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("196")) // red
+        errorStyle = lipgloss.NewStyle().
+                        Foreground(lipgloss.Color("196")) // red
 
-	systemStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("245")) // dim
+        systemStyle = lipgloss.NewStyle().
+                        Foreground(lipgloss.Color("245")) // dim
 
-	usageStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("245")) // dim
+        usageStyle = lipgloss.NewStyle().
+                        Foreground(lipgloss.Color("245")) // dim
 
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("63"))
+        titleStyle = lipgloss.NewStyle().
+                        Bold(true).
+                        Foreground(lipgloss.Color("63"))
 
-	spinnerChars = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+        spinnerChars = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 )
 
 // NewREPL creates a new REPL model.
 func NewREPL(a *agent.Agent, sessionDir string) replModel {
-	renderer, err := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
-		glamour.WithEmoji(),
-	)
-	if err != nil {
-		renderer = nil
-	}
+        renderer, err := glamour.NewTermRenderer(
+                glamour.WithAutoStyle(),
+                glamour.WithEmoji(),
+        )
+        if err != nil {
+                renderer = nil
+        }
 
-	return replModel{
-		agent:      a,
-		state:      stateIdle,
-		histIdx:    -1,
-		renderer:   renderer,
-		sessionDir: sessionDir,
-	}
+        return replModel{
+                agent:      a,
+                state:      stateIdle,
+                histIdx:    -1,
+                renderer:   renderer,
+                sessionDir: sessionDir,
+        }
 }
 
 // Init initializes the model.
 func (m replModel) Init() tea.Cmd {
-	return tickSpinner()
+        return tickSpinner()
 }
 
 // Update handles messages.
 func (m replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		return m, nil
+        switch msg := msg.(type) {
+        case tea.WindowSizeMsg:
+                m.width = msg.Width
+                m.height = msg.Height
+                return m, nil
 
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c":
-			if m.state == stateRunning {
-				// Request cancellation - will be handled by context
-				m.quit = true
-				return m, tea.Quit
-			}
-			m.quit = true
-			return m, tea.Quit
+        case tea.KeyMsg:
+                switch msg.String() {
+                case "ctrl+c":
+                        if m.state == stateRunning {
+                                // Request cancellation - will be handled by context
+                                m.quit = true
+                                return m, tea.Quit
+                        }
+                        m.quit = true
+                        return m, tea.Quit
 
-		case "enter":
-			if m.state == stateRunning {
-				return m, nil
-			}
+                case "enter":
+                        if m.state == stateRunning {
+                                return m, nil
+                        }
 
-			input := strings.TrimSpace(m.input)
-			m.input = ""
+                        input := strings.TrimSpace(m.input)
+                        m.input = ""
 
-			// Handle commands
-			if strings.HasPrefix(input, "/") {
-				return m.handleCommand(input)
-			}
+                        // Handle commands
+                        if strings.HasPrefix(input, "/") {
+                                return m.handleCommand(input)
+                        }
 
-			if input == "" {
-				return m, nil
-			}
+                        if input == "" {
+                                return m, nil
+                        }
 
-			// Add to history
-			m.history = append(m.history, input)
-			m.histIdx = len(m.history)
+                        // Add to history
+                        m.history = append(m.history, input)
+                        m.histIdx = len(m.history)
 
-			// Add user message to output
-			m.output = append(m.output, OutputLine{
-				Type:    "user",
-				Content: input,
-			})
+                        // Add user message to output
+                        m.output = append(m.output, OutputLine{
+                                Type:    "user",
+                                Content: input,
+                        })
 
-			// Run agent
-			m.state = stateRunning
-			return m, m.runAgent(input)
+                        // Run agent
+                        m.state = stateRunning
+                        return m, m.runAgent(input)
 
-		case "up":
-			if m.histIdx > 0 {
-				m.histIdx--
-				m.input = m.history[m.histIdx]
-			} else if m.histIdx == 0 {
-				m.input = m.history[0]
-			}
+                case "up":
+                        if m.histIdx > 0 {
+                                m.histIdx--
+                                m.input = m.history[m.histIdx]
+                        } else if m.histIdx == 0 {
+                                m.input = m.history[0]
+                        }
 
-		case "down":
-			if m.histIdx < len(m.history)-1 {
-				m.histIdx++
-				m.input = m.history[m.histIdx]
-			} else {
-				m.histIdx = len(m.history)
-				m.input = ""
-			}
+                case "down":
+                        if m.histIdx < len(m.history)-1 {
+                                m.histIdx++
+                                m.input = m.history[m.histIdx]
+                        } else {
+                                m.histIdx = len(m.history)
+                                m.input = ""
+                        }
 
-		case "backspace":
-			if m.cursor > 0 && m.cursor <= len(m.input) {
-				m.input = m.input[:m.cursor-1] + m.input[m.cursor:]
-				m.cursor--
-			}
+                case "backspace", "ctrl+h":
+                        if m.cursor > 0 && m.cursor <= len(m.input) {
+                                m.input = m.input[:m.cursor-1] + m.input[m.cursor:]
+                                m.cursor--
+                        }
 
-		case "left":
-			if m.cursor > 0 {
-				m.cursor--
-			}
+                case "delete":
+                        if m.cursor < len(m.input) {
+                                m.input = m.input[:m.cursor] + m.input[m.cursor+1:]
+                        }
 
-		case "right":
-			if m.cursor < len(m.input) {
-				m.cursor++
-			}
+                case "ctrl+u":
+                        m.input = m.input[m.cursor:]
+                        m.cursor = 0
 
-		default:
-			// Insert character at cursor position
-			if len(msg.String()) == 1 {
-				if m.cursor < len(m.input) {
-					m.input = m.input[:m.cursor] + msg.String() + m.input[m.cursor:]
-				} else {
-					m.input += msg.String()
-				}
-				m.cursor++
-			}
-		}
+                case "ctrl+w":
+                        // Delete word before cursor
+                        if m.cursor > 0 {
+                                i := m.cursor - 1
+                                for i > 0 && m.input[i-1] != ' ' {
+                                        i--
+                                }
+                                m.input = m.input[:i] + m.input[m.cursor:]
+                                m.cursor = i
+                        }
 
-	case agentCompleteMsg:
-		m.state = stateIdle
-		m.output = append(m.output, msg.output...)
-		m.totalUsage.InputTokens += msg.usage.InputTokens
-		m.totalUsage.OutputTokens += msg.usage.OutputTokens
-		m.totalUsage.CacheRead += msg.usage.CacheRead
-		m.totalUsage.CacheCreate += msg.usage.CacheCreate
-		if msg.err != nil {
-			m.err = msg.err
-		}
-		// Auto-save session after each agent run
-		if len(m.agent.History()) > 0 {
-			m.autoSaveSession()
-		}
+                case "left":
+                        if m.cursor > 0 {
+                                m.cursor--
+                        }
 
-	case agentResultMsg:
-		m.state = stateIdle
-		if msg.err != nil {
-			m.output = append(m.output, OutputLine{
-				Type:    "error",
-				Content: msg.err.Error(),
-			})
-			m.err = msg.err
-		}
+                case "right":
+                        if m.cursor < len(m.input) {
+                                m.cursor++
+                        }
 
-	case agentTextMsg:
-		m.output = append(m.output, OutputLine{
-			Type:    "text",
-			Content: msg.text,
-		})
+                default:
+                        // Insert character at cursor position (skip control chars)
+                        if len(msg.String()) == 1 && msg.String()[0] >= 32 {
+                                if m.cursor < len(m.input) {
+                                        m.input = m.input[:m.cursor] + msg.String() + m.input[m.cursor:]
+                                } else {
+                                        m.input += msg.String()
+                                }
+                                m.cursor++
+                        }
+                }
 
-	case agentToolUseMsg:
-		m.output = append(m.output, OutputLine{
-			Type:     "tool_use",
-			ToolName: msg.name,
-			Content:  formatToolInput(msg.input),
-		})
+        case agentCompleteMsg:
+                m.state = stateIdle
+                m.output = append(m.output, msg.output...)
+                m.totalUsage.InputTokens += msg.usage.InputTokens
+                m.totalUsage.OutputTokens += msg.usage.OutputTokens
+                m.totalUsage.CacheRead += msg.usage.CacheRead
+                m.totalUsage.CacheCreate += msg.usage.CacheCreate
+                if msg.err != nil {
+                        m.err = msg.err
+                }
+                // Auto-save session after each agent run
+                if len(m.agent.History()) > 0 {
+                        m.autoSaveSession()
+                }
 
-	case agentToolResultMsg:
-		m.output = append(m.output, OutputLine{
-			Type:     "tool_result",
-			ToolName: msg.name,
-			Content:  msg.output,
-			Duration: msg.duration,
-		})
+        case agentResultMsg:
+                m.state = stateIdle
+                if msg.err != nil {
+                        m.output = append(m.output, OutputLine{
+                                Type:    "error",
+                                Content: msg.err.Error(),
+                        })
+                        m.err = msg.err
+                }
 
-	case agentTurnEndMsg:
-		m.totalUsage.InputTokens += msg.usage.InputTokens
-		m.totalUsage.OutputTokens += msg.usage.OutputTokens
-		m.totalUsage.CacheRead += msg.usage.CacheRead
-		m.totalUsage.CacheCreate += msg.usage.CacheCreate
+        case agentTextMsg:
+                m.output = append(m.output, OutputLine{
+                        Type:    "text",
+                        Content: msg.text,
+                })
 
-	case spinnerTickMsg:
-		m.spinner = (m.spinner + 1) % len(spinnerChars)
-		if m.state == stateRunning {
-			return m, tickSpinner()
-		}
-		return m, nil
-	}
+        case agentToolUseMsg:
+                m.output = append(m.output, OutputLine{
+                        Type:     "tool_use",
+                        ToolName: msg.name,
+                        Content:  formatToolInput(msg.input),
+                })
 
-	return m, nil
+        case agentToolResultMsg:
+                m.output = append(m.output, OutputLine{
+                        Type:     "tool_result",
+                        ToolName: msg.name,
+                        Content:  msg.output,
+                        Duration: msg.duration,
+                })
+
+        case agentTurnEndMsg:
+                m.totalUsage.InputTokens += msg.usage.InputTokens
+                m.totalUsage.OutputTokens += msg.usage.OutputTokens
+                m.totalUsage.CacheRead += msg.usage.CacheRead
+                m.totalUsage.CacheCreate += msg.usage.CacheCreate
+
+        case spinnerTickMsg:
+                m.spinner = (m.spinner + 1) % len(spinnerChars)
+                if m.state == stateRunning {
+                        return m, tickSpinner()
+                }
+                return m, nil
+        }
+
+        return m, nil
 }
 
 // View renders the model.
 func (m replModel) View() string {
-	if m.quit && m.err == nil {
-		return ""
-	}
+        if m.quit && m.err == nil {
+                return ""
+        }
 
-	var b strings.Builder
+        var b strings.Builder
 
-	// Title
-	b.WriteString(titleStyle.Render("⚡ Cairn Code"))
-	if m.agent != nil {
-		b.WriteString(systemStyle.Render(fmt.Sprintf("  [%s / %s]", m.agent.ProviderName(), m.agent.Model())))
-	}
-	if m.sessionID != "" {
-		b.WriteString(systemStyle.Render(fmt.Sprintf("  session: %s", m.sessionID[:8])))
-	}
-	b.WriteString("\n\n")
+        // Title
+        b.WriteString(titleStyle.Render("⚡ Cairn Code"))
+        if m.agent != nil {
+                b.WriteString(systemStyle.Render(fmt.Sprintf("  [%s / %s]", m.agent.ProviderName(), m.agent.Model())))
+        }
+        if m.sessionID != "" {
+                b.WriteString(systemStyle.Render(fmt.Sprintf("  session: %s", m.sessionID[:8])))
+        }
+        b.WriteString("\n\n")
 
-	// Output
-	for _, line := range m.output {
-		b.WriteString(m.renderOutputLine(line))
-	}
+        // Output
+        for _, line := range m.output {
+                b.WriteString(m.renderOutputLine(line))
+        }
 
-	// Spinner if running
-	if m.state == stateRunning {
-		b.WriteString(fmt.Sprintf("%s Thinking...\n", spinnerChars[m.spinner]))
-	}
+        // Spinner if running
+        if m.state == stateRunning {
+                b.WriteString(fmt.Sprintf("%s Thinking...\n", spinnerChars[m.spinner]))
+        }
 
-	// Usage summary
-	if m.totalUsage.InputTokens > 0 {
-		b.WriteString(usageStyle.Render(fmt.Sprintf(
-			"\nTokens: %d in, %d out",
-			m.totalUsage.InputTokens,
-			m.totalUsage.OutputTokens,
-		)))
-		b.WriteString("\n")
-	}
+        // Usage summary
+        if m.totalUsage.InputTokens > 0 {
+                b.WriteString(usageStyle.Render(fmt.Sprintf(
+                        "\nTokens: %d in, %d out",
+                        m.totalUsage.InputTokens,
+                        m.totalUsage.OutputTokens,
+                )))
+                b.WriteString("\n")
+        }
 
-	// Input prompt
-	if !m.quit {
-		b.WriteString(promptStyle.Render("⟩ "))
-		b.WriteString(m.input)
-		b.WriteString("\n")
-	}
+        // Input prompt
+        if !m.quit {
+                b.WriteString(promptStyle.Render("⟩ "))
+                b.WriteString(m.input)
+                b.WriteString("\n")
+        }
 
-	return b.String()
+        return b.String()
 }
 
 // renderOutputLine renders a single output line.
 func (m *replModel) renderOutputLine(line OutputLine) string {
-	switch line.Type {
-	case "user":
-		return userStyle.Render("⟩ " + line.Content) + "\n\n"
+        switch line.Type {
+        case "user":
+                return userStyle.Render("⟩ " + line.Content) + "\n\n"
 
-	case "text":
-		rendered := line.Content
-		if m.renderer != nil {
-			md, err := m.renderer.Render(line.Content)
-			if err == nil {
-				rendered = md
-			}
-		}
-		return rendered + "\n"
+        case "text":
+                rendered := line.Content
+                if m.renderer != nil {
+                        md, err := m.renderer.Render(line.Content)
+                        if err == nil {
+                                rendered = md
+                        }
+                }
+                return rendered + "\n"
 
-	case "tool_use":
-		var b strings.Builder
-		b.WriteString(toolNameStyle.Render(fmt.Sprintf("▸ %s", line.ToolName)))
-		if line.Content != "" {
-			b.WriteString("\n")
-			// Truncate long tool inputs for display
-			if len(line.Content) > 500 {
-				b.WriteString(toolResultStyle.Render(line.Content[:500] + "..."))
-			} else {
-				b.WriteString(toolResultStyle.Render(line.Content))
-			}
-		}
-		b.WriteString("\n")
-		return b.String()
+        case "tool_use":
+                var b strings.Builder
+                b.WriteString(toolNameStyle.Render(fmt.Sprintf("▸ %s", line.ToolName)))
+                if line.Content != "" {
+                        b.WriteString("\n")
+                        // Truncate long tool inputs for display
+                        if len(line.Content) > 500 {
+                                b.WriteString(toolResultStyle.Render(line.Content[:500] + "..."))
+                        } else {
+                                b.WriteString(toolResultStyle.Render(line.Content))
+                        }
+                }
+                b.WriteString("\n")
+                return b.String()
 
-	case "tool_result":
-		var b strings.Builder
-		b.WriteString(toolResultStyle.Render(fmt.Sprintf("  ✓ %s", line.ToolName)))
-		if line.Duration > 0 {
-			b.WriteString(usageStyle.Render(fmt.Sprintf(" (%.1fs)", line.Duration.Seconds())))
-		}
-		b.WriteString("\n")
-		// Truncate long tool results for display
-		content := strings.TrimSpace(line.Content)
-		if len(content) > 2000 {
-			content = content[:2000] + "\n... [output truncated]"
-		}
-		if content != "" {
-			b.WriteString(toolResultStyle.Render(indent(content, "    ")))
-			b.WriteString("\n")
-		}
-		return b.String()
+        case "tool_result":
+                var b strings.Builder
+                b.WriteString(toolResultStyle.Render(fmt.Sprintf("  ✓ %s", line.ToolName)))
+                if line.Duration > 0 {
+                        b.WriteString(usageStyle.Render(fmt.Sprintf(" (%.1fs)", line.Duration.Seconds())))
+                }
+                b.WriteString("\n")
+                // Truncate long tool results for display
+                content := strings.TrimSpace(line.Content)
+                if len(content) > 2000 {
+                        content = content[:2000] + "\n... [output truncated]"
+                }
+                if content != "" {
+                        b.WriteString(toolResultStyle.Render(indent(content, "    ")))
+                        b.WriteString("\n")
+                }
+                return b.String()
 
-	case "error":
-		return errorStyle.Render("✗ " + line.Content) + "\n\n"
+        case "error":
+                return errorStyle.Render("✗ " + line.Content) + "\n\n"
 
-	case "system":
-		return systemStyle.Render(line.Content) + "\n"
+        case "system":
+                return systemStyle.Render(line.Content) + "\n"
 
-	default:
-		return line.Content + "\n"
-	}
+        default:
+                return line.Content + "\n"
+        }
 }
 
 // handleCommand processes slash commands.
 func (m replModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
-	parts := strings.Fields(cmd)
-	if len(parts) == 0 {
-		return m, nil
-	}
+        parts := strings.Fields(cmd)
+        if len(parts) == 0 {
+                return m, nil
+        }
 
-	switch parts[0] {
-	case "/help", "/?":
-		helpText := `
+        switch parts[0] {
+        case "/help", "/?":
+                helpText := `
 Available commands:
   /help              Show this help message
   /clear             Clear conversation history
@@ -397,396 +417,396 @@ Available commands:
   /tools             List available tools
   /quit, /exit       Exit the application
 `
-		m.output = append(m.output, OutputLine{
-			Type:    "system",
-			Content: helpText,
-		})
-		return m, nil
+                m.output = append(m.output, OutputLine{
+                        Type:    "system",
+                        Content: helpText,
+                })
+                return m, nil
 
-	case "/clear":
-		m.agent.Reset()
-		m.totalUsage = llm.Usage{}
-		m.sessionID = ""
-		m.output = append(m.output, OutputLine{
-			Type:    "system",
-			Content: "Conversation cleared.",
-		})
-		return m, nil
+        case "/clear":
+                m.agent.Reset()
+                m.totalUsage = llm.Usage{}
+                m.sessionID = ""
+                m.output = append(m.output, OutputLine{
+                        Type:    "system",
+                        Content: "Conversation cleared.",
+                })
+                return m, nil
 
-	case "/compact":
-		m.state = stateRunning
-		return m, m.runCompact()
+        case "/compact":
+                m.state = stateRunning
+                return m, m.runCompact()
 
-	case "/model":
-		if len(parts) > 1 {
-			newModel := strings.Join(parts[1:], " ")
-			m.agent.SetModel(newModel)
-			m.output = append(m.output, OutputLine{
-				Type:    "system",
-				Content: fmt.Sprintf("Model set to: %s", newModel),
-			})
-		} else {
-			models := m.agent.ProviderName()
-			m.output = append(m.output, OutputLine{
-				Type:    "system",
-				Content: fmt.Sprintf("Current model: %s (provider: %s)", m.agent.Model(), models),
-			})
-		}
-		return m, nil
+        case "/model":
+                if len(parts) > 1 {
+                        newModel := strings.Join(parts[1:], " ")
+                        m.agent.SetModel(newModel)
+                        m.output = append(m.output, OutputLine{
+                                Type:    "system",
+                                Content: fmt.Sprintf("Model set to: %s", newModel),
+                        })
+                } else {
+                        models := m.agent.ProviderName()
+                        m.output = append(m.output, OutputLine{
+                                Type:    "system",
+                                Content: fmt.Sprintf("Current model: %s (provider: %s)", m.agent.Model(), models),
+                        })
+                }
+                return m, nil
 
-	case "/cost":
-		cost := fmt.Sprintf("Token usage:\n  Input: %d\n  Output: %d", m.totalUsage.InputTokens, m.totalUsage.OutputTokens)
-		m.output = append(m.output, OutputLine{
-			Type:    "system",
-			Content: cost,
-		})
-		return m, nil
+        case "/cost":
+                cost := fmt.Sprintf("Token usage:\n  Input: %d\n  Output: %d", m.totalUsage.InputTokens, m.totalUsage.OutputTokens)
+                m.output = append(m.output, OutputLine{
+                        Type:    "system",
+                        Content: cost,
+                })
+                return m, nil
 
-	case "/provider":
-		m.output = append(m.output, OutputLine{
-			Type:    "system",
-			Content: fmt.Sprintf("Provider: %s", m.agent.ProviderName()),
-		})
-		return m, nil
+        case "/provider":
+                m.output = append(m.output, OutputLine{
+                        Type:    "system",
+                        Content: fmt.Sprintf("Provider: %s", m.agent.ProviderName()),
+                })
+                return m, nil
 
-	case "/save":
-		return m, m.saveCurrentSession()
+        case "/save":
+                return m, m.saveCurrentSession()
 
-	case "/resume":
-		resumeID := ""
-		if len(parts) > 1 {
-			resumeID = parts[1]
-		}
-		m.state = stateRunning
-		return m, m.resumeSession(resumeID)
+        case "/resume":
+                resumeID := ""
+                if len(parts) > 1 {
+                        resumeID = parts[1]
+                }
+                m.state = stateRunning
+                return m, m.resumeSession(resumeID)
 
-	case "/sessions":
-		m.state = stateRunning
-		return m, m.listSessions()
+        case "/sessions":
+                m.state = stateRunning
+                return m, m.listSessions()
 
-	case "/tools":
-		m.output = append(m.output, OutputLine{
-			Type:    "system",
-			Content: "Available tools: file_read, file_write, file_edit, bash, glob, grep, todo_write, web_search, web_fetch",
-		})
-		return m, nil
+        case "/tools":
+                m.output = append(m.output, OutputLine{
+                        Type:    "system",
+                        Content: "Available tools: file_read, file_write, file_edit, bash, glob, grep, todo_write, web_search, web_fetch",
+                })
+                return m, nil
 
-	case "/quit", "/exit", "/q":
-		m.quit = true
-		return m, tea.Quit
+        case "/quit", "/exit", "/q":
+                m.quit = true
+                return m, tea.Quit
 
-	default:
-		m.output = append(m.output, OutputLine{
-			Type:    "error",
-			Content: fmt.Sprintf("Unknown command: %s (type /help for available commands)", parts[0]),
-		})
-		return m, nil
-	}
+        default:
+                m.output = append(m.output, OutputLine{
+                        Type:    "error",
+                        Content: fmt.Sprintf("Unknown command: %s (type /help for available commands)", parts[0]),
+                })
+                return m, nil
+        }
 }
 
 // runAgent runs the agent in a goroutine and returns commands to the tea runtime.
 func (m replModel) runAgent(input string) tea.Cmd {
-	return func() tea.Msg {
-		// Collect output via callbacks
-		var collectedOutput []OutputLine
-		var totalUsage llm.Usage
-		var agentErr error
+        return func() tea.Msg {
+                // Collect output via callbacks
+                var collectedOutput []OutputLine
+                var totalUsage llm.Usage
+                var agentErr error
 
-		cb := agent.Callbacks{
-			OnText: func(text string) {
-				collectedOutput = append(collectedOutput, OutputLine{
-					Type:    "text",
-					Content: text,
-				})
-			},
-			OnToolUse: func(name string, input any) {
-				collectedOutput = append(collectedOutput, OutputLine{
-					Type:     "tool_use",
-					ToolName: name,
-					Content:  formatToolInput(input),
-				})
-			},
-			OnToolResult: func(name string, output string, duration time.Duration) {
-				collectedOutput = append(collectedOutput, OutputLine{
-					Type:     "tool_result",
-					ToolName: name,
-					Content:  output,
-					Duration: duration,
-				})
-			},
-			OnTurnEnd: func(turn int, usage llm.Usage) {
-				totalUsage.InputTokens += usage.InputTokens
-				totalUsage.OutputTokens += usage.OutputTokens
-				totalUsage.CacheRead += usage.CacheRead
-				totalUsage.CacheCreate += usage.CacheCreate
-			},
-			OnError: func(err error) {
-				collectedOutput = append(collectedOutput, OutputLine{
-					Type:    "error",
-					Content: err.Error(),
-				})
-			},
-			OnPermission: func(tool string, input any) bool {
-				return true
-			},
-		}
+                cb := agent.Callbacks{
+                        OnText: func(text string) {
+                                collectedOutput = append(collectedOutput, OutputLine{
+                                        Type:    "text",
+                                        Content: text,
+                                })
+                        },
+                        OnToolUse: func(name string, input any) {
+                                collectedOutput = append(collectedOutput, OutputLine{
+                                        Type:     "tool_use",
+                                        ToolName: name,
+                                        Content:  formatToolInput(input),
+                                })
+                        },
+                        OnToolResult: func(name string, output string, duration time.Duration) {
+                                collectedOutput = append(collectedOutput, OutputLine{
+                                        Type:     "tool_result",
+                                        ToolName: name,
+                                        Content:  output,
+                                        Duration: duration,
+                                })
+                        },
+                        OnTurnEnd: func(turn int, usage llm.Usage) {
+                                totalUsage.InputTokens += usage.InputTokens
+                                totalUsage.OutputTokens += usage.OutputTokens
+                                totalUsage.CacheRead += usage.CacheRead
+                                totalUsage.CacheCreate += usage.CacheCreate
+                        },
+                        OnError: func(err error) {
+                                collectedOutput = append(collectedOutput, OutputLine{
+                                        Type:    "error",
+                                        Content: err.Error(),
+                                })
+                        },
+                        OnPermission: func(tool string, input any) bool {
+                                return true
+                        },
+                }
 
-		a := m.agent
-		a.SetCallbacks(cb)
-		agentErr = a.Run(context.Background(), input)
+                a := m.agent
+                a.SetCallbacks(cb)
+                agentErr = a.Run(context.Background(), input)
 
-		return agentCompleteMsg{
-			output: collectedOutput,
-			usage:  totalUsage,
-			err:    agentErr,
-		}
-	}
+                return agentCompleteMsg{
+                        output: collectedOutput,
+                        usage:  totalUsage,
+                        err:    agentErr,
+                }
+        }
 }
 
 // runCompact runs the compaction command.
 func (m replModel) runCompact() tea.Cmd {
-	return func() tea.Msg {
-		a := m.agent
-		a.SetCallbacks(agent.Callbacks{
-			OnError: func(err error) {
-				// noop — handled below
-			},
-		})
+        return func() tea.Msg {
+                a := m.agent
+                a.SetCallbacks(agent.Callbacks{
+                        OnError: func(err error) {
+                                // noop — handled below
+                        },
+                })
 
-		err := a.Compact(context.Background())
-		if err != nil {
-			return agentCompleteMsg{
-				output: []OutputLine{
-					{Type: "error", Content: fmt.Sprintf("Compaction failed: %v", err)},
-				},
-				usage: llm.Usage{},
-				err:   err,
-			}
-		}
+                err := a.Compact(context.Background())
+                if err != nil {
+                        return agentCompleteMsg{
+                                output: []OutputLine{
+                                        {Type: "error", Content: fmt.Sprintf("Compaction failed: %v", err)},
+                                },
+                                usage: llm.Usage{},
+                                err:   err,
+                        }
+                }
 
-		return agentCompleteMsg{
-			output: []OutputLine{
-				{Type: "system", Content: "Conversation compacted successfully."},
-			},
-			usage: llm.Usage{},
-		}
-	}
+                return agentCompleteMsg{
+                        output: []OutputLine{
+                                {Type: "system", Content: "Conversation compacted successfully."},
+                        },
+                        usage: llm.Usage{},
+                }
+        }
 }
 
 // saveCurrentSession saves the current conversation as a session.
 func (m replModel) saveCurrentSession() tea.Cmd {
-	return func() tea.Msg {
-		history := m.agent.History()
-		if len(history) == 0 {
-			return agentCompleteMsg{
-				output: []OutputLine{
-					{Type: "system", Content: "Nothing to save — conversation is empty."},
-				},
-			}
-		}
+        return func() tea.Msg {
+                history := m.agent.History()
+                if len(history) == 0 {
+                        return agentCompleteMsg{
+                                output: []OutputLine{
+                                        {Type: "system", Content: "Nothing to save — conversation is empty."},
+                                },
+                        }
+                }
 
-		id := session.NewSessionID()
-		sess := session.FromMessages(id, history, m.agent.Model(), m.agent.ProviderName(),
-			m.totalUsage.InputTokens, m.totalUsage.OutputTokens)
+                id := session.NewSessionID()
+                sess := session.FromMessages(id, history, m.agent.Model(), m.agent.ProviderName(),
+                        m.totalUsage.InputTokens, m.totalUsage.OutputTokens)
 
-		if err := session.SaveSession(m.sessionDir, sess); err != nil {
-			return agentCompleteMsg{
-				output: []OutputLine{
-					{Type: "error", Content: fmt.Sprintf("Failed to save session: %v", err)},
-				},
-			}
-		}
+                if err := session.SaveSession(m.sessionDir, sess); err != nil {
+                        return agentCompleteMsg{
+                                output: []OutputLine{
+                                        {Type: "error", Content: fmt.Sprintf("Failed to save session: %v", err)},
+                                },
+                        }
+                }
 
-		m.sessionID = id
-		return agentCompleteMsg{
-			output: []OutputLine{
-				{Type: "system", Content: fmt.Sprintf("Session saved: %s", id)},
-			},
-		}
-	}
+                m.sessionID = id
+                return agentCompleteMsg{
+                        output: []OutputLine{
+                                {Type: "system", Content: fmt.Sprintf("Session saved: %s", id)},
+                        },
+                }
+        }
 }
 
 // resumeSession loads and resumes a saved session.
 func (m replModel) resumeSession(id string) tea.Cmd {
-	return func() tea.Msg {
-		sessDir := m.sessionDir
-		if id == "" {
-			// Load the most recent session
-			sessions, err := session.ListSessions(sessDir)
-			if err != nil {
-				return agentCompleteMsg{
-					output: []OutputLine{
-						{Type: "error", Content: fmt.Sprintf("Failed to list sessions: %v", err)},
-					},
-				}
-			}
-			if len(sessions) == 0 {
-				return agentCompleteMsg{
-					output: []OutputLine{
-						{Type: "system", Content: "No saved sessions found."},
-					},
-				}
-			}
-			id = sessions[0].ID
-		}
+        return func() tea.Msg {
+                sessDir := m.sessionDir
+                if id == "" {
+                        // Load the most recent session
+                        sessions, err := session.ListSessions(sessDir)
+                        if err != nil {
+                                return agentCompleteMsg{
+                                        output: []OutputLine{
+                                                {Type: "error", Content: fmt.Sprintf("Failed to list sessions: %v", err)},
+                                        },
+                                }
+                        }
+                        if len(sessions) == 0 {
+                                return agentCompleteMsg{
+                                        output: []OutputLine{
+                                                {Type: "system", Content: "No saved sessions found."},
+                                        },
+                                }
+                        }
+                        id = sessions[0].ID
+                }
 
-		sess, err := session.LoadSession(sessDir, id)
-		if err != nil {
-			return agentCompleteMsg{
-				output: []OutputLine{
-					{Type: "error", Content: fmt.Sprintf("Failed to load session %s: %v", id, err)},
-				},
-			}
-		}
+                sess, err := session.LoadSession(sessDir, id)
+                if err != nil {
+                        return agentCompleteMsg{
+                                output: []OutputLine{
+                                        {Type: "error", Content: fmt.Sprintf("Failed to load session %s: %v", id, err)},
+                                },
+                        }
+                }
 
-		// Restore state
-		if sess.Model != "" {
-			m.agent.SetModel(sess.Model)
-		}
-		m.agent.SetMessages(sess.ToMessages())
-		m.totalUsage = llm.Usage{
-			InputTokens:  sess.TokensIn,
-			OutputTokens: sess.TokensOut,
-		}
-		m.sessionID = sess.ID
+                // Restore state
+                if sess.Model != "" {
+                        m.agent.SetModel(sess.Model)
+                }
+                m.agent.SetMessages(sess.ToMessages())
+                m.totalUsage = llm.Usage{
+                        InputTokens:  sess.TokensIn,
+                        OutputTokens: sess.TokensOut,
+                }
+                m.sessionID = sess.ID
 
-		return agentCompleteMsg{
-			output: []OutputLine{
-				{Type: "system", Content: fmt.Sprintf("Resumed session %s (model: %s, messages: %d)", sess.ID, sess.Model, len(sess.Messages))},
-			},
-		}
-	}
+                return agentCompleteMsg{
+                        output: []OutputLine{
+                                {Type: "system", Content: fmt.Sprintf("Resumed session %s (model: %s, messages: %d)", sess.ID, sess.Model, len(sess.Messages))},
+                        },
+                }
+        }
 }
 
 // listSessions lists all saved sessions.
 func (m replModel) listSessions() tea.Cmd {
-	return func() tea.Msg {
-		sessions, err := session.ListSessions(m.sessionDir)
-		if err != nil {
-			return agentCompleteMsg{
-				output: []OutputLine{
-					{Type: "error", Content: fmt.Sprintf("Failed to list sessions: %v", err)},
-				},
-			}
-		}
+        return func() tea.Msg {
+                sessions, err := session.ListSessions(m.sessionDir)
+                if err != nil {
+                        return agentCompleteMsg{
+                                output: []OutputLine{
+                                        {Type: "error", Content: fmt.Sprintf("Failed to list sessions: %v", err)},
+                                },
+                        }
+                }
 
-		if len(sessions) == 0 {
-			return agentCompleteMsg{
-				output: []OutputLine{
-					{Type: "system", Content: "No saved sessions found."},
-				},
-			}
-		}
+                if len(sessions) == 0 {
+                        return agentCompleteMsg{
+                                output: []OutputLine{
+                                        {Type: "system", Content: "No saved sessions found."},
+                                },
+                        }
+                }
 
-		var buf strings.Builder
-		buf.WriteString(fmt.Sprintf("Saved sessions (%d):\n\n", len(sessions)))
-		for i, s := range sessions {
-			summary := s.Summary
-			if summary == "" {
-				summary = "(no summary)"
-			}
-			buf.WriteString(fmt.Sprintf("  %d. %s  model=%s  msgs=%d  updated=%s\n", i+1, s.ID[:8], s.Model, len(s.Messages), s.UpdatedAt.Format("2006-01-02 15:04")))
-			if len(summary) > 60 {
-				summary = summary[:60] + "..."
-			}
-			buf.WriteString(fmt.Sprintf("     %s\n", summary))
-		}
+                var buf strings.Builder
+                buf.WriteString(fmt.Sprintf("Saved sessions (%d):\n\n", len(sessions)))
+                for i, s := range sessions {
+                        summary := s.Summary
+                        if summary == "" {
+                                summary = "(no summary)"
+                        }
+                        buf.WriteString(fmt.Sprintf("  %d. %s  model=%s  msgs=%d  updated=%s\n", i+1, s.ID[:8], s.Model, len(s.Messages), s.UpdatedAt.Format("2006-01-02 15:04")))
+                        if len(summary) > 60 {
+                                summary = summary[:60] + "..."
+                        }
+                        buf.WriteString(fmt.Sprintf("     %s\n", summary))
+                }
 
-		return agentCompleteMsg{
-			output: []OutputLine{
-				{Type: "system", Content: buf.String()},
-			},
-		}
-	}
+                return agentCompleteMsg{
+                        output: []OutputLine{
+                                {Type: "system", Content: buf.String()},
+                        },
+                }
+        }
 }
 
 // autoSaveSession saves the current session if there is one.
 func (m *replModel) autoSaveSession() {
-	history := m.agent.History()
-	if len(history) == 0 {
-		return
-	}
+        history := m.agent.History()
+        if len(history) == 0 {
+                return
+        }
 
-	id := m.sessionID
-	if id == "" {
-		id = session.NewSessionID()
-		m.sessionID = id
-	}
+        id := m.sessionID
+        if id == "" {
+                id = session.NewSessionID()
+                m.sessionID = id
+        }
 
-	sess := session.FromMessages(id, history, m.agent.Model(), m.agent.ProviderName(),
-		m.totalUsage.InputTokens, m.totalUsage.OutputTokens)
-	// Preserve created-at from existing session
-	if prev, err := session.LoadSession(m.sessionDir, id); err == nil {
-		sess.CreatedAt = prev.CreatedAt
-	}
+        sess := session.FromMessages(id, history, m.agent.Model(), m.agent.ProviderName(),
+                m.totalUsage.InputTokens, m.totalUsage.OutputTokens)
+        // Preserve created-at from existing session
+        if prev, err := session.LoadSession(m.sessionDir, id); err == nil {
+                sess.CreatedAt = prev.CreatedAt
+        }
 
-	_ = session.SaveSession(m.sessionDir, sess)
+        _ = session.SaveSession(m.sessionDir, sess)
 }
 
 // Message types for tea.Cmd communication.
 type agentResultMsg struct {
-	err error
+        err error
 }
 
 type agentTextMsg struct {
-	text string
+        text string
 }
 
 type agentToolUseMsg struct {
-	name  string
-	input any
+        name  string
+        input any
 }
 
 type agentToolResultMsg struct {
-	name     string
-	output   string
-	duration time.Duration
+        name     string
+        output   string
+        duration time.Duration
 }
 
 type agentTurnEndMsg struct {
-	usage llm.Usage
+        usage llm.Usage
 }
 
 type spinnerTickMsg time.Time
 
 type agentCompleteMsg struct {
-	output []OutputLine
-	usage  llm.Usage
-	err    error
+        output []OutputLine
+        usage  llm.Usage
+        err    error
 }
 
 // tickSpinner returns a command that ticks the spinner.
 func tickSpinner() tea.Cmd {
-	return tea.Tick(time.Millisecond*80, func(t time.Time) tea.Msg {
-		return spinnerTickMsg(t)
-	})
+        return tea.Tick(time.Millisecond*80, func(t time.Time) tea.Msg {
+                return spinnerTickMsg(t)
+        })
 }
 
 // formatToolInput formats a tool's input for display.
 func formatToolInput(input any) string {
-	if input == nil {
-		return ""
-	}
-	data, err := json.Marshal(input)
-	if err != nil {
-		return fmt.Sprintf("%v", input)
-	}
-	// Pretty-print the JSON
-	var pretty map[string]any
-	if err := json.Unmarshal(data, &pretty); err == nil {
-		data, err = json.MarshalIndent(pretty, "", "  ")
-		if err == nil {
-			return string(data)
-		}
-	}
-	return string(data)
+        if input == nil {
+                return ""
+        }
+        data, err := json.Marshal(input)
+        if err != nil {
+                return fmt.Sprintf("%v", input)
+        }
+        // Pretty-print the JSON
+        var pretty map[string]any
+        if err := json.Unmarshal(data, &pretty); err == nil {
+                data, err = json.MarshalIndent(pretty, "", "  ")
+                if err == nil {
+                        return string(data)
+                }
+        }
+        return string(data)
 }
 
 // indent indents each line of text with the given prefix.
 func indent(text, prefix string) string {
-	lines := strings.Split(text, "\n")
-	for i, line := range lines {
-		lines[i] = prefix + line
-	}
-	return strings.Join(lines, "\n")
+        lines := strings.Split(text, "\n")
+        for i, line := range lines {
+                lines[i] = prefix + line
+        }
+        return strings.Join(lines, "\n")
 }
