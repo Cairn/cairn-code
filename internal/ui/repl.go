@@ -349,11 +349,11 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                 }
                                 return m, nil
                         }
-                        if m.histIdx > 0 {
-                                m.histIdx--
+                        if len(m.history) > 0 {
+                                if m.histIdx > 0 {
+                                        m.histIdx--
+                                }
                                 m.input = m.history[m.histIdx]
-                        } else if m.histIdx == 0 {
-                                m.input = m.history[0]
                         }
 
                 case "down":
