@@ -52,9 +52,6 @@ type replModel struct {
         spinner    int
         sessionDir string
         sessionID  string // current session ID for auto-save
-        scrollY    int     // current scroll offset (0 = bottom, newest)
-        maxViewY   int     // total rendered height of output
-        atBottom   bool    // whether viewport is at the bottom
 }
 
 var (
@@ -105,7 +102,6 @@ func NewREPL(a *agent.Agent, sessionDir string) *replModel {
                 histIdx:    -1,
                 renderer:   renderer,
                 sessionDir: sessionDir,
-                atBottom:   true,
         }
 }
 
@@ -122,14 +118,6 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 m.height = msg.Height
                 return m, nil
 
-        case tea.MouseMsg:
-                switch msg.Type {
-                case tea.MouseWheelUp:
-                        m.scrollUp(3)
-                case tea.MouseWheelDown:
-                        m.scrollDown(3)
-                }
-
         case tea.KeyMsg:
                 switch msg.String() {
                 case "ctrl+c":
@@ -140,18 +128,6 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         }
                         m.quit = true
                         return m, tea.Quit
-
-                // Scrolling keys
-                case "pgup", "shift+up":
-                        m.scrollUp(m.height / 2)
-                case "pgdown", "shift+down":
-                        m.scrollDown(m.height / 2)
-                case "home":
-                        m.scrollY = m.maxViewY
-                        m.atBottom = false
-                case "end":
-                        m.scrollY = 0
-                        m.atBottom = true
 
                 case "enter":
                         if m.state == stateRunning {
@@ -351,119 +327,17 @@ func (m replModel) View() string {
                 content.WriteString("\n")
         }
 
-        fullContent := content.String()
-        contentLines := strings.Split(fullContent, "\n")
-        // Remove trailing empty line from final newline
-        if len(contentLines) > 0 && contentLines[len(contentLines)-1] == "" {
-                contentLines = contentLines[:len(contentLines)-1]
-        }
-
-        // Calculate viewport height (leave room for header line + input line + padding)
-        viewportHeight := m.height - 4
-        if viewportHeight < 1 {
-                viewportHeight = 1
-        }
-
-        totalHeight := len(contentLines)
-
-        // Auto-scroll to bottom when new output arrives and user is at bottom
-        if m.atBottom || m.scrollY < 0 {
-                m.scrollY = 0
-                m.atBottom = true
-        }
-
-        // Clamp scrollY
-        maxScroll := totalHeight - viewportHeight
-        if maxScroll < 0 {
-                maxScroll = 0
-        }
-        if m.scrollY > maxScroll {
-                m.scrollY = maxScroll
-        }
-        m.maxViewY = maxScroll
-
-        // Determine visible window
-        // scrollY=0 means bottom (newest), scrollY=maxScroll means top (oldest)
-        startIdx := totalHeight - viewportHeight - m.scrollY
-        if startIdx < 0 {
-                startIdx = 0
-        }
-        endIdx := startIdx + viewportHeight
-        if endIdx > totalHeight {
-                endIdx = totalHeight
-        }
-
-        // Build visible content with scrollbar
-        var b strings.Builder
-        showScrollbar := totalHeight > viewportHeight
-        var thumbStart, thumbEnd int
-        if showScrollbar {
-                // Thumb height proportional to viewport/content ratio, min 1
-                thumbHeight := viewportHeight * viewportHeight / totalHeight
-                if thumbHeight < 1 {
-                        thumbHeight = 1
-                }
-                // Thumb position based on scroll offset
-                var ratio float64
-                if maxScroll > 0 {
-                        ratio = float64(m.scrollY) / float64(maxScroll)
-                }
-                thumbStart = int(ratio * float64(viewportHeight-thumbHeight))
-                thumbEnd = thumbStart + thumbHeight
-                if thumbEnd > viewportHeight {
-                        thumbEnd = viewportHeight
-                        thumbStart = thumbEnd - thumbHeight
-                }
-        }
-        scrollbarTrackStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-        scrollbarThumbStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("251"))
-        for row := 0; row < viewportHeight; row++ {
-                lineIdx := startIdx + row
-                if lineIdx < totalHeight {
-                        b.WriteString(contentLines[lineIdx])
-                }
-                if showScrollbar {
-                        if row >= thumbStart && row < thumbEnd {
-                                b.WriteString(scrollbarThumbStyle.Render("█"))
-                        } else {
-                                b.WriteString(scrollbarTrackStyle.Render("│"))
-                        }
-                }
-                if row < viewportHeight-1 {
-                        b.WriteString("\n")
-                }
-        }
-
-        // Scroll indicator (text hint)
-        if m.scrollY > 0 {
-                b.WriteString("\n" + systemStyle.Render("▲ pgup/shift+up/home"))
-        } else if !m.atBottom && totalHeight > viewportHeight {
-                b.WriteString("\n" + systemStyle.Render("▼ pgdown/shift+down/end"))
-        }
-
         // Input prompt (always visible at bottom)
         if !m.quit {
-                b.WriteString("\n")
-                b.WriteString(promptStyle.Render("⟩ "))
-                b.WriteString(m.input)
+                content.WriteString("\n")
+                content.WriteString(promptStyle.Render("⟩ "))
+                content.WriteString(m.input)
+                if m.state == stateRunning {
+                        content.WriteString(spinnerChars[m.spinner])
+                }
         }
 
-        return b.String()
-}
-
-// scrollUp moves the viewport toward older content (increases scrollY).
-func (m *replModel) scrollUp(amount int) {
-        m.scrollY += amount
-        m.atBottom = false
-}
-
-// scrollDown moves the viewport toward newer content (decreases scrollY).
-func (m *replModel) scrollDown(amount int) {
-        m.scrollY -= amount
-        if m.scrollY <= 0 {
-                m.scrollY = 0
-                m.atBottom = true
-        }
+        return content.String()
 }
 
 // renderOutputLine renders a single output line.
