@@ -5,6 +5,7 @@ import (
         "encoding/json"
         "fmt"
         "html"
+        "math/rand/v2"
         "os/exec"
         "regexp"
         "strings"
@@ -52,6 +53,7 @@ type replModel struct {
         renderer   *glamour.TermRenderer
         spinner    int
         spinnerDir int  // +1 forward, -1 backward (ping-pong)
+        currentVerb string // picked once per turn, stays fixed (Claude Code style)
         cursorBlink bool
         sessionDir string
         sessionID  string // current session ID for auto-save
@@ -114,14 +116,23 @@ var (
         // Spinner: braille bounce pattern (ping-pong like Claude Code)
         spinnerChars = []string{"⠂", "⠐", "⠄", "⠅", "⠆", "⠇", "⠈", "⠠", "⠠", "⠠"}
 
-        // Playful spinner verbs (Claude Code style)
+        // Playful spinner verbs (Claude Code style) — picked once per turn at random
         spinnerVerbs = []string{
-                "Thinking", "Clauding", "Cogitating", "Crafting", "Analyzing",
-                "Reasoning", "Deliberating", "Reflecting", "Processing", "Computing",
-                "Exploring", "Investigating", "Synthesizing", "Constructing", "Pondering",
-                "Examining", "Evaluating", "Generating", "Assembling", "Navigating",
-                "Researching", "Resolving", "Orchestrating", "Optimizing", "Refining",
-                "Brainstorming", "Architecting", "Implementing", "Tracing", "Modeling",
+                // Cognitive
+                "Thinking", "Clauding", "Cogitating", "Contemplating", "Deliberating",
+                "Mulling", "Pondering", "Ruminating", "Musing", "Percolating",
+                "Reasoning", "Analyzing", "Reflecting", "Processing", "Computing",
+                "Brainstorming", "Architecting", "Synthesizing", "Constructing", "Evaluating",
+                // Action
+                "Crafting", "Building", "Forging", "Shaping", "Wiring",
+                "Assembling", "Implementing", "Orchestrating", "Refining", "Polishing",
+                "Exploring", "Investigating", "Tracing", "Navigating", "Searching",
+                "Generating", "Resolving", "Optimizing", "Compiling", "Debugging",
+                // Whimsical
+                "Claude-hopping", "Baking", "Brewing", "Simmering", "Sautéing",
+                "Caramelizing", "Garnishing", "Kneading", "Zesting", "Fermenting",
+                "Beboppin'", "Moonwalking", "Razzle-dazzling", "Gitifying", "Wibbling",
+                "Reticulating", "Quantumizing", "Crunching", "Churning", "MacGyvering",
         }
 
         toolDescriptions = map[string]string{
@@ -255,6 +266,7 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                         m.pickerSelect = 0
                                         m.pickerScroll = 0
                                         m.state = stateRunning
+                                        m.currentVerb = pickSpinnerVerb()
                                         return m, tea.Batch(m.resumeSession(selected.ID), tickSpinner())
                                 }
                                 m.showSessionPicker = false
@@ -309,6 +321,7 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                                 Content: input,
                                         })
                                         m.state = stateRunning
+                                        m.currentVerb = pickSpinnerVerb()
                                         return m, tea.Batch(m.runBashCommand(bashCmd), tickSpinner())
                                 }
                                 return m, nil
@@ -326,6 +339,7 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
                         // Run agent (with spinner)
                         m.state = stateRunning
+                        m.currentVerb = pickSpinnerVerb()
                         return m, tea.Batch(m.runAgent(input), tickSpinner())
 
                 case "up":
@@ -631,8 +645,10 @@ func (m replModel) View() string {
 
         // Spinner if running
         if m.state == stateRunning {
-                verbIdx := (m.spinner + len(m.output)) % len(spinnerVerbs)
-                verb := spinnerVerbs[verbIdx]
+                verb := m.currentVerb
+                if verb == "" {
+                        verb = spinnerVerbs[0]
+                }
                 content.WriteString(fmt.Sprintf("%s %s…", spinnerChars[m.spinner], verb))
         }
 
@@ -1180,6 +1196,7 @@ func (m *replModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
 
         case "/compact":
                 m.state = stateRunning
+                m.currentVerb = pickSpinnerVerb()
                 return m, tea.Batch(m.runCompact(), tickSpinner())
 
         case "/model":
@@ -1222,14 +1239,17 @@ func (m *replModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
                         // Resume specific session by ID
                         resumeID := parts[1]
                         m.state = stateRunning
+                        m.currentVerb = pickSpinnerVerb()
                         return m, tea.Batch(m.resumeSession(resumeID), tickSpinner())
                 }
                 // No ID given — show session picker
                 m.state = stateRunning
+                m.currentVerb = pickSpinnerVerb()
                 return m, tea.Batch(m.loadSessionsForPicker(), tickSpinner())
 
         case "/sessions":
                 m.state = stateRunning
+                m.currentVerb = pickSpinnerVerb()
                 return m, tea.Batch(m.listSessions(), tickSpinner())
 
         case "/tools":
@@ -1249,7 +1269,7 @@ func (m *replModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
                 })
                 return m, nil
 
-        case "/exit", "/q":
+        case "/exit", "/quit", "/q":
                 m.quit = true
                 return m, tea.Quit
 
@@ -1602,6 +1622,11 @@ func tickSpinner() tea.Cmd {
         return tea.Tick(time.Millisecond*80, func(t time.Time) tea.Msg {
                 return spinnerTickMsg(t)
         })
+}
+
+// pickSpinnerVerb randomly selects a spinner verb (once per turn, Claude Code style).
+func pickSpinnerVerb() string {
+        return spinnerVerbs[rand.IntN(len(spinnerVerbs))]
 }
 
 // tickCursorBlink returns a command that blinks the cursor every 530ms.
