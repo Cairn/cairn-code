@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/Go-1.24-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go">
-  <img src="https://img.shields.io/badge/CLI-agentic_ loop-6e40c9?style=for-the-badge" alt="Agent Loop">
-  <img src="https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20Ollama-f472b6?style=for-the-badge" alt="Multi-Provider">
-  <img src="https://img.shields.io/badge/TUI-bubbletea-FF6F00?style=for-the-badge&logo=bubbletea&logoColor=black" alt="Bubbletea">
-  <img src="https://img.shields.io/badge/Tools-9-22c55e?style=for-the-badge" alt="9 Tools">
+  <img src="https://img.shields.io/badge/Go-1.24-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go"><br>
+  <img src="https://img.shields.io/badge/CLI-agentic%20loop-6e40c9?style=for-the-badge" alt="Agent Loop"><br>
+  <img src="https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20Ollama-f472b6?style=for-the-badge" alt="Multi-Provider"><br>
+  <img src="https://img.shields.io/badge/TUI-bubbletea-FF6F00?style=for-the-badge" alt="Bubbletea"><br>
+  <img src="https://img.shields.io/badge/Tools-9-22c55e?style=for-the-badge" alt="9 Tools"><br>
   <img src="https://img.shields.io/badge/Private-Cairn-1a1b26?style=for-the-badge" alt="Private">
 </p>
 
