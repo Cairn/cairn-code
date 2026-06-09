@@ -159,7 +159,7 @@ func main() {
         }
 
         // Interactive REPL mode — pass session dir to the REPL
-        p := tea.NewProgram(ui.NewREPL(ag, sessDir), tea.WithMouseAllMotion())
+        p := tea.NewProgram(ui.NewREPL(ag, sessDir), tea.WithAltScreen(), tea.WithMouseCellMotion())
         if _, err := p.Run(); err != nil {
                 fmt.Fprintf(os.Stderr, "Error: %v\n", err)
                 os.Exit(1)
