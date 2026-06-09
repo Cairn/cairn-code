@@ -1,0 +1,32 @@
+# Binaries
+/cairn-code
+/cairn-code-*
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (may contain API keys)
+cairn-code.json
+
+# Database
+*.db
+
+# Environment
+.env

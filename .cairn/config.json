@@ -1,0 +1,7 @@
+{
+  "default_provider": "opencode",
+  "default_model": "big-pickle",
+  "permissions": {
+    "auto_allow": ["FileRead", "Glob", "Grep", "TodoWrite", "Bash", "FileWrite", "FileEdit"]
+  }
+}
