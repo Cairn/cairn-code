@@ -53,6 +53,9 @@ type replModel struct {
         cursorBlink bool
         sessionDir string
         sessionID  string // current session ID for auto-save
+        lastCtrlC  time.Time
+        showQuit   bool   // whether quit confirmation is showing
+        quitChoice int    // 0 = yes, 1 = no
 }
 
 var (
@@ -122,15 +125,37 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         case tea.KeyMsg:
                 switch msg.String() {
                 case "ctrl+c":
+                        if m.showQuit {
+                                // Already showing quit dialog — dismiss it
+                                m.showQuit = false
+                                return m, nil
+                        }
                         if m.state == stateRunning {
-                                // Request cancellation - will be handled by context
+                                // Agent is running — quit immediately
                                 m.quit = true
                                 return m, tea.Quit
                         }
-                        m.quit = true
-                        return m, tea.Quit
+                        // If pressed within 500ms of last Ctrl+C, show quit dialog
+                        if time.Since(m.lastCtrlC) < 500*time.Millisecond {
+                                m.showQuit = true
+                                m.quitChoice = 1 // default to No
+                                return m, nil
+                        }
+                        // Single press — clear input
+                        m.lastCtrlC = time.Now()
+                        m.input = ""
+                        m.cursor = 0
+                        return m, nil
 
                 case "enter":
+                        if m.showQuit {
+                                if m.quitChoice == 0 {
+                                        m.quit = true
+                                        return m, tea.Quit
+                                }
+                                m.showQuit = false
+                                return m, nil
+                        }
                         if m.state == stateRunning {
                                 return m, nil
                         }
@@ -206,13 +231,34 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         }
 
                 case "left":
+                        if m.showQuit {
+                                m.quitChoice = 0 // Yes
+                                return m, nil
+                        }
                         if m.cursor > 0 {
                                 m.cursor--
                         }
 
                 case "right":
+                        if m.showQuit {
+                                m.quitChoice = 1 // No
+                                return m, nil
+                        }
                         if m.cursor < len(m.input) {
                                 m.cursor++
+                        }
+
+                // Quit dialog shortcuts
+                case "y", "Y":
+                        if m.showQuit {
+                                m.quitChoice = 0
+                                m.quit = true
+                                return m, tea.Quit
+                        }
+                case "n", "N", "esc":
+                        if m.showQuit {
+                                m.showQuit = false
+                                return m, nil
                         }
 
                 default:
@@ -347,7 +393,122 @@ func (m replModel) View() string {
                 content.WriteString(after)
         }
 
+        // Quit confirmation overlay
+        if m.showQuit {
+                dialog := m.renderQuitDialog()
+                return dialog
+        }
+
         return content.String()
+}
+
+// renderQuitDialog renders a centered quit confirmation dialog.
+func (m *replModel) renderQuitDialog() string {
+        dialogWidth := 40
+        dialogHeight := 7
+
+        // Calculate center position
+        vertPad := (m.height - dialogHeight) / 2
+        if vertPad < 0 {
+                vertPad = 0
+        }
+        horizPad := (m.width - dialogWidth) / 2
+        if horizPad < 0 {
+                horizPad = 0
+        }
+
+        var b strings.Builder
+
+        // Vertical padding to center
+        for i := 0; i < vertPad; i++ {
+                b.WriteString("\n")
+        }
+
+        // Horizontal padding
+        horizSpace := strings.Repeat(" ", horizPad)
+
+        // Box border style
+        borderStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
+        yellowStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("221")).Bold(true)
+        dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+
+        // Top border
+        b.WriteString(horizSpace)
+        b.WriteString(borderStyle.Render("┌" + strings.Repeat("─", dialogWidth-2) + "┌"))
+        b.WriteString("\n")
+
+        // Title line
+        b.WriteString(horizSpace)
+        title := "  Quit Cairn Code?  "
+        titlePad := dialogWidth - 2 - len(title)
+        if titlePad < 0 {
+                titlePad = 0
+        }
+        b.WriteString(borderStyle.Render("│"))
+        b.WriteString(yellowStyle.Render(title + strings.Repeat(" ", titlePad)))
+        b.WriteString(borderStyle.Render("│"))
+        b.WriteString("\n")
+
+        // Empty line
+        b.WriteString(horizSpace)
+        b.WriteString(borderStyle.Render("│" + strings.Repeat(" ", dialogWidth-2) + "│"))
+        b.WriteString("\n")
+
+        // Options line: [ Yes ]  [ No ]
+        b.WriteString(horizSpace)
+        b.WriteString(borderStyle.Render("│"))
+        innerPad := (dialogWidth - 2 - 18) / 2
+        b.WriteString(strings.Repeat(" ", innerPad))
+
+        yesStyle := promptStyle.Bold(true)
+        noStyle := dimStyle
+        if m.quitChoice == 0 {
+                yesStyle = yellowStyle.Bold(true)
+        } else {
+                noStyle = yellowStyle.Bold(true)
+        }
+        b.WriteString(yesStyle.Render("◀ Yes ▶"))
+        b.WriteString(dimStyle.Render("    "))
+        b.WriteString(noStyle.Render("◀ No ▶"))
+
+        remaining := dialogWidth - 2 - innerPad - 18
+        if remaining > 0 {
+                b.WriteString(strings.Repeat(" ", remaining))
+        }
+        b.WriteString(borderStyle.Render("│"))
+        b.WriteString("\n")
+
+        // Empty line
+        b.WriteString(horizSpace)
+        b.WriteString(borderStyle.Render("│" + strings.Repeat(" ", dialogWidth-2) + "│"))
+        b.WriteString("\n")
+
+        // Hint line
+        b.WriteString(horizSpace)
+        b.WriteString(borderStyle.Render("│"))
+        hint := dimStyle.Render(" ← → to select, Enter to confirm ")
+        hintPad := dialogWidth - 2 - len("[ ← → to select, Enter to confirm ]")
+        if hintPad < 0 {
+                hintPad = 0
+        }
+        // Strip ANSI to count visible chars for padding
+        hintText := " ← → to select, Enter to confirm "
+        visHint := len(hintText)
+        totalPad := dialogWidth - 2 - visHint
+        if totalPad < 0 {
+                totalPad = 0
+        }
+        b.WriteString(strings.Repeat(" ", (totalPad)/2))
+        b.WriteString(hint)
+        b.WriteString(strings.Repeat(" ", totalPad - totalPad/2))
+        b.WriteString(borderStyle.Render("│"))
+        b.WriteString("\n")
+
+        // Bottom border
+        b.WriteString(horizSpace)
+        b.WriteString(borderStyle.Render("└" + strings.Repeat("─", dialogWidth-2) + "┘"))
+
+        return b.String()
 }
 
 // renderOutputLine renders a single output line.
