@@ -53,6 +53,9 @@ type replModel struct {
         renderer   *glamour.TermRenderer
         spinner    int
         currentVerb string // picked once per turn, stays fixed (Claude Code style)
+        streamingText string // text accumulating during streaming (rendered raw, no glamour yet)
+        streamChunkCh  chan string          // channel for receiving streaming chunks from agent goroutine
+        streamResultCh chan agentCompleteMsg // receives final agent result when goroutine finishes
         cursorBlink bool
         sessionDir string
         sessionID  string // current session ID for auto-save
@@ -88,6 +91,9 @@ var (
 
         errorStyle = lipgloss.NewStyle().
                         Foreground(lipgloss.Color("196")) // red
+
+        textStyle = lipgloss.NewStyle().
+                        Foreground(lipgloss.Color("252")) // bright white for streaming text
 
         systemStyle = lipgloss.NewStyle().
                         Foreground(lipgloss.Color("245")) // dim
@@ -527,6 +533,7 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 m.totalUsage.OutputTokens += msg.usage.OutputTokens
                 m.totalUsage.CacheRead += msg.usage.CacheRead
                 m.totalUsage.CacheCreate += msg.usage.CacheCreate
+                m.streamingText = "" // clear streaming buffer
                 if msg.err != nil {
                         m.err = msg.err
                 }
@@ -576,6 +583,53 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 m.spinner = (m.spinner + 1) % len(spinnerChars)
                 if m.state == stateRunning {
                         return m, tickSpinner()
+                }
+                return m, nil
+
+        case drainStreamMsg:
+                // Non-blocking drain: read all pending chunks from channel
+                if m.streamChunkCh != nil {
+                        for {
+                                select {
+                                case chunk, ok := <-m.streamChunkCh:
+                                        if !ok {
+                                                // Channel closed — agent goroutine finished
+                                                m.streamChunkCh = nil
+                                                // Read the final result and process inline
+                                                if m.streamResultCh != nil {
+                                                        result := <-m.streamResultCh
+                                                        m.streamResultCh = nil
+                                                        // Process the completion inline
+                                                        m.state = stateIdle
+                                                        m.output = append(m.output, result.output...)
+                                                        m.totalUsage.InputTokens += result.usage.InputTokens
+                                                        m.totalUsage.OutputTokens += result.usage.OutputTokens
+                                                        m.totalUsage.CacheRead += result.usage.CacheRead
+                                                        m.totalUsage.CacheCreate += result.usage.CacheCreate
+                                                        m.streamingText = ""
+                                                        if result.err != nil {
+                                                                m.err = result.err
+                                                        }
+                                                        if len(m.agent.History()) > 0 {
+                                                                m.autoSaveSession()
+                                                        }
+                                                }
+                                                break
+                                        }
+                                        m.streamingText += chunk
+                                        // Check for stream clear sentinel (from OnText commit)
+                                        if strings.Contains(m.streamingText, "\x00STREAM_CLEAR\x00") {
+                                                m.streamingText = ""
+                                        }
+                                default:
+                                        // No more chunks available right now
+                                        break
+                                }
+                        }
+                }
+                // Keep polling while running
+                if m.state == stateRunning {
+                        return m, drainStreamTicks()
                 }
                 return m, nil
 
@@ -630,7 +684,29 @@ func (m replModel) View() string {
                 content.WriteString(m.renderOutputLine(line))
         }
 
-        // Spinner if running
+        // Streaming text (rendered live as it arrives)
+        if m.streamingText != "" {
+                // Split into complete lines + partial last line
+                // Render complete lines through glamour, leave partial line raw
+                lines := strings.Split(m.streamingText, "\n")
+                for i, line := range lines {
+                        if i == len(lines)-1 && line == "" {
+                                // Trailing newline from split — skip
+                                continue
+                        }
+                        if i == len(lines)-1 {
+                                // Last (potentially incomplete) line — render raw
+                                content.WriteString(textStyle.Render(line))
+                        } else {
+                                // Complete line — render through glamour
+                                content.WriteString(m.renderStreamingLine(line))
+                                content.WriteString("\n")
+                        }
+                }
+                content.WriteString("\n")
+        }
+
+        // Spinner if running (shows below streaming text)
         if m.state == stateRunning {
                 verb := m.currentVerb
                 if verb == "" {
@@ -1098,6 +1174,18 @@ func (m *replModel) renderBanner() string {
         return b.String()
 }
 
+// renderStreamingLine renders a single line from the streaming buffer through glamour.
+// Used for complete lines during live streaming (not the final commit).
+func (m *replModel) renderStreamingLine(line string) string {
+        if m.renderer != nil {
+                md, err := m.renderer.Render(line)
+                if err == nil {
+                        return md
+                }
+        }
+        return line
+}
+
 // renderOutputLine renders a single output line.
 func (m *replModel) renderOutputLine(line OutputLine) string {
         switch line.Type {
@@ -1318,63 +1406,98 @@ func (m replModel) runBashCommand(cmd string) tea.Cmd {
         }
 }
 
-// runAgent runs the agent in a goroutine and returns commands to the tea runtime.
+// runAgent starts the agent in a goroutine with a channel for streaming updates.
 func (m replModel) runAgent(input string) tea.Cmd {
+        // Create channel for streaming chunks — stored in model for polling
+        chunkCh := make(chan string, 256)
+        resultCh := make(chan agentCompleteMsg, 1)
+
         return func() tea.Msg {
-                // Collect output via callbacks
-                var collectedOutput []OutputLine
-                var totalUsage llm.Usage
-                var agentErr error
+                // Store channels in model for polling
+                m.streamChunkCh = chunkCh
+                m.streamResultCh = resultCh
 
-                cb := agent.Callbacks{
-                        OnText: func(text string) {
-                                collectedOutput = append(collectedOutput, OutputLine{
-                                        Type:    "text",
-                                        Content: text,
-                                })
-                        },
-                        OnToolUse: func(name string, input any) {
-                                collectedOutput = append(collectedOutput, OutputLine{
-                                        Type:     "tool_use",
-                                        ToolName: name,
-                                        Content:  formatToolInput(input),
-                                })
-                        },
-                        OnToolResult: func(name string, output string, duration time.Duration) {
-                                collectedOutput = append(collectedOutput, OutputLine{
-                                        Type:     "tool_result",
-                                        ToolName: name,
-                                        Content:  output,
-                                        Duration: duration,
-                                })
-                        },
-                        OnTurnEnd: func(turn int, usage llm.Usage) {
-                                totalUsage.InputTokens += usage.InputTokens
-                                totalUsage.OutputTokens += usage.OutputTokens
-                                totalUsage.CacheRead += usage.CacheRead
-                                totalUsage.CacheCreate += usage.CacheCreate
-                        },
-                        OnError: func(err error) {
-                                collectedOutput = append(collectedOutput, OutputLine{
-                                        Type:    "error",
-                                        Content: err.Error(),
-                                })
-                        },
-                        OnPermission: func(tool string, input any) bool {
-                                return true
-                        },
-                }
+                // Start agent in background goroutine
+                go func() {
+                        var collectedOutput []OutputLine
+                        var totalUsage llm.Usage
 
-                a := m.agent
-                a.SetCallbacks(cb)
-                agentErr = a.Run(context.Background(), input)
+                        cb := agent.Callbacks{
+                                OnText: func(text string) {
+                                        // Final committed text (full response after streaming done)
+                                        collectedOutput = append(collectedOutput, OutputLine{
+                                                Type:    "text",
+                                                Content: text,
+                                        })
+                                        // Signal UI to clear streaming buffer
+                                        select {
+                                        case chunkCh <- "\x00STREAM_CLEAR\x00":
+                                        default:
+                                        }
+                                },
+                                OnStreamChunk: func(chunk string) {
+                                        select {
+                                        case chunkCh <- chunk:
+                                        default:
+                                        }
+                                },
+                                OnToolUse: func(name string, input any) {
+                                        collectedOutput = append(collectedOutput, OutputLine{
+                                                Type:     "tool_use",
+                                                ToolName: name,
+                                                Content:  formatToolInput(input),
+                                        })
+                                },
+                                OnToolResult: func(name string, output string, duration time.Duration) {
+                                        collectedOutput = append(collectedOutput, OutputLine{
+                                                Type:     "tool_result",
+                                                ToolName: name,
+                                                Content:  output,
+                                                Duration: duration,
+                                        })
+                                },
+                                OnTurnEnd: func(turn int, usage llm.Usage) {
+                                        totalUsage.InputTokens += usage.InputTokens
+                                        totalUsage.OutputTokens += usage.OutputTokens
+                                        totalUsage.CacheRead += usage.CacheRead
+                                        totalUsage.CacheCreate += usage.CacheCreate
+                                },
+                                OnError: func(err error) {
+                                        collectedOutput = append(collectedOutput, OutputLine{
+                                                Type:    "error",
+                                                Content: err.Error(),
+                                        })
+                                },
+                                OnPermission: func(tool string, input any) bool {
+                                        return true
+                                },
+                        }
 
-                return agentCompleteMsg{
-                        output: collectedOutput,
-                        usage:  totalUsage,
-                        err:    agentErr,
-                }
+                        a := m.agent
+                        a.SetCallbacks(cb)
+                        agentErr := a.Run(context.Background(), input)
+
+                        resultCh <- agentCompleteMsg{
+                                output: collectedOutput,
+                                usage:  totalUsage,
+                                err:    agentErr,
+                        }
+                        close(chunkCh)
+                }()
+
+                // Start draining chunks immediately
+                return drainStreamMsg{}
         }
+}
+
+// drainStreamMsg triggers non-blocking drain of the streaming chunk channel.
+type drainStreamMsg struct{}
+
+// drainStreamTicks returns a command that polls the chunk channel at ~60fps.
+func drainStreamTicks() tea.Cmd {
+        return tea.Tick(time.Millisecond*16, func(t time.Time) tea.Msg {
+                return drainStreamMsg{}
+        })
 }
 
 // runCompact runs the compaction command.

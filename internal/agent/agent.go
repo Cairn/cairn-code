@@ -31,13 +31,14 @@ type TodoItem = tools.TodoItem
 
 // Callbacks provides hooks for the UI to observe agent behavior.
 type Callbacks struct {
-        OnText       func(text string)
-        OnToolUse    func(name string, input any)
-        OnToolResult func(name string, output string, duration time.Duration)
-        OnTurnStart  func(turn int)
-        OnTurnEnd    func(turn int, usage llm.Usage)
-        OnError      func(err error)
-        OnPermission func(tool string, input any) bool // return true to allow
+        OnText        func(text string)
+        OnStreamChunk func(chunk string) // called per-token during streaming
+        OnToolUse     func(name string, input any)
+        OnToolResult  func(name string, output string, duration time.Duration)
+        OnTurnStart   func(turn int)
+        OnTurnEnd     func(turn int, usage llm.Usage)
+        OnError       func(err error)
+        OnPermission  func(tool string, input any) bool // return true to allow
 }
 
 // NewAgent creates a new Agent with the given provider, tools, and config.
@@ -183,15 +184,17 @@ func (a *Agent) callStreaming(ctx context.Context, sp llm.StreamingProvider, too
         resp, err := sp.StreamMessage(ctx, a.messages, tools, system, a.model, func(chunk string, done bool) {
                 if !done && chunk != "" {
                         streamedText.WriteString(chunk)
+                        // Fire per-token callback for live UI streaming
+                        if a.callbacks.OnStreamChunk != nil {
+                                a.callbacks.OnStreamChunk(chunk)
+                        }
                 }
         })
         if err != nil {
                 return nil, err
         }
 
-        // Emit the complete streamed text as a single OnText call.
-        // This prevents the UI from rendering each token through glamour
-        // separately, which would break markdown into fragmented paragraphs.
+        // Emit the complete streamed text as a single OnText call for committed output.
         if streamedText.Len() > 0 && a.callbacks.OnText != nil {
                 a.callbacks.OnText(streamedText.String())
         }
