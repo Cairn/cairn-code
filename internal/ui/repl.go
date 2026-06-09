@@ -57,6 +57,11 @@ type replModel struct {
         showQuit   bool   // whether quit confirmation is showing
         quitChoice int    // 0 = yes, 1 = no
         cmdSelect  int    // selected index in command autocomplete
+        // Session picker
+        showSessionPicker bool              // whether session picker is showing
+        pickerSessions    []session.Session // sessions to pick from
+        pickerSelect      int              // selected index in picker
+        pickerScroll      int              // scroll offset for picker
 }
 
 var (
@@ -126,7 +131,7 @@ func filteredCommands(prefix string) []cmdDef {
 
 // showAutocomplete returns true if we should show the command palette.
 func (m *replModel) showAutocomplete() bool {
-        return strings.HasPrefix(m.input, "/") && !m.showQuit
+        return strings.HasPrefix(m.input, "/") && !m.showQuit && !m.showSessionPicker
 }
 
 // NewREPL creates a new REPL model.
@@ -164,6 +169,13 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         case tea.KeyMsg:
                 switch msg.String() {
                 case "ctrl+c":
+                        if m.showSessionPicker {
+                                m.showSessionPicker = false
+                                m.pickerSessions = nil
+                                m.pickerSelect = 0
+                                m.pickerScroll = 0
+                                return m, nil
+                        }
                         if m.showQuit {
                                 // Already showing quit dialog — dismiss it
                                 m.showQuit = false
@@ -187,6 +199,20 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         return m, nil
 
                 case "enter":
+                        if m.showSessionPicker {
+                                if m.pickerSelect >= 0 && m.pickerSelect < len(m.pickerSessions) {
+                                        selected := m.pickerSessions[m.pickerSelect]
+                                        m.showSessionPicker = false
+                                        m.pickerSessions = nil
+                                        m.pickerSelect = 0
+                                        m.pickerScroll = 0
+                                        m.state = stateRunning
+                                        return m, tea.Batch(m.resumeSession(selected.ID), tickSpinner())
+                                }
+                                m.showSessionPicker = false
+                                m.pickerSessions = nil
+                                return m, nil
+                        }
                         if m.showQuit {
                                 if m.quitChoice == 0 {
                                         m.quit = true
@@ -238,6 +264,15 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         return m, tea.Batch(m.runAgent(input), tickSpinner())
 
                 case "up":
+                        if m.showSessionPicker {
+                                if m.pickerSelect > 0 {
+                                        m.pickerSelect--
+                                        if m.pickerSelect < m.pickerScroll {
+                                                m.pickerScroll = m.pickerSelect
+                                        }
+                                }
+                                return m, nil
+                        }
                         if m.showAutocomplete() {
                                 matches := filteredCommands(m.input)
                                 if len(matches) > 0 {
@@ -256,6 +291,17 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         }
 
                 case "down":
+                        if m.showSessionPicker {
+                                if m.pickerSelect < len(m.pickerSessions)-1 {
+                                        m.pickerSelect++
+                                        // Visible height: dialog height minus borders minus title minus footer
+                                        visibleHeight := m.pickerVisibleHeight()
+                                        if m.pickerSelect >= m.pickerScroll+visibleHeight {
+                                                m.pickerScroll = m.pickerSelect - visibleHeight + 1
+                                        }
+                                }
+                                return m, nil
+                        }
                         if m.showAutocomplete() {
                                 matches := filteredCommands(m.input)
                                 if len(matches) > 0 {
@@ -365,6 +411,13 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         m.cursor++
                         m.cmdSelect = 0
                 case "esc":
+                        if m.showSessionPicker {
+                                m.showSessionPicker = false
+                                m.pickerSessions = nil
+                                m.pickerSelect = 0
+                                m.pickerScroll = 0
+                                return m, nil
+                        }
                         if m.showQuit {
                                 m.showQuit = false
                                 return m, nil
@@ -452,6 +505,29 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         case cursorBlinkMsg:
                 m.cursorBlink = !m.cursorBlink
                 return m, tickCursorBlink()
+
+        case sessionsLoadedMsg:
+                m.state = stateIdle
+                if msg.err != nil {
+                        m.output = append(m.output, OutputLine{
+                                Type:    "error",
+                                Content: fmt.Sprintf("Failed to list sessions: %v", msg.err),
+                        })
+                        return m, nil
+                }
+                if len(msg.sessions) == 0 {
+                        m.output = append(m.output, OutputLine{
+                                Type:    "system",
+                                Content: "No saved sessions found.",
+                        })
+                        return m, nil
+                }
+                // Show the picker
+                m.showSessionPicker = true
+                m.pickerSessions = msg.sessions
+                m.pickerSelect = 0
+                m.pickerScroll = 0
+                return m, nil
         }
 
         return m, nil
@@ -539,6 +615,11 @@ func (m replModel) View() string {
                 content.WriteString(after)
         }
 
+        // Session picker overlay
+        if m.showSessionPicker {
+                return m.renderSessionPicker()
+        }
+
         // Quit confirmation overlay
         if m.showQuit {
                 dialog := m.renderQuitDialog()
@@ -546,6 +627,226 @@ func (m replModel) View() string {
         }
 
         return content.String()
+}
+
+// pickerVisibleHeight returns the number of session rows that fit in the picker dialog.
+func (m *replModel) pickerVisibleHeight() int {
+        // Reserve: top border(1) + title(1) + separator(1) + footer hint(1) + bottom border(1) = 5
+        // Also leave some margin at top and bottom of terminal
+        maxDialogHeight := m.height - 6
+        if maxDialogHeight < 5 {
+                maxDialogHeight = 5
+        }
+        visible := maxDialogHeight - 5 // subtract borders/title/footer
+        if visible < 1 {
+                visible = 1
+        }
+        if visible > len(m.pickerSessions) {
+                visible = len(m.pickerSessions)
+        }
+        return visible
+}
+
+// renderSessionPicker renders a centered session picker overlay.
+func (m *replModel) renderSessionPicker() string {
+        dialogWidth := 70
+        numSessions := len(m.pickerSessions)
+        visibleHeight := m.pickerVisibleHeight()
+        dialogHeight := 5 + visibleHeight // border + title + separator + items + footer + border
+
+        // Calculate center position
+        vertPad := (m.height - dialogHeight) / 2
+        if vertPad < 1 {
+                vertPad = 1
+        }
+        horizPad := (m.width - dialogWidth) / 2
+        if horizPad < 2 {
+                horizPad = 2
+        }
+
+        var b strings.Builder
+
+        // Vertical padding to center
+        for i := 0; i < vertPad; i++ {
+                b.WriteString("\n")
+        }
+
+        // Horizontal padding
+        horizSpace := strings.Repeat(" ", horizPad)
+
+        // Styles
+        borderStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
+        yellowStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("221")).Bold(true)
+        dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+        selectedBg := lipgloss.NewStyle().Background(lipgloss.Color("63")).Foreground(lipgloss.Color("230")).Bold(true)
+        metaStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+        summaryStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+
+        // Top border
+        b.WriteString(horizSpace)
+        b.WriteString(borderStyle.Render("┌" + strings.Repeat("─", dialogWidth-2) + "┐"))
+        b.WriteString("\n")
+
+        // Title line
+        b.WriteString(horizSpace)
+        titleText := "  ⚡ Resume Session"
+        titlePad := dialogWidth - 2 - len(titleText)
+        if titlePad < 0 {
+                titlePad = 0
+        }
+        line := fmt.Sprintf("%s%s%s", borderStyle.Render("│"), yellowStyle.Render(titleText+strings.Repeat(" ", titlePad)), borderStyle.Render("│"))
+        b.WriteString(line)
+        b.WriteString("\n")
+
+        // Separator line
+        b.WriteString(horizSpace)
+        b.WriteString(borderStyle.Render("├" + strings.Repeat("─", dialogWidth-2) + "┤"))
+        b.WriteString("\n")
+
+        // Session entries (scrollable)
+        endIdx := m.pickerScroll + visibleHeight
+        if endIdx > numSessions {
+                endIdx = numSessions
+        }
+
+        for i := m.pickerScroll; i < endIdx; i++ {
+                s := m.pickerSessions[i]
+                b.WriteString(horizSpace)
+                b.WriteString(borderStyle.Render("│"))
+
+                // Build the session entry line
+                shortID := s.ID[:8]
+                summary := s.Summary
+                if summary == "" {
+                        // Generate a short description from first user message
+                        summary = m.sessionPreview(&s)
+                }
+                if len(summary) > 40 {
+                        summary = summary[:37] + "..."
+                }
+
+                timeStr := s.UpdatedAt.Format("Jan 02 15:04")
+                meta := fmt.Sprintf("%s  %s  %d msgs", timeStr, shortID, len(s.Messages))
+
+                isSelected := (i == m.pickerSelect)
+                innerPad := dialogWidth - 2 - 2 // -2 for left/right margin
+                if isSelected {
+                        // Selected row: highlight
+                        entryLine := fmt.Sprintf(" ▸ %s", summary)
+                        // Pad the entry to fill the dialog width
+                        entryVisLen := len(fmt.Sprintf(" ▸ %s", summary))
+                        metaVisLen := len(meta)
+                        totalVis := entryVisLen + metaVisLen
+                        if totalVis > innerPad {
+                                if entryVisLen+3 > innerPad {
+                                        entryLine = fmt.Sprintf(" ▸ %s", summary[:innerPad-3])
+                                        entryVisLen = innerPad
+                                }
+                                meta = meta[:innerPad-entryVisLen]
+                        }
+                        pad := innerPad - len(entryLine) - len(meta)
+                        if pad < 0 {
+                                pad = 0
+                        }
+                        b.WriteString(selectedBg.Render(entryLine))
+                        b.WriteString(strings.Repeat(" ", pad))
+                        b.WriteString(selectedBg.Render(meta))
+                } else {
+                        entryLine := fmt.Sprintf("   %s", summary)
+                        entryVisLen := len(entryLine)
+                        metaVisLen := len(meta)
+                        totalVis := entryVisLen + metaVisLen
+                        if totalVis > innerPad {
+                                if entryVisLen+3 > innerPad {
+                                        entryLine = fmt.Sprintf("   %s", summary[:innerPad-3])
+                                        entryVisLen = innerPad
+                                }
+                                meta = meta[:innerPad-entryVisLen]
+                        }
+                        pad := innerPad - len(entryLine) - len(meta)
+                        if pad < 0 {
+                                pad = 0
+                        }
+                        b.WriteString(summaryStyle.Render(entryLine))
+                        b.WriteString(strings.Repeat(" ", pad))
+                        b.WriteString(metaStyle.Render(meta))
+                }
+
+                // Pad to dialog width
+                // This is tricky with ANSI; we just add the right border
+                b.WriteString(borderStyle.Render("│"))
+                b.WriteString("\n")
+        }
+
+        // If fewer sessions than visible height, fill with empty rows
+        for i := endIdx; i < m.pickerScroll+visibleHeight; i++ {
+                b.WriteString(horizSpace)
+                b.WriteString(borderStyle.Render("│" + strings.Repeat(" ", dialogWidth-2) + "│"))
+                b.WriteString("\n")
+        }
+
+        // Scroll indicator
+        if numSessions > visibleHeight {
+                b.WriteString(horizSpace)
+                b.WriteString(borderStyle.Render("├" + strings.Repeat("─", dialogWidth-2) + "┤"))
+                b.WriteString("\n")
+
+                // Scroll bar
+                b.WriteString(horizSpace)
+                b.WriteString(borderStyle.Render("│"))
+                scrollHint := dimStyle.Render(fmt.Sprintf("  ↑↓ navigate  Enter select  %d/%d  Esc cancel", m.pickerSelect+1, numSessions))
+                scrollVisLen := len(fmt.Sprintf("  ↑↓ navigate  Enter select  %d/%d  Esc cancel", m.pickerSelect+1, numSessions))
+                hintPad := dialogWidth - 2 - scrollVisLen
+                if hintPad > 0 {
+                        b.WriteString(strings.Repeat(" ", hintPad))
+                } else if hintPad < 0 {
+                        // Truncate - just show what fits
+                        // We already wrote scrollHint, so it's fine if it overflows slightly
+                }
+                b.WriteString(scrollHint)
+                b.WriteString(borderStyle.Render("│"))
+                b.WriteString("\n")
+        } else {
+                // No scrollbar needed - just footer
+                b.WriteString(horizSpace)
+                b.WriteString(borderStyle.Render("├" + strings.Repeat("─", dialogWidth-2) + "┤"))
+                b.WriteString("\n")
+
+                b.WriteString(horizSpace)
+                b.WriteString(borderStyle.Render("│"))
+                hint := dimStyle.Render("  ↑↓ navigate  Enter select  Esc cancel")
+                hintVisLen := len("  ↑↓ navigate  Enter select  Esc cancel")
+                hintPad := dialogWidth - 2 - hintVisLen
+                if hintPad > 0 {
+                        b.WriteString(strings.Repeat(" ", hintPad))
+                }
+                b.WriteString(hint)
+                b.WriteString(borderStyle.Render("│"))
+                b.WriteString("\n")
+        }
+
+        // Bottom border
+        b.WriteString(horizSpace)
+        b.WriteString(borderStyle.Render("└" + strings.Repeat("─", dialogWidth-2) + "┘"))
+
+        return b.String()
+}
+
+// sessionPreview generates a short preview string for a session.
+func (m *replModel) sessionPreview(s *session.Session) string {
+        for _, msg := range s.Messages {
+                if msg.Role == "user" {
+                        content := fmt.Sprintf("%v", msg.Content)
+                        // Extract first line or first N chars
+                        if len(content) > 50 {
+                                content = content[:50]
+                        }
+                        // Remove newlines
+                        content = strings.ReplaceAll(content, "\n", " ")
+                        return content
+                }
+        }
+        return "(empty session)"
 }
 
 // renderQuitDialog renders a centered quit confirmation dialog.
@@ -736,7 +1037,7 @@ Available commands:
   /cost              Show token usage summary
   /provider          Show current provider
   /save              Save current session to disk
-  /resume [id]       Resume a saved session (latest if no ID given)
+  /resume [id]       Resume a saved session (picks from list if no ID given)
   /sessions          List all saved sessions
   /tools             List available tools
   /quit, /exit       Exit the application
@@ -797,12 +1098,15 @@ Available commands:
                 return m, m.saveCurrentSession()
 
         case "/resume":
-                resumeID := ""
                 if len(parts) > 1 {
-                        resumeID = parts[1]
+                        // Resume specific session by ID
+                        resumeID := parts[1]
+                        m.state = stateRunning
+                        return m, tea.Batch(m.resumeSession(resumeID), tickSpinner())
                 }
+                // No ID given — show session picker
                 m.state = stateRunning
-                return m, tea.Batch(m.resumeSession(resumeID), tickSpinner())
+                return m, tea.Batch(m.loadSessionsForPicker(), tickSpinner())
 
         case "/sessions":
                 m.state = stateRunning
@@ -1002,6 +1306,14 @@ func (m replModel) resumeSession(id string) tea.Cmd {
         }
 }
 
+// loadSessionsForPicker loads sessions and returns them via a message for the picker UI.
+func (m replModel) loadSessionsForPicker() tea.Cmd {
+        return func() tea.Msg {
+                sessions, err := session.ListSessions(m.sessionDir)
+                return sessionsLoadedMsg{sessions: sessions, err: err}
+        }
+}
+
 // listSessions lists all saved sessions.
 func (m replModel) listSessions() tea.Cmd {
         return func() tea.Msg {
@@ -1099,6 +1411,11 @@ type agentCompleteMsg struct {
         output []OutputLine
         usage  llm.Usage
         err    error
+}
+
+type sessionsLoadedMsg struct {
+        sessions []session.Session
+        err      error
 }
 
 // tickSpinner returns a command that ticks the spinner.
