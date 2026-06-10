@@ -1414,7 +1414,10 @@ func (m replModel) runBashCommand(cmd string) tea.Cmd {
 }
 
 // runAgent starts the agent in a goroutine with a channel for streaming updates.
-func (m replModel) runAgent(input string) tea.Cmd {
+// Must be a pointer receiver — the closure stores channels on m, and a value
+// receiver would mutate a copy that bubbletea discards, causing the drain loop
+// to skip and the spinner to spin forever.
+func (m *replModel) runAgent(input string) tea.Cmd {
         // Create channel for streaming chunks — stored in model for polling
         chunkCh := make(chan string, 256)
         resultCh := make(chan agentCompleteMsg, 1)
@@ -1558,7 +1561,7 @@ func (m replModel) runCompact() tea.Cmd {
 }
 
 // saveCurrentSession saves the current conversation as a session.
-func (m replModel) saveCurrentSession() tea.Cmd {
+func (m *replModel) saveCurrentSession() tea.Cmd {
         return func() tea.Msg {
                 history := m.agent.History()
                 if len(history) == 0 {
