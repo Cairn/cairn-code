@@ -6,7 +6,7 @@
 
 ## Priority: High
 - [ ] Fix middleware.test.ts audit log failures — 3 tests fail with "Cannot use a closed database" in middleware.test.ts (note: this is Synapse CRM, reference for pattern)
-- [ ] Add OpenCode provider support — opencode.go exists but needs integration testing
+- [x] Add OpenCode provider support — opencode.go exists but needs integration testing
 - [ ] Improve error messages — surface actionable errors when API calls fail (rate limits, auth errors, network issues)
 - [ ] Add file edit tool safety — validate paths, prevent writes outside workspace, add undo support
 
