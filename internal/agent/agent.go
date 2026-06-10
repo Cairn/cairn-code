@@ -57,6 +57,11 @@ func (a *Agent) SetModel(model string) {
         a.model = model
 }
 
+// Config returns the agent's configuration.
+func (a *Agent) Config() *config.Config {
+        return a.config
+}
+
 // Run executes the main agent loop with the given prompt.
 func (a *Agent) Run(ctx context.Context, prompt string) error {
         // Append user message

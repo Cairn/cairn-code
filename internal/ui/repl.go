@@ -72,6 +72,14 @@ type replModel struct {
         pickerSessions    []session.Session // sessions to pick from
         pickerSelect      int              // selected index in picker
         pickerScroll      int              // scroll offset for picker
+
+        // Permission prompt
+        showPermPrompt bool   // whether a permission prompt is showing
+        permTool       string // tool name requesting permission
+        permInput      string // formatted tool input preview
+        permRespCh     chan bool // channel to send user's decision back to agent goroutine
+        sessionAllowedTools map[string]bool // tools auto-approved for this session
+        permReqCh     chan permRequestMsg // receives permission requests from agent goroutine
 }
 
 var (
@@ -215,6 +223,7 @@ func NewREPL(a *agent.Agent, sessionDir, workDir, version string, initialPrompt 
                 sessionDir: sessionDir,
                 workDir:    workDir,
                 version:    version,
+                sessionAllowedTools: make(map[string]bool),
         }
         if len(initialPrompt) > 0 && initialPrompt[0] != "" {
                 m.initialPrompt = initialPrompt[0]
@@ -256,6 +265,53 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 return m, nil
 
         case tea.KeyMsg:
+                // Permission prompt takes priority over all other key handling
+                if m.showPermPrompt {
+                        switch msg.String() {
+                        case "y", "Y":
+                                m.showPermPrompt = false
+                                m.sessionAllowedTools[m.permTool] = true
+                                if m.permRespCh != nil {
+                                        m.permRespCh <- true
+                                        m.permRespCh = nil
+                                }
+                                m.permTool = ""
+                                m.permInput = ""
+                                return m, drainStreamTicks()
+                        case "n", "N":
+                                m.showPermPrompt = false
+                                if m.permRespCh != nil {
+                                        m.permRespCh <- false
+                                        m.permRespCh = nil
+                                }
+                                m.permTool = ""
+                                m.permInput = ""
+                                return m, drainStreamTicks()
+                        case "a", "A":
+                                // Always allow this tool for the session
+                                m.showPermPrompt = false
+                                m.sessionAllowedTools[m.permTool] = true
+                                if m.permRespCh != nil {
+                                        m.permRespCh <- true
+                                        m.permRespCh = nil
+                                }
+                                m.permTool = ""
+                                m.permInput = ""
+                                return m, drainStreamTicks()
+                        case "esc":
+                                // Treat Esc as deny
+                                m.showPermPrompt = false
+                                if m.permRespCh != nil {
+                                        m.permRespCh <- false
+                                        m.permRespCh = nil
+                                }
+                                m.permTool = ""
+                                m.permInput = ""
+                                return m, drainStreamTicks()
+                        }
+                        return m, nil
+                }
+
                 switch msg.String() {
                 case "ctrl+c":
                         if m.showSessionPicker {
@@ -621,15 +677,24 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 return m, nil
 
         case drainStreamMsg:
-                // Non-blocking drain: read all pending chunks from channel
+                // Non-blocking drain: read all pending chunks and permission requests
                 if m.streamChunkCh != nil {
                 drainLoop:
                         for {
                                 select {
+                                case req, ok := <-m.permReqCh:
+                                        if ok {
+                                                // Permission request from agent — show prompt
+                                                m.showPermPrompt = true
+                                                m.permTool = req.tool
+                                                m.permInput = req.input
+                                                m.permRespCh = req.respCh
+                                        }
                                 case chunk, ok := <-m.streamChunkCh:
                                         if !ok {
                                                 // Channel closed — agent goroutine finished
                                                 m.streamChunkCh = nil
+                                                m.permReqCh = nil
                                                 // Read the final result and process inline
                                                 if m.streamResultCh != nil {
                                                         result := <-m.streamResultCh
@@ -770,12 +835,29 @@ func (m replModel) View() string {
         }
 
         // Spinner if running and not yet streaming (hides once response text starts arriving)
-        if m.state == stateRunning && m.streamingText == "" {
+        if m.state == stateRunning && m.streamingText == "" && !m.showPermPrompt {
                 verb := m.currentVerb
                 if verb == "" {
                         verb = spinnerVerbs[0]
                 }
                 content.WriteString(fmt.Sprintf("%s %s…", spinnerChars[m.spinner], verb))
+        }
+
+        // Permission prompt
+        if m.showPermPrompt {
+                // Truncate tool input for display
+                inputPreview := m.permInput
+                if len(inputPreview) > 200 {
+                        inputPreview = inputPreview[:200] + "…"
+                }
+                warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("214")) // orange
+                content.WriteString(warnStyle.Bold(true).Render(fmt.Sprintf("⚠  %s wants to run:", m.permTool)))
+                content.WriteString("\n")
+                content.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render(inputPreview))
+                content.WriteString("\n")
+                permHint := "Allow? [y]es / [n]o / always allow for session [a] / esc to deny"
+                content.WriteString(warnStyle.Render(permHint))
+                content.WriteString("\n")
         }
 
         // Token usage
@@ -1477,6 +1559,8 @@ func (m *replModel) runAgent(input string) tea.Cmd {
         // Create channel for streaming chunks — stored in model for polling
         chunkCh := make(chan string, 256)
         resultCh := make(chan agentCompleteMsg, 1)
+        // Channel for permission requests from agent goroutine to UI
+        permReqCh := make(chan permRequestMsg, 1)
 
         return func() tea.Msg {
                 // Create cancellable context for the agent goroutine
@@ -1486,6 +1570,7 @@ func (m *replModel) runAgent(input string) tea.Cmd {
                 m.streamChunkCh = chunkCh
                 m.streamResultCh = resultCh
                 m.agentCancel = agentCancel
+                m.permReqCh = permReqCh
 
                 // Start agent in background goroutine with panic protection.
                 // Using defer close(chunkCh) ensures the drain loop always unblocks,
@@ -1556,7 +1641,30 @@ func (m *replModel) runAgent(input string) tea.Cmd {
                                         })
                                 },
                                 OnPermission: func(tool string, input any) bool {
-                                        return true
+                                        // Check config deny list first
+                                        cfg := m.agent.Config()
+                                        if cfg != nil && !cfg.IsToolAllowed(tool) {
+                                                return false
+                                        }
+                                        // Check session auto-allowed tools
+                                        if m.sessionAllowedTools[tool] {
+                                                return true
+                                        }
+                                        // Check config auto-allow list
+                                        if cfg != nil && cfg.IsToolAutoAllowed(tool) {
+                                                return true
+                                        }
+                                        // Need to ask user — send request to UI thread
+                                        respCh := make(chan bool, 1)
+                                        toolInput := formatToolInput(input)
+                                        select {
+                                        case permReqCh <- permRequestMsg{tool: tool, input: toolInput, respCh: respCh}:
+                                        case <-agentCtx.Done():
+                                                return false
+                                        }
+                                        // Block until user responds
+                                        allowed := <-respCh
+                                        return allowed
                                 },
                         }
 
@@ -1584,6 +1692,13 @@ func submitInitialPrompt(prompt string) tea.Cmd {
         return func() tea.Msg {
                 return initialPromptMsg(prompt)
         }
+}
+
+// permRequestMsg is sent when the agent requests permission for a tool.
+type permRequestMsg struct {
+        tool  string
+        input string
+        respCh chan bool
 }
 
 // drainStreamMsg triggers non-blocking drain of the streaming chunk channel.
