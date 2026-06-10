@@ -743,8 +743,8 @@ func (m replModel) View() string {
                 content.WriteString("\n")
         }
 
-        // Spinner if running (shows below streaming text)
-        if m.state == stateRunning {
+        // Spinner if running and not yet streaming (hides once response text starts arriving)
+        if m.state == stateRunning && m.streamingText == "" {
                 verb := m.currentVerb
                 if verb == "" {
                         verb = spinnerVerbs[0]
