@@ -333,6 +333,8 @@ func streamOpenAIFormat(ctx context.Context, url, apiKey, orgID string, messages
         var usage openaiUsage
 
         scanner := bufio.NewScanner(resp.Body)
+        // Increase buffer to 1MB — tool call arguments can exceed the default 64KB
+        scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
         for scanner.Scan() {
                 line := scanner.Text()
                 if !strings.HasPrefix(line, "data: ") {

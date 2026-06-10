@@ -229,6 +229,8 @@ func (p *AnthropicProvider) parseAnthropicStream(body io.Reader, cb StreamingCal
         var usage anthropicUsage
 
         scanner := bufio.NewScanner(body)
+        // Increase buffer to 1MB — tool call arguments can exceed the default 64KB
+        scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
         for scanner.Scan() {
                 line := scanner.Text()
                 if !strings.HasPrefix(line, "data: ") {
@@ -300,6 +302,11 @@ func (p *AnthropicProvider) parseAnthropicStream(body io.Reader, cb StreamingCal
                 case "message_stop":
                         cb("", true)
                 }
+        }
+
+        // Safety net: if stream ended without message_stop, still signal done
+        if cb != nil {
+                cb("", true)
         }
 
         // Build content blocks from accumulated stream data
