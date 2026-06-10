@@ -66,6 +66,7 @@ type replModel struct {
         cmdSelect  int    // selected index in command autocomplete
         workDir    string
         version    string
+        initialPrompt string // prompt supplied via CLI args to auto-submit on start
         // Session picker
         showSessionPicker bool              // whether session picker is showing
         pickerSessions    []session.Session // sessions to pick from
@@ -197,7 +198,7 @@ func (m *replModel) showAutocomplete() bool {
 }
 
 // NewREPL creates a new REPL model.
-func NewREPL(a *agent.Agent, sessionDir, workDir, version string) *replModel {
+func NewREPL(a *agent.Agent, sessionDir, workDir, version string, initialPrompt ...string) *replModel {
         renderer, err := glamour.NewTermRenderer(
                 glamour.WithAutoStyle(),
                 glamour.WithEmoji(),
@@ -206,7 +207,7 @@ func NewREPL(a *agent.Agent, sessionDir, workDir, version string) *replModel {
                 renderer = nil
         }
 
-        return &replModel{
+        m := &replModel{
                 agent:      a,
                 state:      stateIdle,
                 histIdx:    -1,
@@ -215,11 +216,19 @@ func NewREPL(a *agent.Agent, sessionDir, workDir, version string) *replModel {
                 workDir:    workDir,
                 version:    version,
         }
+        if len(initialPrompt) > 0 && initialPrompt[0] != "" {
+                m.initialPrompt = initialPrompt[0]
+        }
+        return m
 }
 
 // Init initializes the model.
 func (m *replModel) Init() tea.Cmd {
-        return tea.Batch(tickSpinner(), tickCursorBlink())
+        cmds := []tea.Cmd{tickCursorBlink()}
+        if m.initialPrompt != "" {
+                cmds = append(cmds, submitInitialPrompt(m.initialPrompt))
+        }
+        return tea.Batch(cmds...)
 }
 
 // Update handles messages.
@@ -228,6 +237,22 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         case tea.WindowSizeMsg:
                 m.width = msg.Width
                 m.height = msg.Height
+                return m, nil
+
+        case initialPromptMsg:
+                m.initialPrompt = "" // clear so it doesn't re-trigger
+                input := strings.TrimSpace(string(msg))
+                if input != "" {
+                        m.history = append(m.history, input)
+                        m.histIdx = len(m.history)
+                        m.output = append(m.output, OutputLine{
+                                Type:    "user",
+                                Content: input,
+                        })
+                        m.state = stateRunning
+                        m.currentVerb = pickSpinnerVerb()
+                        return m, tea.Batch(m.runAgent(input), tickSpinner())
+                }
                 return m, nil
 
         case tea.KeyMsg:
@@ -1556,6 +1581,16 @@ func (m *replModel) runAgent(input string) tea.Cmd {
 
                 // Start draining chunks immediately
                 return drainStreamMsg{}
+        }
+}
+
+// initialPromptMsg is sent after Init to auto-submit a CLI-supplied prompt.
+type initialPromptMsg string
+
+// submitInitialPrompt returns a command that sends the initial prompt as a message.
+func submitInitialPrompt(prompt string) tea.Cmd {
+        return func() tea.Msg {
+                return initialPromptMsg(prompt)
         }
 }
 

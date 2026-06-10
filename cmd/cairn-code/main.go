@@ -164,7 +164,7 @@ func main() {
 
         // Interactive REPL mode — pass session dir, working dir, and version to the REPL
         workDir, _ := os.Getwd()
-        p := tea.NewProgram(ui.NewREPL(ag, sessDir, workDir, version))
+        p := tea.NewProgram(ui.NewREPL(ag, sessDir, workDir, version, prompt))
         if _, err := p.Run(); err != nil {
                 fmt.Fprintf(os.Stderr, "Error: %v\n", err)
                 os.Exit(1)
