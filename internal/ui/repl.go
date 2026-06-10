@@ -318,14 +318,15 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                 m.showQuit = false
                                 return m, nil
                         }
-                        // Autocomplete: select command and execute
+                        // Autocomplete: complete and execute
                         if m.showAutocomplete() {
                                 matches := filteredCommands(m.input)
                                 if m.cmdSelect < len(matches) {
-                                        m.input = matches[m.cmdSelect].name + " "
-                                        m.cursor = len(m.input)
+                                        cmd := matches[m.cmdSelect].name
+                                        m.input = ""
+                                        m.cursor = 0
                                         m.cmdSelect = 0
-                                        return m, nil
+                                        return m.handleCommand(cmd)
                                 }
                         }
                         if m.state == stateRunning {
@@ -440,18 +441,9 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         if m.showAutocomplete() {
                                 matches := filteredCommands(m.input)
                                 if m.cmdSelect < len(matches) {
-                                        cmd := matches[m.cmdSelect].name
-                                        m.input = cmd
+                                        m.input = matches[m.cmdSelect].name
                                         m.cursor = len(m.input)
                                         m.cmdSelect = 0
-                                        // Commands that take no arguments — execute immediately
-                                        switch cmd {
-                                        case "/clear", "/compact", "/cost", "/exit", "/quit", "/q",
-                                                "/provider", "/save", "/sessions", "/tools":
-                                                m.input = ""
-                                                m.cursor = 0
-                                                return m.handleCommand(cmd)
-                                        }
                                 }
                                 return m, nil
                         }
