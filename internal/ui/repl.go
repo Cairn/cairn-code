@@ -694,20 +694,50 @@ func (m replModel) View() string {
         // Streaming text (rendered live as it arrives)
         if m.streamingText != "" {
                 // Split into complete lines + partial last line
-                // Render complete lines through glamour, leave partial line raw
+                // Render all complete lines as a single markdown block through glamour,
+                // so multi-line constructs (paragraphs, lists, code blocks) render correctly.
+                // Only the last potentially-incomplete line is rendered raw.
                 lines := strings.Split(m.streamingText, "\n")
-                for i, line := range lines {
-                        if i == len(lines)-1 && line == "" {
-                                // Trailing newline from split — skip
-                                continue
-                        }
-                        if i == len(lines)-1 {
-                                // Last (potentially incomplete) line — render raw
-                                content.WriteString(textStyle.Render(line))
+                if len(lines) > 1 {
+                        // Separate the last (potentially incomplete) line from the rest
+                        lastLine := lines[len(lines)-1]
+                        completeText := strings.Join(lines[:len(lines)-1], "\n")
+                        if strings.HasSuffix(m.streamingText, "\n") {
+                                // streamingText ends with newline — all lines are complete
+                                if m.renderer != nil {
+                                        md, err := m.renderer.Render(completeText + "\n" + lastLine)
+                                        if err == nil {
+                                                content.WriteString(md)
+                                        } else {
+                                                content.WriteString(textStyle.Render(completeText + "\n" + lastLine))
+                                        }
+                                } else {
+                                        content.WriteString(textStyle.Render(completeText + "\n" + lastLine))
+                                }
                         } else {
-                                // Complete line — render through glamour
-                                content.WriteString(m.renderStreamingLine(line))
-                                content.WriteString("\n")
+                                // Last line is incomplete — render complete lines as block, last line raw
+                                if completeText != "" {
+                                        if m.renderer != nil {
+                                                md, err := m.renderer.Render(completeText)
+                                                if err == nil {
+                                                        content.WriteString(md)
+                                                } else {
+                                                        content.WriteString(textStyle.Render(completeText))
+                                                        content.WriteString("\n")
+                                                }
+                                        } else {
+                                                content.WriteString(textStyle.Render(completeText))
+                                                content.WriteString("\n")
+                                        }
+                                }
+                                if lastLine != "" {
+                                        content.WriteString(textStyle.Render(lastLine))
+                                }
+                        }
+                } else {
+                        // Only one line (no newlines yet) — render raw
+                        if lines[0] != "" {
+                                content.WriteString(textStyle.Render(lines[0]))
                         }
                 }
                 content.WriteString("\n")
