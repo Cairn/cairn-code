@@ -682,11 +682,9 @@ func (m replModel) View() string {
         // Render all output into full content
         var content strings.Builder
 
-        // Welcome banner (shown once at start, before any output)
-        if len(m.output) == 0 && m.state == stateIdle {
-                content.WriteString(m.renderBanner())
-                content.WriteString("\n")
-        }
+        // Welcome banner (always shown at top)
+        content.WriteString(m.renderBanner())
+        content.WriteString("\n")
 
         // Output
         for _, line := range m.output {
