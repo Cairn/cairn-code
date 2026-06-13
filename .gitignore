@@ -1,0 +1,37 @@
+# Binary (the built executable, NOT the source dir)
+/cairn-code
+
+# Go
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sessions (user data)
+sessions/
+
+# Config (user data)
+.cairn/
+
+# Credentials - NEVER commit
+.github_creds.json
+.env*
+*.pem
+
+# Logs
+*.log
+dev.log
+dev.out.log
+server.log
+
+# Misc
+.z-ai-config
+.claude
+local-*
