@@ -134,7 +134,12 @@ func main() {
                                 fmt.Fprintf(os.Stderr, "● %s\n", name)
                         },
                         OnToolResult: func(name string, output string, duration time.Duration) {
-                                fmt.Fprintf(os.Stderr, "● %s (%.1fs)\n", name, duration.Seconds())
+                                durStr := formatPrintDuration(duration)
+                                if durStr != "" {
+                                        fmt.Fprintf(os.Stderr, "● %s (%s)\n", name, durStr)
+                                } else {
+                                        fmt.Fprintf(os.Stderr, "● %s\n", name)
+                                }
                         },
                         OnPermission: func(tool string, input any) bool {
                                 return true // Auto-allow in print mode
@@ -169,4 +174,16 @@ func main() {
                 fmt.Fprintf(os.Stderr, "Error: %v\n", err)
                 os.Exit(1)
         }
+}
+
+// formatPrintDuration returns a human-friendly duration string for print mode.
+func formatPrintDuration(d time.Duration) string {
+        if d <= 0 {
+                return ""
+        }
+        ms := d.Milliseconds()
+        if ms >= 1000 {
+                return fmt.Sprintf("%.1fs", d.Seconds())
+        }
+        return fmt.Sprintf("%dms", ms)
 }
