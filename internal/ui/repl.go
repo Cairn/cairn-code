@@ -54,7 +54,7 @@ type replModel struct {
         spinner    int
         currentVerb string // picked once per turn, stays fixed (Claude Code style)
         streamingText string // text accumulating during streaming (rendered raw, no glamour yet)
-        streamChunkCh  chan string          // channel for receiving streaming chunks from agent goroutine
+        streamChunkCh  chan string          // channel for receiving streaming chunks and tool events from agent goroutine
         streamResultCh chan agentCompleteMsg // receives final agent result when goroutine finishes
         agentCancel   context.CancelFunc    // cancels the agent goroutine context
         cursorBlink bool
@@ -695,13 +695,19 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                                 // Channel closed — agent goroutine finished
                                                 m.streamChunkCh = nil
                                                 m.permReqCh = nil
-                                                // Read the final result and process inline
+                                                // Read the final result — only append text/error lines,
+                                                // tool_use/tool_result were already streamed live
                                                 if m.streamResultCh != nil {
                                                         result := <-m.streamResultCh
                                                         m.streamResultCh = nil
-                                                        // Process the completion inline
                                                         m.state = stateIdle
-                                                        m.output = append(m.output, result.output...)
+                                                        for _, line := range result.output {
+                                                                // Skip tool events that were already streamed live
+                                                                if line.Type == "tool_use" || line.Type == "tool_result" {
+                                                                        continue
+                                                                }
+                                                                m.output = append(m.output, line)
+                                                        }
                                                         m.totalUsage.InputTokens += result.usage.InputTokens
                                                         m.totalUsage.OutputTokens += result.usage.OutputTokens
                                                         m.totalUsage.CacheRead += result.usage.CacheRead
@@ -715,6 +721,22 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                                         }
                                                 }
                                                 break drainLoop
+                                        }
+                                        // Handle tool events streamed live from agent goroutine
+                                        if isToolEvent(chunk) {
+                                                line := decodeToolEvent(chunk)
+                                                if line.Type != "" {
+                                                        // Flush any pending streaming text first
+                                                        if m.streamingText != "" && !strings.Contains(m.streamingText, "\x00STREAM_CLEAR\x00") {
+                                                                m.output = append(m.output, OutputLine{
+                                                                        Type:    "text",
+                                                                        Content: m.streamingText,
+                                                                })
+                                                        }
+                                                        m.streamingText = ""
+                                                        m.output = append(m.output, line)
+                                                }
+                                                continue
                                         }
                                         m.streamingText += chunk
                                         // Check for stream clear sentinel (from OnText commit)
@@ -1370,8 +1392,8 @@ func (m *replModel) renderOutputLine(line OutputLine) string {
                 var b strings.Builder
                 b.WriteString(successStyle.Render("● "))
                 b.WriteString(toolResultStyle.Render(fmt.Sprintf("%s", line.ToolName)))
-                if line.Duration > 0 {
-                        b.WriteString(usageStyle.Render(fmt.Sprintf(" (%.1fs)", line.Duration.Seconds())))
+                if durStr := formatDuration(line.Duration); durStr != "" {
+                        b.WriteString(usageStyle.Render(" (" + durStr + ")"))
                 }
                 b.WriteString("\n")
                 // Show truncated output for tool results
@@ -1614,19 +1636,31 @@ func (m *replModel) runAgent(input string) tea.Cmd {
                                         }
                                 },
                                 OnToolUse: func(name string, input any) {
-                                        collectedOutput = append(collectedOutput, OutputLine{
+                                        line := OutputLine{
                                                 Type:     "tool_use",
                                                 ToolName: name,
                                                 Content:  formatToolInput(input),
-                                        })
+                                        }
+                                        collectedOutput = append(collectedOutput, line)
+                                        // Stream tool_use event live to UI
+                                        select {
+                                        case chunkCh <- encodeToolEvent("tool_use", line):
+                                        default:
+                                        }
                                 },
                                 OnToolResult: func(name string, output string, duration time.Duration) {
-                                        collectedOutput = append(collectedOutput, OutputLine{
+                                        line := OutputLine{
                                                 Type:     "tool_result",
                                                 ToolName: name,
                                                 Content:  output,
                                                 Duration: duration,
-                                        })
+                                        }
+                                        collectedOutput = append(collectedOutput, line)
+                                        // Stream tool_result event live to UI
+                                        select {
+                                        case chunkCh <- encodeToolEvent("tool_result", line):
+                                        default:
+                                        }
                                 },
                                 OnTurnEnd: func(turn int, usage llm.Usage) {
                                         totalUsage.InputTokens += usage.InputTokens
@@ -1692,6 +1726,58 @@ func submitInitialPrompt(prompt string) tea.Cmd {
         return func() tea.Msg {
                 return initialPromptMsg(prompt)
         }
+}
+
+// Tool event sentinels for streaming tool_use/tool_result over chunkCh.
+// Format: \x00TOOL_EVENT\x00<type>\x00<json>\x00END\x00
+const (
+        toolEventPrefix = "\x00TOOL_EVENT\x00"
+        toolEventEnd    = "\x00END\x00"
+)
+
+// encodeToolEvent serializes an OutputLine as a tagged sentinel string
+// that can be sent over the chunkCh alongside streaming text chunks.
+func encodeToolEvent(eventType string, line OutputLine) string {
+        data, _ := json.Marshal(line)
+        return toolEventPrefix + eventType + "\x00" + string(data) + toolEventEnd
+}
+
+// isToolEvent checks if a chunk is a tool event sentinel.
+func isToolEvent(chunk string) bool {
+        return strings.HasPrefix(chunk, toolEventPrefix)
+}
+
+// decodeToolEvent parses a tool event sentinel back into an OutputLine.
+// Format: "tool_use\x00{...json...}\x00END\x00"
+func decodeToolEvent(chunk string) OutputLine {
+        rest := strings.TrimPrefix(chunk, toolEventPrefix)
+        endIdx := strings.Index(rest, toolEventEnd)
+        if endIdx < 0 {
+                return OutputLine{}
+        }
+        // rest = "tool_use\x00{...}\x00END\x00..."
+        firstNull := strings.Index(rest, "\x00")
+        if firstNull < 0 {
+                return OutputLine{}
+        }
+        jsonStr := rest[firstNull+1 : endIdx]
+        var line OutputLine
+        json.Unmarshal([]byte(jsonStr), &line)
+        return line
+}
+
+// formatDuration returns a human-friendly duration string.
+// For durations >= 1s: "1.2s"
+// For durations < 1s: "45ms"
+func formatDuration(d time.Duration) string {
+        if d <= 0 {
+                return ""
+        }
+        ms := d.Milliseconds()
+        if ms >= 1000 {
+                return fmt.Sprintf("%.1fs", d.Seconds())
+        }
+        return fmt.Sprintf("%dms", ms)
 }
 
 // permRequestMsg is sent when the agent requests permission for a tool.
