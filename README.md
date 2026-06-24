@@ -8,7 +8,7 @@ A Claude Code-style terminal coding agent built in Go. Streams LLM responses in 
 - Viewport scrolling, content caching, and keyboard shortcuts
 - Multi-provider LLM support (Anthropic, OpenAI, Ollama, OpenCode)
 - Cost tracking per session and per tool call
-- Built-in tools: file read/write/edit, bash, grep, glob, web search/fetch, todo management
+- Built-in tools: file read/write/edit, bash, go, git, grep, glob, web search/fetch, todo management
 - Diff-aware file editing
 
 ## Build
@@ -26,6 +26,8 @@ make build
 | `file_write` | Create or overwrite files |
 | `file_edit` | Make targeted edits to existing files |
 | `bash` | Execute shell commands |
+| `go` | Execute go commands |
+| `git` | Execute git commands |
 | `grep` | Search file contents with regex |
 | `glob` | Find files by pattern |
 | `web_search` | Search the web |

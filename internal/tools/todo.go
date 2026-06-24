@@ -58,7 +58,7 @@ func (t *TodoWriteTool) InputSchema() map[string]any {
 				},
 			},
 		},
-		"required":             []string{"todos"},
+		"required": []string{"todos"},
 	}
 }
 

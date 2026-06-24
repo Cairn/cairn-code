@@ -9,21 +9,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/cairn/cairn-code/internal/llm"
+	"github.com/google/uuid"
 )
 
 // Session represents a persisted conversation session.
 type Session struct {
-	ID        string         `json:"id"`
-	CreatedAt time.Time      `json:"created_at"`
-	UpdatedAt time.Time      `json:"updated_at"`
-	Messages  []SessionMsg   `json:"messages"`
-	Model     string         `json:"model"`
-	Provider  string         `json:"provider"`
-	Summary   string         `json:"summary,omitempty"`
-	TokensIn  int            `json:"tokens_in"`
-	TokensOut int            `json:"tokens_out"`
+	ID        string       `json:"id"`
+	CreatedAt time.Time    `json:"created_at"`
+	UpdatedAt time.Time    `json:"updated_at"`
+	Messages  []SessionMsg `json:"messages"`
+	Model     string       `json:"model"`
+	Provider  string       `json:"provider"`
+	Summary   string       `json:"summary,omitempty"`
+	TokensIn  int          `json:"tokens_in"`
+	TokensOut int          `json:"tokens_out"`
 }
 
 // SessionMsg is a JSON-friendly representation of a conversation message.

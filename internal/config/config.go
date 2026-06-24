@@ -10,16 +10,16 @@ import (
 
 // Config holds the full configuration for Cairn Code.
 type Config struct {
-	DefaultProvider string            `json:"default_provider"`
-	DefaultModel    string            `json:"default_model"`
-	Anthropic       AnthropicConfig   `json:"anthropic"`
-	OpenAI          OpenAIConfig       `json:"openai"`
-	Ollama          OllamaConfig       `json:"ollama"`
-	Permissions     PermissionsConfig `json:"permissions"`
-	MaxTurns        int               `json:"max_turns"`
-	MaxTokens       int               `json:"max_tokens"`
-	SystemPromptFile string           `json:"system_prompt_file"`
-	ContextFiles    []string          `json:"context_files"`
+	DefaultProvider  string            `json:"default_provider"`
+	DefaultModel     string            `json:"default_model"`
+	Anthropic        AnthropicConfig   `json:"anthropic"`
+	OpenAI           OpenAIConfig      `json:"openai"`
+	Ollama           OllamaConfig      `json:"ollama"`
+	Permissions      PermissionsConfig `json:"permissions"`
+	MaxTurns         int               `json:"max_turns"`
+	MaxTokens        int               `json:"max_tokens"`
+	SystemPromptFile string            `json:"system_prompt_file"`
+	ContextFiles     []string          `json:"context_files"`
 }
 
 type AnthropicConfig struct {
@@ -54,7 +54,7 @@ func DefaultConfig() *Config {
 		MaxTurns:         100,
 		MaxTokens:        8192,
 		SystemPromptFile: "CAIRN.md",
-		ContextFiles:      []string{},
+		ContextFiles:     []string{},
 		Permissions: PermissionsConfig{
 			AutoAllow: []string{},
 			Ask:       []string{"file_write", "bash", "file_edit"},

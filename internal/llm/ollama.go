@@ -42,11 +42,11 @@ func (p *OllamaProvider) AvailableModels() []ModelInfo {
 
 // ollamaRequest is the request format for Ollama's API.
 type ollamaRequest struct {
-	Model    string           `json:"model"`
-	Messages []ollamaMessage  `json:"messages"`
-	Tools    []ollamaTool     `json:"tools,omitempty"`
-	Stream   bool             `json:"stream"`
-	Options  map[string]any   `json:"options,omitempty"`
+	Model    string          `json:"model"`
+	Messages []ollamaMessage `json:"messages"`
+	Tools    []ollamaTool    `json:"tools,omitempty"`
+	Stream   bool            `json:"stream"`
+	Options  map[string]any  `json:"options,omitempty"`
 }
 
 type ollamaMessage struct {
@@ -55,8 +55,8 @@ type ollamaMessage struct {
 }
 
 type ollamaTool struct {
-	Type     string         `json:"type"`
-	Function ollamaFuncDef  `json:"function"`
+	Type     string        `json:"type"`
+	Function ollamaFuncDef `json:"function"`
 }
 
 type ollamaFuncDef struct {
@@ -67,10 +67,10 @@ type ollamaFuncDef struct {
 
 // ollamaResponse is the response format from Ollama's API.
 type ollamaResponse struct {
-	Model     string          `json:"model"`
-	Message   ollamaMessage   `json:"message"`
+	Model     string           `json:"model"`
+	Message   ollamaMessage    `json:"message"`
 	ToolCalls []ollamaToolCall `json:"tool_calls,omitempty"`
-	Done      bool            `json:"done"`
+	Done      bool             `json:"done"`
 }
 
 type ollamaToolCall struct {

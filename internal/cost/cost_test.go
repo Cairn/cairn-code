@@ -15,7 +15,7 @@ func TestGetModelPricing(t *testing.T) {
 		{"gpt-4o", 2.50, 10.00},
 		{"gpt-4o-mini", 0.15, 0.60},
 		{"gpt-3.5-turbo", 0.50, 1.50},
-		{"llama3", 0, 0},     // free
+		{"llama3", 0, 0},        // free
 		{"unknown-model", 0, 0}, // unknown = free
 	}
 
@@ -64,15 +64,15 @@ func TestEstimateCost(t *testing.T) {
 		wantCost   float64
 	}{
 		{
-			name:    "zero usage",
-			model:   "claude-sonnet-4-20250514",
+			name:     "zero usage",
+			model:    "claude-sonnet-4-20250514",
 			wantCost: 0,
 		},
 		{
-			name:    "simple claude sonnet 4",
-			model:   "claude-sonnet-4-20250514",
-			input:   1_000_000,
-			output:  500_000,
+			name:     "simple claude sonnet 4",
+			model:    "claude-sonnet-4-20250514",
+			input:    1_000_000,
+			output:   500_000,
 			wantCost: 3.00*1.0 + 15.00*0.5, // $3.00 + $7.50 = $10.50
 		},
 		{
@@ -85,17 +85,17 @@ func TestEstimateCost(t *testing.T) {
 			wantCost:   3.00*0.5 + 15.00*0.25 + 0.30*0.5 + 3.75*0.1, // $1.50+$3.75+$0.15+$0.375 = $5.775
 		},
 		{
-			name:    "gpt-4o",
-			model:   "gpt-4o",
-			input:   1_000_000,
-			output:  1_000_000,
+			name:     "gpt-4o",
+			model:    "gpt-4o",
+			input:    1_000_000,
+			output:   1_000_000,
 			wantCost: 2.50 + 10.00, // $12.50
 		},
 		{
-			name:    "free model",
-			model:   "llama3",
-			input:   1_000_000,
-			output:  1_000_000,
+			name:     "free model",
+			model:    "llama3",
+			input:    1_000_000,
+			output:   1_000_000,
 			wantCost: 0,
 		},
 	}

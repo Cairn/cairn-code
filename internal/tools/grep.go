@@ -74,27 +74,27 @@ func (t *GrepTool) InputSchema() map[string]any {
 func (t *GrepTool) NeedsPermission() bool { return false }
 
 type grepInput struct {
-	Pattern    string `json:"pattern"`
-	Path       string `json:"path,omitempty"`
-	Glob       string `json:"glob,omitempty"`
-	OutputMode string `json:"output_mode,omitempty"`
-	IgnoreCase bool   `json:"i,omitempty"`
-	ShowLineNum bool  `json:"n,omitempty"`
-	Context    int    `json:"C,omitempty"`
-	After      int    `json:"A,omitempty"`
-	Before     int    `json:"B,omitempty"`
+	Pattern     string `json:"pattern"`
+	Path        string `json:"path,omitempty"`
+	Glob        string `json:"glob,omitempty"`
+	OutputMode  string `json:"output_mode,omitempty"`
+	IgnoreCase  bool   `json:"i,omitempty"`
+	ShowLineNum bool   `json:"n,omitempty"`
+	Context     int    `json:"C,omitempty"`
+	After       int    `json:"A,omitempty"`
+	Before      int    `json:"B,omitempty"`
 }
 
 type fileMatch struct {
-	Path     string
-	Lines    []matchLine
-	Count    int
+	Path  string
+	Lines []matchLine
+	Count int
 }
 
 type matchLine struct {
-	LineNum  int
-	Line     string
-	Matches  []int // column positions of matches
+	LineNum int
+	Line    string
+	Matches []int // column positions of matches
 }
 
 func (t *GrepTool) Execute(ctx context.Context, input json.RawMessage) (string, error) {

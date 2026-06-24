@@ -45,11 +45,11 @@ func (p *AnthropicProvider) AvailableModels() []ModelInfo {
 
 // anthropicRequest is the request format for Anthropic's API.
 type anthropicRequest struct {
-	Model     string              `json:"model"`
-	MaxTokens int                 `json:"max_tokens"`
-	System    string              `json:"system,omitempty"`
-	Messages  []anthropicMessage  `json:"messages"`
-	Tools     []anthropicTool     `json:"tools,omitempty"`
+	Model     string             `json:"model"`
+	MaxTokens int                `json:"max_tokens"`
+	System    string             `json:"system,omitempty"`
+	Messages  []anthropicMessage `json:"messages"`
+	Tools     []anthropicTool    `json:"tools,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -65,23 +65,23 @@ type anthropicTool struct {
 
 // anthropicResponse is the response format from Anthropic's API.
 type anthropicResponse struct {
-	ID           string              `json:"id"`
-	Type         string              `json:"type"`
-	Role         string              `json:"role"`
-	Content      []anthropicContent   `json:"content"`
-	Model        string              `json:"model"`
-	StopReason   string              `json:"stop_reason"`
-	Usage        anthropicUsage      `json:"usage"`
+	ID         string             `json:"id"`
+	Type       string             `json:"type"`
+	Role       string             `json:"role"`
+	Content    []anthropicContent `json:"content"`
+	Model      string             `json:"model"`
+	StopReason string             `json:"stop_reason"`
+	Usage      anthropicUsage     `json:"usage"`
 }
 
 type anthropicContent struct {
-	Type    string         `json:"type"`
-	Text    string         `json:"text,omitempty"`
-	ID      string         `json:"id,omitempty"`
-	Name    string         `json:"name,omitempty"`
+	Type    string          `json:"type"`
+	Text    string          `json:"text,omitempty"`
+	ID      string          `json:"id,omitempty"`
+	Name    string          `json:"name,omitempty"`
 	Input   json.RawMessage `json:"input,omitempty"`
-	Content string         `json:"content,omitempty"`
-	IsError bool           `json:"is_error,omitempty"`
+	Content string          `json:"content,omitempty"`
+	IsError bool            `json:"is_error,omitempty"`
 }
 
 type anthropicUsage struct {

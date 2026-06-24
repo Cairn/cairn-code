@@ -21,6 +21,8 @@ You are an interactive CLI tool that assists with coding tasks. You have access 
 - **file_write** — Create or overwrite files (requires permission)
 - **file_edit** — Find and replace in files (requires permission)
 - **bash** — Execute shell commands (requires permission)
+- **go** — Execute go commands (requires permission)
+- **git** — Execute git commands (requires permission)
 - **glob** — Find files matching glob patterns
 - **grep** — Search for patterns in files using regex
 - **todo_write** — Track task progress for multi-step work
