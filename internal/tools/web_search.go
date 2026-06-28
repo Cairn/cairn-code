@@ -115,25 +115,27 @@ func (t *WebSearchTool) searchDuckDuckGo(ctx context.Context, query string) ([]s
 
 // parseDuckDuckGoResults parses DuckDuckGo lite HTML to extract search results.
 func parseDuckDuckGoResults(html string) []searchResult {
-        var results []searchResult
+        // DuckDuckGo lite uses <a> tags with class 'result-link' and
+        // snippets in <td class="result-snippet">. Attributes may appear
+        // in any order, so match the whole tag then extract.
+        linkRe := regexp.MustCompile(`<a[^>]+class='result-link'[^>]*>.*?</a>`)
+        hrefRe := regexp.MustCompile(`href='([^']+)'`)
+        snippetRe := regexp.MustCompile(`(?s)<td[^>]+class='result-snippet'[^>]*>(.*?)</td>`)
 
-        // DuckDuckGo lite uses a specific format: results are in <a> tags with class
-        // "result-link" and snippets in <td class="result-snippet">
-        // We use regex to extract the key parts.
-
-        // Match link blocks: each result is a <tr class="result-link">...</tr>
-        linkRe := regexp.MustCompile(`<a[^>]+class="result-link"[^>]*href="([^"]+)"[^>]*>(.*?)</a>`)
-        snippetRe := regexp.MustCompile(`<td[^>]+class="result-snippet"[^>]*>(.*?)</td>`)
-
-        linkMatches := linkRe.FindAllStringSubmatch(html, 5)
+        linkMatches := linkRe.FindAllString(html, 5)
         snippetMatches := snippetRe.FindAllStringSubmatch(html, 5)
 
-        for i, lm := range linkMatches {
+        var results []searchResult
+        for i, aTag := range linkMatches {
                 if i >= 5 {
                         break
                 }
-                href := lm[1]
-                title := stripHTMLTags(lm[2])
+                hrefMatch := hrefRe.FindStringSubmatch(aTag)
+                if hrefMatch == nil {
+                        continue
+                }
+                href := hrefMatch[1]
+                title := stripHTMLTags(aTag)
 
                 snippet := ""
                 if i < len(snippetMatches) {
