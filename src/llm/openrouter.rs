@@ -177,7 +177,7 @@ fn openrouter_request_body(
 ) -> Result<String, String> {
     let mut body = String::new();
     body.push_str(&format!("{{\"model\":\"{model}\",\"stream\":{stream}"));
-    body.push_str(&format!(",\"max_tokens\":{max_tokens}"));
+    body.push_str(&format!(",\"max_completion_tokens\":{max_tokens}"));
     body.push_str(",\"messages\":[");
     if !system.is_empty() {
         let escaped = system.replace('\\', "\\\\").replace('"', "\\\"");
@@ -259,7 +259,7 @@ fn parse_openrouter_response(raw: &str) -> Result<(Vec<Message>, Usage), String>
 
 fn parse_openrouter_402(err: &str) -> Option<usize> {
     let lower = err.to_lowercase();
-    if lower.contains("fewer max_tokens") || lower.contains("fewer max tokens") {
+    if lower.contains("fewer max_tokens") || lower.contains("fewer max tokens") || lower.contains("fewer max_completion_tokens") {
         return Some(1024);
     }
     // "requested up to N tokens, but can only afford M"

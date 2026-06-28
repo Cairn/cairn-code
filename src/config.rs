@@ -78,6 +78,13 @@ fn dirs_config_path() -> PathBuf {
     config_path()
 }
 
+pub fn sessions_dir() -> String {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".config/cairn-code/sessions").to_string_lossy().to_string()
+}
+
 pub fn save_config(provider: &str, model: &str, api_key: Option<&str>) -> Result<(), String> {
     use crate::json::JsonValue;
     let path = config_path();

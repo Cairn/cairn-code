@@ -81,6 +81,21 @@ fn main() {
                         let _ = agent.switch_provider(prov, modl);
                     }
                 }
+                Ok(cmd) if cmd.starts_with("__load_session__:") => {
+                    let id = cmd.trim_start_matches("__load_session__:");
+                    if !id.is_empty() {
+                        let sessions_dir = config::sessions_dir();
+                        if let Ok(session) = crate::session::load(&sessions_dir, id) {
+                            let usage = llm::Usage {
+                                input_tokens: session.tokens_in,
+                                output_tokens: session.tokens_out,
+                                cache_read: 0,
+                                cache_create: 0,
+                            };
+                            agent.set_state(session.messages, usage);
+                        }
+                    }
+                }
                 Ok(prompt) => {
                     cancel2.store(false, Ordering::Relaxed);
                     let _ = agent.run(&prompt, event_tx.clone(), &cancel2);

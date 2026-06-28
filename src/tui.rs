@@ -5,12 +5,14 @@ use std::time::Duration;
 
 use ratatui::{
     Frame,
-    widgets::Paragraph,
+    layout::Position,
+    widgets::{Paragraph, Wrap},
     style::{Style, Color, Modifier},
     text::{Span, Line, Text},
 };
 
 use crate::llm;
+use crate::session;
 use crate::agent::AgentEvent;
 
 pub struct OutputLine {
@@ -55,6 +57,10 @@ pub struct Tui {
     cmd_picker_list: Vec<String>,
     cmd_picker_filtered: Vec<String>,
     cmd_picker_sel: usize,
+    show_session_picker: bool,
+    picker_sessions: Vec<session::SessionSummary>,
+    picker_session_sel: usize,
+    picker_session_scrl: usize,
     agent_tx: Option<mpsc::Sender<String>>,
     cancel_flag: Option<Arc<AtomicBool>>,
 }
@@ -86,9 +92,13 @@ impl Tui {
             awaiting_api_key: false,
             pending_openrouter_setup: false,
             show_command_picker: false,
-            cmd_picker_list: vec!["/clear".into(), "/cost".into(), "/exit".into(), "/help".into(), "/model".into(), "/provider".into(), "/quit".into(), "/q".into()],
+            cmd_picker_list: vec!["/clear".into(), "/cost".into(), "/exit".into(), "/help".into(), "/model".into(), "/provider".into(), "/quit".into(), "/q".into(), "/resume".into(), "/save".into(), "/sessions".into()],
             cmd_picker_filtered: Vec::new(),
             cmd_picker_sel: 0,
+            show_session_picker: false,
+            picker_sessions: Vec::new(),
+            picker_session_sel: 0,
+            picker_session_scrl: 0,
             agent_tx: None,
             cancel_flag: None,
         }
@@ -210,6 +220,10 @@ impl Tui {
 
         match key.code {
             KeyCode::Up => {
+                if self.show_session_picker {
+                    if self.picker_session_sel > 0 { self.picker_session_sel -= 1; }
+                    return true;
+                }
                 if self.show_command_picker {
                     if self.cmd_picker_sel > 0 { self.cmd_picker_sel -= 1; }
                     return true;
@@ -230,6 +244,10 @@ impl Tui {
                 true
             }
             KeyCode::Down => {
+                if self.show_session_picker {
+                    if self.picker_session_sel + 1 < self.picker_sessions.len() { self.picker_session_sel += 1; }
+                    return true;
+                }
                 if self.show_command_picker {
                     if self.cmd_picker_sel + 1 < self.cmd_picker_filtered.len() { self.cmd_picker_sel += 1; }
                     return true;
@@ -283,6 +301,7 @@ impl Tui {
                 } else if self.show_command_picker { self.show_command_picker = false; }
                 else if self.show_provider_picker { self.show_provider_picker = false; }
                 else if self.show_model_picker { self.show_model_picker = false; }
+                else if self.show_session_picker { self.show_session_picker = false; }
                 else if matches!(self.state, State::Running) {
                     if let Some(flag) = &self.cancel_flag {
                         flag.store(true, Ordering::Relaxed);
@@ -369,6 +388,17 @@ impl Tui {
                             });
                         }
                     } else { self.show_model_picker = false; }
+                    return true;
+                }
+
+                if self.show_session_picker {
+                    if self.picker_session_sel < self.picker_sessions.len() {
+                        let id = self.picker_sessions[self.picker_session_sel].id.clone();
+                        self.show_session_picker = false;
+                        self.resume_session(&id);
+                    } else {
+                        self.show_session_picker = false;
+                    }
                     return true;
                 }
 
@@ -493,9 +523,21 @@ impl Tui {
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /clear /model /cost /provider /help /exit".into(),
+                    content: "Commands: /clear /cost /exit /help /model /provider /resume /save /sessions".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
+            }
+            "/save" => {
+                self.save_session();
+            }
+            "/sessions" => {
+                self.list_sessions();
+            }
+            "/resume" => {
+                self.show_session_picker = true;
+                self.picker_sessions = session::list(&self.sessions_dir()).unwrap_or_default();
+                self.picker_session_sel = 0;
+                self.picker_session_scrl = 0;
             }
             "/exit" | "/quit" | "/q" => {
                 std::process::exit(0);
@@ -504,6 +546,136 @@ impl Tui {
                 self.output_lines.push(OutputLine {
                     type_: "error".into(),
                     content: format!("Unknown command: {} (type /help)", parts[0]),
+                    tool_name: String::new(), duration: String::new(),
+                });
+            }
+        }
+    }
+
+    fn sessions_dir(&self) -> String {
+        crate::config::sessions_dir()
+    }
+
+    fn save_session(&mut self) {
+        let messages = self.output_lines.iter().filter_map(|l| {
+            if l.type_ == "user" {
+                Some(llm::Message { role: "user".into(), content: llm::Content::Text(l.content.clone()) })
+            } else if l.type_ == "text" {
+                Some(llm::Message { role: "assistant".into(), content: llm::Content::Text(l.content.clone()) })
+            } else {
+                None
+            }
+        }).collect::<Vec<_>>();
+
+        if messages.is_empty() {
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: "Nothing to save — no conversation yet.".into(),
+                tool_name: String::new(), duration: String::new(),
+            });
+            return;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let sess = session::Session {
+            id: session::new_id(),
+            model: self.model.clone(),
+            provider: self.provider.clone(),
+            messages,
+            tokens_in: self.total_usage.input_tokens,
+            tokens_out: self.total_usage.output_tokens,
+            created_at: now,
+            updated_at: now,
+        };
+        match session::save(&self.sessions_dir(), &sess) {
+            Ok(()) => {
+                self.output_lines.push(OutputLine {
+                    type_: "system".into(),
+                    content: format!("Session saved: {} ({} msgs)", &sess.id[..8], self.output_lines.len()),
+                    tool_name: String::new(), duration: String::new(),
+                });
+            }
+            Err(e) => {
+                self.output_lines.push(OutputLine {
+                    type_: "error".into(),
+                    content: format!("Failed to save session: {e}"),
+                    tool_name: String::new(), duration: String::new(),
+                });
+            }
+        }
+    }
+
+    fn list_sessions(&mut self) {
+        let sessions = session::list(&self.sessions_dir()).unwrap_or_default();
+        if sessions.is_empty() {
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: "No saved sessions.".into(),
+                tool_name: String::new(), duration: String::new(),
+            });
+            return;
+        }
+        let mut msg = String::from("Saved sessions:\n");
+        for s in &sessions {
+            let time_str = format_timestamp(s.updated_at);
+            let summary = if s.summary.len() > 60 {
+                format!("{}…", &s.summary[..60])
+            } else {
+                s.summary.clone()
+            };
+            msg.push_str(&format!("  {}  {}  {} msgs  {}\n", &s.id[..8], s.model, s.msg_count, time_str));
+            if !summary.is_empty() {
+                msg.push_str(&format!("    {summary}\n"));
+            }
+        }
+        self.output_lines.push(OutputLine {
+            type_: "system".into(),
+            content: msg.trim_end().to_string(),
+            tool_name: String::new(), duration: String::new(),
+        });
+    }
+
+    fn resume_session(&mut self, id: &str) {
+        match session::load(&self.sessions_dir(), id) {
+            Ok(sess) => {
+                let mut lines = Vec::new();
+                for msg in &sess.messages {
+                    let content = match &msg.content {
+                        llm::Content::Text(t) => t.clone(),
+                        llm::Content::Thinking(t) => t.clone(),
+                        _ => continue,
+                    };
+                    lines.push(OutputLine {
+                        type_: if msg.role == "user" { "user".into() } else { "text".into() },
+                        content,
+                        tool_name: String::new(), duration: String::new(),
+                    });
+                }
+                self.output_lines = lines;
+                self.total_usage = llm::Usage {
+                    input_tokens: sess.tokens_in,
+                    output_tokens: sess.tokens_out,
+                    cache_read: 0,
+                    cache_create: 0,
+                };
+                self.model = sess.model.clone();
+                self.provider = sess.provider.clone();
+
+                if let Some(tx) = &self.agent_tx {
+                    let _ = tx.send(format!("__load_session__:{}", sess.id));
+                    let _ = tx.send(format!("__switch__:{}:{}", sess.provider, sess.model));
+                }
+                self.output_lines.push(OutputLine {
+                    type_: "system".into(),
+                    content: format!("Resumed session {} (model: {}, messages: {})", &sess.id[..8], sess.model, sess.messages.len()),
+                    tool_name: String::new(), duration: String::new(),
+                });
+            }
+            Err(e) => {
+                self.output_lines.push(OutputLine {
+                    type_: "error".into(),
+                    content: format!("Failed to load session: {e}"),
                     tool_name: String::new(), duration: String::new(),
                 });
             }
@@ -527,9 +699,21 @@ impl Tui {
         let w = area.width.saturating_sub(2) as usize;
         let pw = w.min(58);
         let pad = |s: &str| {
-            let b = s.len();
-            if b < pw { format!("{}{}", s, " ".repeat(pw - b)) }
-            else { s.chars().take(pw).collect::<String>() }
+            let dw = display_width(s);
+            if dw < pw {
+                format!("{}{}", s, " ".repeat(pw - dw))
+            } else {
+                let mut out = String::with_capacity(pw);
+                let mut w_used = 0;
+                for c in s.chars() {
+                    let cw = char_width(c);
+                    if w_used + cw > pw { break; }
+                    out.push(c);
+                    w_used += cw;
+                }
+                if w_used < pw { out.push_str(&" ".repeat(pw - w_used)); }
+                out
+            }
         };
         let sp = " ".repeat((area.width as usize).saturating_sub(pw + 4));
 
@@ -614,6 +798,7 @@ impl Tui {
         }
 
         // Prompt or pickers
+        let mut cursor_pos: Option<(u16, usize)> = None;
         if self.show_command_picker {
             let bg_orange = Style::new().bg(Color::Indexed(215)).fg(Color::Indexed(230));
             let cursor = self.cursor.min(self.input_buf.len());
@@ -679,6 +864,38 @@ impl Tui {
                     Span::styled(format!("{prefix}{}  {}{ctx}{check}", m.name, m.id), if is_sel { bg_orange } else { dim }),
                 ]));
             }
+        } else if self.show_session_picker {
+            let visible = 10usize;
+            let end = (self.picker_session_scrl + visible).min(self.picker_sessions.len());
+            let num = self.picker_sessions.len();
+            let bg_orange = Style::new().bg(Color::Indexed(215)).fg(Color::Indexed(230));
+
+            lines.push(Line::from(vec![
+                Span::styled("── Resume Session ", orange_fg.add_modifier(Modifier::BOLD)),
+                Span::styled("(↑↓ navigate  Enter select  Esc cancel) ──", bold_dim),
+            ]));
+            if num > visible {
+                lines.push(Line::from(vec![Span::styled(format!("  … {}/{}  ↑↓ scroll", self.picker_session_sel + 1, num), dim)]));
+            }
+            for i in self.picker_session_scrl..end {
+                let s = &self.picker_sessions[i];
+                let is_sel = i == self.picker_session_sel;
+                let prefix = if is_sel { "▸ " } else { "  " };
+                let summary = if s.summary.len() > 50 {
+                    format!("{}…", &s.summary[..50])
+                } else {
+                    s.summary.clone()
+                };
+                let time_str = format_timestamp(s.updated_at);
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{prefix}{}  {}  {} msgs  {time_str}", &s.id[..8], s.model, s.msg_count), if is_sel { bg_orange } else { dim }),
+                ]));
+                if !summary.is_empty() && is_sel {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("   {summary}"), if is_sel { bg_orange } else { dim }),
+                    ]));
+                }
+            }
         } else if self.awaiting_api_key {
             let cursor = self.cursor.min(self.input_buf.len());
             let nchars = self.input_buf[..cursor].chars().count();
@@ -687,21 +904,29 @@ impl Tui {
             let before: String = masked.iter().take(nchars).collect();
             let after: String = masked.iter().skip(nchars).collect();
             lines.push(Line::from(vec![
-                Span::styled(format!("OpenRouter API key: {before}▋{after}"), orange_fg),
+                Span::styled(format!("OpenRouter API key: {before}{after}"), orange_fg),
             ]));
+            cursor_pos = Some((area.x + display_width("OpenRouter API key: ") as u16 + display_width(&before) as u16, lines.len() - 1));
         } else {
             let cursor = self.cursor.min(self.input_buf.len());
             let (before, after) = self.input_buf.split_at(cursor);
             lines.push(Line::from(vec![
                 Span::styled("❯ ", orange_fg),
                 Span::raw(before),
-                Span::styled("▋", orange_fg),
                 Span::raw(after),
             ]));
+            cursor_pos = Some((area.x + display_width("❯ ") as u16 + display_width(before) as u16, lines.len() - 1));
         }
 
-        let scroll = lines.len().saturating_sub(area.height as usize);
-        f.render_widget(Paragraph::new(Text::from(lines)).scroll((scroll as u16, 0)), area);
+        let scroll = total_wrapped(&lines, area.width as usize).saturating_sub(area.height as usize);
+
+        if let Some((x, line_idx)) = cursor_pos {
+            let wrapped_before = total_wrapped(&lines[..line_idx], area.width as usize);
+            let y = (area.y as usize + wrapped_before).saturating_sub(scroll) as u16;
+            f.set_cursor_position(Position { x, y });
+        }
+
+        f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }).scroll((scroll as u16, 0)), area);
     }
 
     fn flush_streaming(&mut self) {
@@ -748,8 +973,65 @@ impl Tui {
     }
 }
 
+fn char_width(c: char) -> usize {
+    let cp = c as u32;
+    if cp < 0x1100 { 1 }
+    else if cp <= 0x115F { 2 }
+    else if cp >= 0x2329 && cp <= 0x232A { 2 }
+    else if cp >= 0x2E80 && cp <= 0x303E { 2 }
+    else if cp >= 0x3040 && cp <= 0x3096 { 2 }
+    else if cp >= 0x3099 && cp <= 0x30FF { 2 }
+    else if cp >= 0x3105 && cp <= 0x312F { 2 }
+    else if cp >= 0x3131 && cp <= 0x318E { 2 }
+    else if cp >= 0x3190 && cp <= 0x31E3 { 2 }
+    else if cp >= 0x31F0 && cp <= 0x321E { 2 }
+    else if cp >= 0x3220 && cp <= 0x3247 { 2 }
+    else if cp >= 0x3250 && cp <= 0x4DBF { 2 }
+    else if cp >= 0x4E00 && cp <= 0xA4CF { 2 }
+    else if cp >= 0xA960 && cp <= 0xA97C { 2 }
+    else if cp >= 0xAC00 && cp <= 0xD7A3 { 2 }
+    else if cp >= 0xF900 && cp <= 0xFAFF { 2 }
+    else if cp >= 0xFE10 && cp <= 0xFE19 { 2 }
+    else if cp >= 0xFE30 && cp <= 0xFE6F { 2 }
+    else if cp >= 0xFF01 && cp <= 0xFF60 { 2 }
+    else if cp >= 0xFFE0 && cp <= 0xFFE6 { 2 }
+    else if cp >= 0x1B000 && cp <= 0x1B0FF { 2 }
+    else if cp >= 0x1B100 && cp <= 0x1B12F { 2 }
+    else if cp >= 0x1F200 && cp <= 0x1F2FF { 2 }
+    else if cp >= 0x20000 && cp <= 0x2FFFD { 2 }
+    else if cp >= 0x30000 && cp <= 0x3FFFD { 2 }
+    else if cp >= 0x2600 && cp <= 0x26FF { 2 }
+    else { 1 }
+}
+
+fn display_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
 fn terminal_height() -> Option<usize> {
     std::env::var("LINES").ok().and_then(|v| v.parse().ok()).or(Some(24))
+}
+
+fn format_timestamp(ts: u64) -> String {
+    let secs = ts as i64;
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h ago")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m ago")
+    } else {
+        format!("{mins}m ago")
+    }
+}
+
+fn total_wrapped(lines: &[Line], width: usize) -> usize {
+    let w = width.max(1);
+    lines.iter().map(|l| {
+        let line_w: usize = l.spans.iter().map(|s| display_width(&s.content)).sum();
+        if line_w == 0 { 1 } else { (line_w + w - 1) / w }
+    }).sum()
 }
 
 

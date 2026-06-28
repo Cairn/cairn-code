@@ -61,6 +61,21 @@ impl Agent {
         Ok(())
     }
 
+    pub fn set_state(&mut self, messages: Vec<llm::Message>, usage: Usage) {
+        self.messages = messages;
+        self.usage = usage;
+    }
+
+    #[allow(dead_code)]
+    pub fn messages(&self) -> &[llm::Message] {
+        &self.messages
+    }
+
+    #[allow(dead_code)]
+    pub fn usage(&self) -> &Usage {
+        &self.usage
+    }
+
     pub fn run(&mut self, input: &str, tx: mpsc::Sender<AgentEvent>, cancel: &AtomicBool) -> Result<(), String> {
         self.messages.push(llm::Message {
             role: "user".into(),
