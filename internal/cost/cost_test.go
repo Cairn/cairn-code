@@ -16,6 +16,11 @@ func TestGetModelPricing(t *testing.T) {
 		{"gpt-4o-mini", 0.15, 0.60},
 		{"gpt-3.5-turbo", 0.50, 1.50},
 		{"llama3", 0, 0},
+		{"big-pickle", 0, 0},
+		{"deepseek-v4-flash-free", 0, 0},
+		{"mimo-v2.5-free", 0, 0},
+		{"north-mini-code-free", 0, 0},
+		{"nemotron-3-ultra-free", 0, 0},
 		{"unknown-model", 0, 0},
 	}
 

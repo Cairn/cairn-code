@@ -75,6 +75,12 @@ type replModel struct {
         pickerSelect      int              // selected index in picker
         pickerScroll      int              // scroll offset for picker
 
+        // Model picker
+        showModelPicker bool            // whether model picker is showing
+        pickerModels   []llm.ModelInfo  // models to pick from
+        modelPickSel   int              // selected index in model picker
+        modelPickScrl  int              // scroll offset for model picker
+
         // Permission prompt
         showPermPrompt bool   // whether a permission prompt is showing
         permTool       string // tool name requesting permission
@@ -134,6 +140,10 @@ var (
                         Foreground(lipgloss.Color("243")).
                         Italic(true)
 
+        thinkingLabelStyle = lipgloss.NewStyle().
+                        Foreground(lipgloss.Color("240")).
+                        Italic(true)
+
         // Spinner: smooth braille wave pattern
         spinnerChars = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
@@ -175,18 +185,18 @@ var (
 
 var (
         // Command definitions for autocomplete
-        commands = []cmdDef{
-                {"/clear", "Clear conversation history"},
-                {"/model", "Show or change model"},
-                {"/compact", "Compact conversation"},
-                {"/cost", "Show token usage"},
-                {"/provider", "Show current provider"},
-                {"/save", "Save session"},
-                {"/resume", "Resume a session"},
-                {"/sessions", "List saved sessions"},
-                {"/tools", "List available tools"},
-                {"/exit", "Exit application"},
-        }
+	commands = []cmdDef{
+		{"/clear", "Clear conversation history"},
+		{"/model", "Show available models or set one (e.g. /model deepseek-v4-flash-free)"},
+		{"/compact", "Compact conversation"},
+		{"/cost", "Show token usage"},
+		{"/provider", "Show current provider"},
+		{"/save", "Save session"},
+		{"/resume", "Resume a session"},
+		{"/sessions", "List saved sessions"},
+		{"/tools", "List available tools"},
+		{"/exit", "Exit application"},
+	}
 )
 
 type cmdDef struct {
@@ -208,7 +218,7 @@ func filteredCommands(prefix string) []cmdDef {
 
 // showAutocomplete returns true if we should show the command palette.
 func (m *replModel) showAutocomplete() bool {
-        return strings.HasPrefix(m.input, "/") && !m.showQuit && !m.showSessionPicker
+	return strings.HasPrefix(m.input, "/") && !m.showQuit && !m.showSessionPicker && !m.showModelPicker
 }
 
 // NewREPL creates a new REPL model.
@@ -318,9 +328,16 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         return m, nil
                 }
 
-                switch msg.String() {
-                case "ctrl+c":
-                        if m.showSessionPicker {
+		switch msg.String() {
+		case "ctrl+c":
+			if m.showModelPicker {
+				m.showModelPicker = false
+				m.pickerModels = nil
+				m.modelPickSel = 0
+				m.modelPickScrl = 0
+				return m, nil
+			}
+			if m.showSessionPicker {
                                 m.showSessionPicker = false
                                 m.pickerSessions = nil
                                 m.pickerSelect = 0
@@ -354,6 +371,24 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         return m, nil
 
                 case "enter":
+                        if m.showModelPicker {
+                                if m.modelPickSel >= 0 && m.modelPickSel < len(m.pickerModels) {
+                                        selected := m.pickerModels[m.modelPickSel].ID
+                                        m.agent.SetModel(selected)
+                                        m.showModelPicker = false
+                                        m.pickerModels = nil
+                                        m.modelPickSel = 0
+                                        m.modelPickScrl = 0
+                                        m.output = append(m.output, OutputLine{
+                                                Type:    "system",
+                                                Content: fmt.Sprintf("Model set to: %s", selected),
+                                        })
+                                } else {
+                                        m.showModelPicker = false
+                                        m.pickerModels = nil
+                                }
+                                return m, nil
+                        }
                         if m.showSessionPicker {
                                 if m.pickerSelect >= 0 && m.pickerSelect < len(m.pickerSessions) {
                                         selected := m.pickerSessions[m.pickerSelect]
@@ -443,6 +478,15 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         return m, tea.Batch(m.runAgent(input), tickSpinner())
 
                 case "up":
+                        if m.showModelPicker {
+                                if m.modelPickSel > 0 {
+                                        m.modelPickSel--
+                                        if m.modelPickSel < m.modelPickScrl {
+                                                m.modelPickScrl = m.modelPickSel
+                                        }
+                                }
+                                return m, nil
+                        }
                         if m.showSessionPicker {
                                 if m.pickerSelect > 0 {
                                         m.pickerSelect--
@@ -470,6 +514,19 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         }
 
                 case "down":
+                        if m.showModelPicker {
+                                if m.modelPickSel < len(m.pickerModels)-1 {
+                                        m.modelPickSel++
+                                        visibleHeight := m.height - 10
+                                        if visibleHeight < 3 {
+                                                visibleHeight = 3
+                                        }
+                                        if m.modelPickSel >= m.modelPickScrl+visibleHeight {
+                                                m.modelPickScrl = m.modelPickSel - visibleHeight + 1
+                                        }
+                                }
+                                return m, nil
+                        }
                         if m.showSessionPicker {
                                 if m.pickerSelect < len(m.pickerSessions)-1 {
                                         m.pickerSelect++
@@ -590,6 +647,13 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         m.cursor++
                         m.cmdSelect = 0
                 case "esc":
+                        if m.showModelPicker {
+                                m.showModelPicker = false
+                                m.pickerModels = nil
+                                m.modelPickSel = 0
+                                m.modelPickScrl = 0
+                                return m, nil
+                        }
                         if m.showSessionPicker {
                                 m.showSessionPicker = false
                                 m.pickerSessions = nil
@@ -610,6 +674,10 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                         }
 
                 default:
+                        // Don't accept typing when pickers are active
+                        if m.showModelPicker || m.showSessionPicker {
+                                return m, nil
+                        }
                         // Insert character at cursor position (skip control chars)
                         if len(msg.String()) == 1 && msg.String()[0] >= 32 {
                                 if m.cursor < len(m.input) {
@@ -819,6 +887,8 @@ func (m replModel) View() string {
 
         // Streaming text (rendered live as it arrives)
         if m.streamThinking != "" {
+                content.WriteString(thinkingLabelStyle.Render("── Thinking ──"))
+                content.WriteString("\n")
                 content.WriteString(thinkingStyle.Render(m.streamThinking))
                 content.WriteString("\n")
         }
@@ -899,61 +969,66 @@ func (m replModel) View() string {
                 content.WriteString("\n")
         }
 
-        // Token usage
-        if m.totalUsage.InputTokens > 0 {
-                content.WriteString(usageStyle.Render(fmt.Sprintf(
-                        "\nTokens: %d in, %d out",
-                        m.totalUsage.InputTokens,
-                        m.totalUsage.OutputTokens,
-                )))
-                content.WriteString("\n")
-        }
+	// Token usage
+	if m.totalUsage.InputTokens > 0 {
+		content.WriteString(usageStyle.Render(fmt.Sprintf(
+			"\nTokens: %d in, %d out  •  %s",
+			m.totalUsage.InputTokens,
+			m.totalUsage.OutputTokens,
+			m.agent.Model(),
+		)))
+		content.WriteString("\n")
+	}
 
         // Input prompt with cursor and autocomplete
         if !m.quit {
                 content.WriteString("\n")
 
-                // Command autocomplete dropdown
-                if m.showAutocomplete() {
-                        matches := filteredCommands(m.input)
-                        if len(matches) > 0 {
-                                if m.cmdSelect >= len(matches) {
-                                        m.cmdSelect = 0
-                                }
-                                dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-                                selectedStyle := promptStyle.Bold(true)
-                                for i, cmd := range matches {
-                                        if i == m.cmdSelect {
-                                                content.WriteString(selectedStyle.Render("  ▸ " + cmd.name))
-                                        } else {
-                                                content.WriteString(dimStyle.Render("    " + cmd.name))
+                if m.showModelPicker {
+                        content.WriteString(m.renderModelPickerInline())
+                } else {
+                        // Command autocomplete dropdown
+                        if m.showAutocomplete() {
+                                matches := filteredCommands(m.input)
+                                if len(matches) > 0 {
+                                        if m.cmdSelect >= len(matches) {
+                                                m.cmdSelect = 0
                                         }
-                                        // Pad description
-                                        desc := "  " + cmd.desc
-                                        // Truncate description to fit
-                                        maxDesc := 30
-                                        if len(desc) > maxDesc {
-                                                desc = desc[:maxDesc-3] + "..."
+                                        dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+                                        selectedStyle := promptStyle.Bold(true)
+                                        for i, cmd := range matches {
+                                                if i == m.cmdSelect {
+                                                        content.WriteString(selectedStyle.Render("  ▸ " + cmd.name))
+                                                } else {
+                                                        content.WriteString(dimStyle.Render("    " + cmd.name))
+                                                }
+                                                // Pad description
+                                                desc := "  " + cmd.desc
+                                                // Truncate description to fit
+                                                maxDesc := 30
+                                                if len(desc) > maxDesc {
+                                                        desc = desc[:maxDesc-3] + "..."
+                                                }
+                                                content.WriteString(dimStyle.Render(desc))
+                                                content.WriteString("\n")
                                         }
-                                        content.WriteString(dimStyle.Render(desc))
-                                        content.WriteString("\n")
                                 }
                         }
-                }
 
-                content.WriteString(promptStyle.Render("❯ "))
-                // Render input with cursor indicator
-                before := m.input[:m.cursor]
-                after := m.input[m.cursor:]
-                content.WriteString(before)
-                if m.cursorBlink && m.state != stateRunning {
-                        content.WriteString(promptStyle.Render("▋"))
+                        content.WriteString(promptStyle.Render("❯ "))
+                        // Render input with cursor indicator
+                        before := m.input[:m.cursor]
+                        after := m.input[m.cursor:]
+                        content.WriteString(before)
+                        if m.cursorBlink && m.state != stateRunning {
+                                content.WriteString(promptStyle.Render("▋"))
+                        }
+                        content.WriteString(after)
                 }
-                content.WriteString(after)
         }
 
-        // Session picker overlay
-        if m.showSessionPicker {
+	// Session picker overlay
+	if m.showSessionPicker {
                 return m.renderSessionPicker()
         }
 
@@ -1166,7 +1241,78 @@ func (m *replModel) renderSessionPicker() string {
         b.WriteString(horizSpace)
         b.WriteString(borderStyle.Render("└" + strings.Repeat("─", dialogWidth-2) + "┘"))
 
-        return b.String()
+	return b.String()
+}
+
+// renderModelPickerInline renders the model selection list inline above the prompt.
+func (m *replModel) renderModelPickerInline() string {
+	var b strings.Builder
+
+	numModels := len(m.pickerModels)
+	if numModels == 0 {
+		return ""
+	}
+
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	orange := lipgloss.Color("215")
+	selectedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(orange).Bold(true)
+	currentStyle := lipgloss.NewStyle().Foreground(orange).Bold(true)
+	headerStyle := lipgloss.NewStyle().Foreground(orange).Bold(true)
+
+	// Header — orange brand color
+	b.WriteString(headerStyle.Render("── Model "))
+	b.WriteString(dimStyle.Render("(↑↓ navigate  Enter select  Esc cancel) ──"))
+	b.WriteString("\n")
+
+	maxVisible := m.height - 10
+	if maxVisible < 3 {
+		maxVisible = 3
+	}
+	if numModels > maxVisible {
+		endIdx := m.modelPickScrl + maxVisible
+		if endIdx > numModels {
+			endIdx = numModels
+		}
+		for i := m.modelPickScrl; i < endIdx; i++ {
+			mod := m.pickerModels[i]
+			m.renderModelEntry(&b, mod, i, selectedStyle, currentStyle, dimStyle)
+		}
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  … %d/%d  ↑↓ scroll", m.modelPickSel+1, numModels)))
+		b.WriteString("\n")
+	} else {
+		for i, mod := range m.pickerModels {
+			m.renderModelEntry(&b, mod, i, selectedStyle, currentStyle, dimStyle)
+		}
+	}
+
+	return b.String()
+}
+
+func (m *replModel) renderModelEntry(b *strings.Builder, mod llm.ModelInfo, idx int, selectedStyle, currentStyle, dimStyle lipgloss.Style) {
+	isSelected := idx == m.modelPickSel
+	isCurrent := mod.ID == m.agent.Model()
+
+	mark := "  "
+	if isSelected {
+		mark = "▸ "
+	}
+
+	ctx := ""
+	if mod.MaxCtx > 0 {
+		ctx = fmt.Sprintf(" (%dK context)", mod.MaxCtx/1000)
+	}
+
+	line := fmt.Sprintf("%s%s%s%s", mark, mod.Name, ctx, dimStyle.Render("  "+mod.ID))
+	if isCurrent {
+		line += "  " + currentStyle.Render("✓")
+	}
+
+	if isSelected {
+		b.WriteString(selectedStyle.Render(line))
+	} else {
+		b.WriteString(line)
+	}
+	b.WriteString("\n")
 }
 
 // sessionPreview generates a short preview string for a session.
@@ -1387,42 +1533,53 @@ func (m *replModel) renderOutputLine(line OutputLine) string {
                 }
                 return rendered + "\n"
 
-        case "tool_use":
-                var b strings.Builder
-                // ● ToolName(description)
-                b.WriteString(toolNameStyle.Render("● "))
-                b.WriteString(toolNameStyle.Render(line.ToolName))
-                if line.Content != "" {
-                        // Truncate long tool inputs for display
-                        desc := line.Content
-                        if len(desc) > 80 {
-                                desc = desc[:77] + "..."
-                        }
-                        b.WriteString("(")
-                        b.WriteString(toolResultStyle.Render(desc))
-                        b.WriteString(")")
-                }
-                b.WriteString("\n")
-                return b.String()
+	case "tool_use":
+		var b strings.Builder
+		b.WriteString(toolNameStyle.Render("● "))
+		b.WriteString(toolNameStyle.Render(line.ToolName))
+		if line.Content != "" {
+			if len(line.Content) > 80 && strings.Contains(line.Content, "\n") {
+				b.WriteString("\n")
+				b.WriteString(toolResultStyle.Render(indent(line.Content, "  ")))
+			} else {
+				desc := line.Content
+				if len(desc) > 80 {
+					desc = desc[:77] + "..."
+				}
+				b.WriteString("(")
+				b.WriteString(toolResultStyle.Render(desc))
+				b.WriteString(")")
+			}
+		}
+		b.WriteString("\n")
+		return b.String()
 
-        case "tool_result":
-                var b strings.Builder
-                b.WriteString(successStyle.Render("● "))
-                b.WriteString(toolResultStyle.Render(fmt.Sprintf("%s", line.ToolName)))
-                if durStr := formatDuration(line.Duration); durStr != "" {
-                        b.WriteString(usageStyle.Render(" (" + durStr + ")"))
-                }
-                b.WriteString("\n")
-                // Show truncated output for tool results
-                content := strings.TrimSpace(line.Content)
-                if content != "" {
-                        if len(content) > 500 {
-                                content = content[:500] + "\n  ... [truncated]"
-                        }
-                        b.WriteString(toolResultStyle.Render(indent(content, "  ")))
-                        b.WriteString("\n")
-                }
-                return b.String()
+	case "tool_result":
+		var b strings.Builder
+		isError := strings.HasPrefix(strings.TrimSpace(line.Content), "Error:")
+		if isError {
+			b.WriteString(errorStyle.Render("● "))
+		} else {
+			b.WriteString(successStyle.Render("● "))
+		}
+		b.WriteString(toolResultStyle.Render(line.ToolName))
+		if durStr := formatDuration(line.Duration); durStr != "" {
+			b.WriteString(usageStyle.Render(" (" + durStr + ")"))
+		}
+		b.WriteString("\n")
+		content := strings.TrimSpace(line.Content)
+		if content != "" {
+			if len(content) > 500 {
+				content = content[:500] + "\n  ... [truncated]"
+			}
+			if isError {
+				b.WriteString(errorStyle.Render(indent(content, "  ")))
+			} else {
+				b.WriteString(toolResultStyle.Render(indent(content, "  ")))
+			}
+			b.WriteString("\n")
+		}
+		return b.String()
 
         case "error":
                 return errorStyle.Render("● " + line.Content) + "\n\n"
@@ -1458,22 +1615,21 @@ func (m *replModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
                 m.currentVerb = pickSpinnerVerb()
                 return m, tea.Batch(m.runCompact(), tickSpinner())
 
-        case "/model":
-                if len(parts) > 1 {
-                        newModel := strings.Join(parts[1:], " ")
-                        m.agent.SetModel(newModel)
-                        m.output = append(m.output, OutputLine{
-                                Type:    "system",
-                                Content: fmt.Sprintf("Model set to: %s", newModel),
-                        })
-                } else {
-                        models := m.agent.ProviderName()
-                        m.output = append(m.output, OutputLine{
-                                Type:    "system",
-                                Content: fmt.Sprintf("Current model: %s (provider: %s)", m.agent.Model(), models),
-                        })
-                }
-                return m, nil
+	case "/model":
+		if len(parts) > 1 {
+			newModel := strings.Join(parts[1:], " ")
+			m.agent.SetModel(newModel)
+			m.output = append(m.output, OutputLine{
+				Type:    "system",
+				Content: fmt.Sprintf("Model set to: %s", newModel),
+			})
+		} else {
+			m.showModelPicker = true
+			m.pickerModels = m.agent.AvailableModels()
+			m.modelPickSel = 0
+			m.modelPickScrl = 0
+		}
+		return m, nil
 
 	case "/cost":
 		model := m.agent.Model()
@@ -1487,7 +1643,7 @@ func (m *replModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
 			Type:    "system",
 			Content: msg,
 		})
-		return m, nil
+                return m, nil
 
         case "/provider":
                 m.output = append(m.output, OutputLine{

@@ -356,9 +356,14 @@ func (a *Agent) Model() string {
         return a.model
 }
 
-// Provider returns the current LLM provider name.
+// ProviderName returns the current LLM provider name.
 func (a *Agent) ProviderName() string {
-        return a.provider.Name()
+	return a.provider.Name()
+}
+
+// AvailableModels returns the list of models available from the current provider.
+func (a *Agent) AvailableModels() []llm.ModelInfo {
+	return a.provider.AvailableModels()
 }
 
 // ToolNames returns the names of all registered tools.

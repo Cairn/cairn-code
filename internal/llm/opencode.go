@@ -35,14 +35,13 @@ func (p *OpenCodeProvider) Name() string {
 
 // AvailableModels returns the list of available free OpenCode models.
 func (p *OpenCodeProvider) AvailableModels() []ModelInfo {
-        return []ModelInfo{
-                {ID: "big-pickle", Name: "Big Pickle", MaxCtx: 200000},
-                {ID: "deepseek-v4-flash-free", Name: "DeepSeek V4 Flash Free", MaxCtx: 200000},
-                {ID: "mimo-v2.5-free", Name: "MiMo V2.5 Free", MaxCtx: 200000},
-                {ID: "minimax-m3-free", Name: "MiniMax M3 Free", MaxCtx: 200000},
-                {ID: "nemotron-3-ultra-free", Name: "Nemotron 3 Ultra Free", MaxCtx: 1048576},
-                {ID: "qwen3.6-plus-free", Name: "Qwen3.6 Plus Free", MaxCtx: 262144},
-        }
+	return []ModelInfo{
+		{ID: "big-pickle", Name: "Big Pickle", MaxCtx: 200000},
+		{ID: "deepseek-v4-flash-free", Name: "DeepSeek V4 Flash Free", MaxCtx: 200000},
+		{ID: "mimo-v2.5-free", Name: "MiMo V2.5 Free", MaxCtx: 200000},
+		{ID: "north-mini-code-free", Name: "North Mini Code Free", MaxCtx: 200000},
+		{ID: "nemotron-3-ultra-free", Name: "Nemotron 3 Ultra Free", MaxCtx: 1048576},
+	}
 }
 
 // opencodeBaseURL is the base URL for the OpenCode API (kept for backward compatibility).

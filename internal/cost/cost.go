@@ -79,6 +79,22 @@ var modelPricingTable = map[string]ModelPricing{
 		InputCostPerM:  0,
 		OutputCostPerM: 0,
 	},
+	"deepseek-v4-flash-free": {
+		InputCostPerM:  0,
+		OutputCostPerM: 0,
+	},
+	"mimo-v2.5-free": {
+		InputCostPerM:  0,
+		OutputCostPerM: 0,
+	},
+	"north-mini-code-free": {
+		InputCostPerM:  0,
+		OutputCostPerM: 0,
+	},
+	"nemotron-3-ultra-free": {
+		InputCostPerM:  0,
+		OutputCostPerM: 0,
+	},
 }
 
 func GetModelPricing(model string) ModelPricing {
