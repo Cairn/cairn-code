@@ -10,5 +10,6 @@ pub mod grep_tool;
 pub mod web_search;
 pub mod web_fetch;
 pub mod todo;
+pub mod memory;
 
 

@@ -179,58 +179,84 @@ fn openrouter_request_body(
     body.push_str(&format!("{{\"model\":\"{model}\",\"stream\":{stream}"));
     body.push_str(&format!(",\"max_completion_tokens\":{max_tokens}"));
     body.push_str(",\"messages\":[");
+    let mut first = true;
     if !system.is_empty() {
-        let escaped = system.replace('\\', "\\\\").replace('"', "\\\"");
-        body.push_str(&format!("{{\"role\":\"system\",\"content\":\"{escaped}\"}},"));
+        let escaped = escape_json_str(system);
+        body.push_str(&format!("{{\"role\":\"system\",\"content\":\"{escaped}\"}}"));
+        first = false;
     }
-    for (i, msg) in messages.iter().enumerate() {
-        if i > 0 { body.push(','); }
-        body.push_str(&format!("{{\"role\":\"{}\",\"content\":", msg.role));
+    for msg in messages.iter() {
+        if !first { body.push(','); }
+        first = false;
         match &msg.content {
             Content::Text(t) => {
-                let escaped = t.replace('\\', "\\\\").replace('"', "\\\"");
-                body.push_str(&format!("\"{escaped}\""));
+                let escaped = escape_json_str(t);
+                body.push_str(&format!(
+                    "{{\"role\":\"{}\",\"content\":\"{escaped}\"}}",
+                    msg.role
+                ));
             }
             Content::ToolUse(tu) => {
+                let args_escaped = tu.input.replace('\\', "\\\\").replace('"', "\\\"");
                 body.push_str(&format!(
-                    "[{{\"type\":\"tool_use\",\"id\":\"{}\",\"name\":\"{}\",\"input\":{}}}]",
-                    tu.id, tu.name, tu.input
+                    "{{\"role\":\"assistant\",\"tool_calls\":[{{\"id\":\"{}\",\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"{}\"}}}}]}}",
+                    tu.id, tu.name, args_escaped
                 ));
             }
             Content::ToolResult(tr) => {
-                let escaped = tr.content.replace('\\', "\\\\").replace('"', "\\\"");
+                let escaped = escape_json_str(&tr.content);
                 body.push_str(&format!(
-                    "[{{\"type\":\"tool_result\",\"tool_use_id\":\"{}\",\"content\":\"{escaped}\"}}]",
+                    "{{\"role\":\"tool\",\"tool_call_id\":\"{}\",\"content\":\"{escaped}\"}}",
                     tr.tool_use_id
                 ));
             }
             Content::Thinking(t) => {
-                let escaped = t.replace('\\', "\\\\").replace('"', "\\\"");
-                body.push_str(&format!("\"{escaped}\""));
+                let escaped = escape_json_str(t);
+                body.push_str(&format!(
+                    "{{\"role\":\"assistant\",\"content\":\"{escaped}\"}}",
+                ));
             }
         }
-        body.push('}');
     }
     body.push(']');
     if !tools.is_empty() {
         body.push_str(",\"tools\":[");
         for (i, tool) in tools.iter().enumerate() {
             if i > 0 { body.push(','); }
+            let name_esc = escape_json_str(&tool.name);
+            let desc_esc = escape_json_str(&tool.description);
             body.push_str(&format!(
-                "{{\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"description\":\"{}\",\"parameters\":{}}}}}",
-                tool.name, tool.description, tool.input_schema
+                "{{\"type\":\"function\",\"function\":{{\"name\":\"{name_esc}\",\"description\":\"{desc_esc}\",\"parameters\":{}}}}}",
+                tool.input_schema
             ));
         }
         body.push(']');
     }
     body.push('}');
+    if let Err(e) = crate::json::parse(&body) {
+        let pos = e.pos;
+        let start = pos.saturating_sub(20);
+        let end = (pos + 20).min(body.len());
+        let context = &body[start..end];
+        let ch = body.as_bytes().get(pos).map(|&b| b as char).unwrap_or('?');
+        return Err(format!("Invalid JSON body: {e}\nChar at pos {pos}: '{ch}' (0x{:02X})\nContext: ...{context}...", ch as u8));
+    }
     Ok(body)
+}
+
+fn escape_json_str(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 fn parse_openrouter_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
     let mut messages = Vec::new();
     let mut usage = Usage::default();
     let mut collected = String::new();
+    let mut tool_calls: std::collections::HashMap<u64, (String, String, String)> = std::collections::HashMap::new();
     for line in raw.lines() {
         if let Some(data) = line.strip_prefix("data: ") {
             if data == "[DONE]" { continue; }
@@ -240,6 +266,23 @@ fn parse_openrouter_response(raw: &str) -> Result<(Vec<Message>, Usage), String>
                         if let Some(delta) = choice.get("delta") {
                             if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
                                 collected.push_str(text);
+                            }
+                            if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                for tc in tc_arr {
+                                    let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let entry = tool_calls.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
+                                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                        if !id.is_empty() { entry.0 = id.to_string(); }
+                                    }
+                                    if let Some(func) = tc.get("function") {
+                                        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                            if !name.is_empty() { entry.1 = name.to_string(); }
+                                        }
+                                        if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                            entry.2.push_str(args);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -251,8 +294,20 @@ fn parse_openrouter_response(raw: &str) -> Result<(Vec<Message>, Usage), String>
             }
         }
     }
-    if !collected.is_empty() {
-        messages.push(Message { role: "assistant".into(), content: Content::Text(collected) });
+    if !collected.is_empty() || !tool_calls.is_empty() {
+        let content = if !collected.is_empty() {
+            Content::Text(collected)
+        } else {
+            let mut calls: Vec<_> = tool_calls.into_iter().collect();
+            calls.sort_by_key(|(idx, _)| *idx);
+            let tu = calls.into_iter().next().map(|(_, (id, name, args))| {
+                super::provider::ToolUse { id, name, input: args }
+            }).unwrap_or(super::provider::ToolUse {
+                id: String::new(), name: String::new(), input: "{}".into(),
+            });
+            Content::ToolUse(tu)
+        };
+        messages.push(Message { role: "assistant".into(), content });
     }
     Ok((messages, usage))
 }
@@ -271,4 +326,50 @@ fn parse_openrouter_402(err: &str) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::registry::default_registry;
+
+    #[test]
+    fn test_all_tool_schemas_are_valid_json() {
+        let reg = default_registry();
+        for def in reg.definitions() {
+            match crate::json::parse(&def.input_schema) {
+                Ok(v) => {
+                    let obj = v.as_object().expect(&format!("{}: schema should be object", def.name));
+                    assert!(obj.get("type").is_some(), "{}: schema missing 'type'", def.name);
+                    assert!(obj.get("properties").is_some(), "{}: schema missing 'properties'", def.name);
+                }
+                Err(e) => panic!("{}: invalid schema JSON: {e}", def.name),
+            }
+        }
+    }
+
+    #[test]
+    fn test_full_request_body_with_all_tools() {
+        let reg = default_registry();
+        let tools: Vec<ToolDefinition> = reg.definitions();
+        let msgs = vec![Message { role: "user".into(), content: Content::Text("hello".into()) }];
+        let body = openrouter_request_body(&msgs, &tools, "You are helpful.", "openai/gpt-4o", true, 4096).unwrap();
+        match crate::json::parse(&body) {
+            Ok(v) => {
+                let obj = v.as_object().unwrap();
+                assert_eq!(obj.get("model").and_then(|v| v.as_str()), Some("openai/gpt-4o"));
+                assert!(obj.get("messages").and_then(|v| v.as_array()).is_some());
+                let tools_arr = obj.get("tools").and_then(|v| v.as_array()).unwrap();
+                assert_eq!(tools_arr.len(), 12);
+                for (i, tool_val) in tools_arr.iter().enumerate() {
+                    let tool_obj = tool_val.as_object().unwrap();
+                    assert_eq!(tool_obj.get("type").and_then(|v| v.as_str()), Some("function"));
+                    let func = tool_obj.get("function").unwrap().as_object().unwrap();
+                    assert!(func.get("name").is_some(), "tool {i} missing name");
+                    assert!(func.get("parameters").is_some(), "tool {i} missing parameters");
+                }
+            }
+            Err(e) => panic!("Full request body invalid: {e}"),
+        }
+    }
 }

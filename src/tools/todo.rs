@@ -10,7 +10,7 @@ impl Tool for TodoTool {
     fn needs_permission(&self) -> bool { false }
 
     fn input_schema(&self) -> String {
-        r#"{"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string"},"priority":{"type":"string"}}}}}},"required":["todos"]}"#.into()
+        r#"{"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string"},"priority":{"type":"string"}}}}},"required":["todos"]}"#.into()
     }
 
     fn execute(&self, input: &str) -> Result<String, String> {

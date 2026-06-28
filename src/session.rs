@@ -163,3 +163,73 @@ fn message_from_json(val: &crate::json::JsonValue) -> Option<Message> {
 
     Some(Message { role, content })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_id_not_empty() {
+        let id = new_id();
+        assert!(!id.is_empty());
+    }
+
+    #[test]
+    fn test_new_id_unique() {
+        let a = new_id();
+        let b = new_id();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_save_and_list_and_load() {
+        let test_id = format!("test-{}", new_id());
+        let dir = std::env::temp_dir().join("cairn-test-session");
+        let dir_str = dir.to_string_lossy().to_string();
+        fs::create_dir_all(&dir).unwrap();
+
+        let msgs = vec![
+            Message { role: "user".into(), content: crate::llm::Content::Text("hello".into()) },
+            Message { role: "assistant".into(), content: crate::llm::Content::Text("hi".into()) },
+        ];
+
+        let session = Session {
+            id: test_id.clone(),
+            messages: msgs,
+            model: "claude-sonnet-4".into(),
+            provider: "anthropic".into(),
+            tokens_in: 10,
+            tokens_out: 20,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let result = save(&dir_str, &session);
+        assert!(result.is_ok(), "save failed: {:?}", result);
+
+        let summaries = list(&dir_str).unwrap();
+        assert!(!summaries.is_empty());
+        assert!(summaries.iter().any(|s| s.id == test_id));
+
+        let loaded = load(&dir_str, &test_id).unwrap();
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.model, "claude-sonnet-4");
+        assert_eq!(loaded.tokens_in, 10);
+        assert_eq!(loaded.tokens_out, 20);
+
+        // Cleanup
+        let _ = fs::remove_file(dir.join(&test_id));
+    }
+
+    #[test]
+    fn test_list_nonexistent_dir() {
+        let summaries = list("/nonexistent/path/xyz123").unwrap();
+        assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn test_load_nonexistent() {
+        let result = load("/nonexistent/path/xyz123", "nonexistent");
+        assert!(result.is_err());
+    }
+}

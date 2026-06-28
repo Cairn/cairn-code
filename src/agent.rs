@@ -15,6 +15,7 @@ pub enum AgentEvent {
     ToolResult(String, String, String),
     Error(String),
     TurnEnd(llm::Usage),
+    PermissionRequest(String, String),
     Done,
 }
 
@@ -76,7 +77,7 @@ impl Agent {
         &self.usage
     }
 
-    pub fn run(&mut self, input: &str, tx: mpsc::Sender<AgentEvent>, cancel: &AtomicBool) -> Result<(), String> {
+    pub fn run(&mut self, input: &str, tx: mpsc::Sender<AgentEvent>, cancel: &AtomicBool, perm_rx: &mpsc::Receiver<String>) -> Result<(), String> {
         self.messages.push(llm::Message {
             role: "user".into(),
             content: llm::Content::Text(input.to_string()),
@@ -138,12 +139,25 @@ impl Agent {
                     let _ = tx.send(AgentEvent::ToolUse(tu.name.clone(), tu.input.clone()));
 
                     let needs_ask = self.config.ask.iter().any(|t| t == &tu.name);
+                    let always_allowed = self.config.auto_allow.iter().any(|t| t == &tu.name);
                     let denied = self.config.is_tool_denied(&tu.name);
 
                     let result = if denied {
                         Err(format!("Tool '{}' is denied by config", tu.name))
-                    } else if needs_ask {
-                        Err(format!("Tool '{}' requires permission — not yet implemented in REPL", tu.name))
+                    } else if needs_ask && !always_allowed {
+                        let _ = tx.send(AgentEvent::PermissionRequest(tu.name.clone(), tu.input.clone()));
+                        let response = perm_rx.recv().unwrap_or_else(|_| "deny".to_string());
+                        match response.as_str() {
+                            "always_allow" => {
+                                self.config.auto_allow.push(tu.name.clone());
+                                let _ = crate::config::save_full_config(&self.config);
+                                self.tools.get(&tu.name).map(|t| t.execute(&tu.input)).unwrap_or(Err(format!("Unknown tool: {}", tu.name)))
+                            }
+                            "allow" => {
+                                self.tools.get(&tu.name).map(|t| t.execute(&tu.input)).unwrap_or(Err(format!("Unknown tool: {}", tu.name)))
+                            }
+                            _ => Err(format!("Permission denied by user for tool '{}'", tu.name)),
+                        }
                     } else {
                         match self.tools.get(&tu.name) {
                             Some(tool) => tool.execute(&tu.input),

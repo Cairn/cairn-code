@@ -111,6 +111,38 @@ pub fn save_config(provider: &str, model: &str, api_key: Option<&str>) -> Result
     std::fs::write(&path, &output).map_err(|e| e.to_string())
 }
 
+pub fn save_full_config(cfg: &Config) -> Result<(), String> {
+    use crate::json::JsonValue;
+    let path = config_path();
+    let mut obj: std::collections::HashMap<String, JsonValue> = if path.exists() {
+        let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        crate::json::parse(&content).map_err(|e| e.to_string())?.as_object().cloned().unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    obj.insert("default_provider".into(), JsonValue::String(cfg.default_provider.clone()));
+    obj.insert("default_model".into(), JsonValue::String(cfg.default_model.clone()));
+
+    let perms = JsonValue::Object(std::collections::HashMap::from([
+        ("auto_allow".into(), JsonValue::Array(cfg.auto_allow.iter().map(|s| JsonValue::String(s.clone())).collect())),
+        ("ask".into(), JsonValue::Array(cfg.ask.iter().map(|s| JsonValue::String(s.clone())).collect())),
+        ("deny".into(), JsonValue::Array(cfg.deny.iter().map(|s| JsonValue::String(s.clone())).collect())),
+    ]));
+    obj.insert("permissions".into(), perms);
+
+    if !cfg.api_keys.is_empty() {
+        let keys: std::collections::HashMap<String, JsonValue> = cfg.api_keys.iter().map(|(k, v)| (k.clone(), JsonValue::String(v.clone()))).collect();
+        obj.insert("api_keys".into(), JsonValue::Object(keys));
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let output = crate::json::serialize(&JsonValue::Object(obj));
+    std::fs::write(&path, &output).map_err(|e| e.to_string())
+}
+
 pub fn config_get_api_key(provider: &str) -> Option<String> {
     let path = config_path();
     if !path.exists() { return None; }
@@ -168,4 +200,95 @@ fn parse_config(content: &str) -> Result<Config, String> {
     }
 
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let cfg = Config::default();
+        assert_eq!(cfg.default_provider, "anthropic");
+        assert_eq!(cfg.auto_allow.len(), 3);
+        assert!(cfg.ask.contains(&"shell".to_string()));
+        assert!(cfg.deny.is_empty());
+    }
+
+    #[test]
+    fn test_is_tool_denied() {
+        let mut cfg = Config::default();
+        cfg.deny.push("shell".into());
+        assert!(cfg.is_tool_denied("shell"));
+        assert!(!cfg.is_tool_denied("file_read"));
+    }
+
+    #[test]
+    fn test_parse_full_config() {
+        let input = r#"{
+            "default_provider": "openai",
+            "default_model": "gpt-4o",
+            "max_turns": 50,
+            "max_tokens": 4096,
+            "system_prompt_file": "CUSTOM.md",
+            "permissions": {
+                "auto_allow": ["file_read"],
+                "ask": ["shell"],
+                "deny": ["file_write"]
+            },
+            "api_keys": {
+                "openai": "sk-test123"
+            }
+        }"#;
+        let cfg = parse_config(input).unwrap();
+        assert_eq!(cfg.default_provider, "openai");
+        assert_eq!(cfg.default_model, "gpt-4o");
+        assert_eq!(cfg.max_turns, 50);
+        assert_eq!(cfg.max_tokens, 4096);
+        assert_eq!(cfg.system_prompt_file, "CUSTOM.md");
+        assert_eq!(cfg.auto_allow, vec!["file_read".to_string()]);
+        assert_eq!(cfg.ask, vec!["shell".to_string()]);
+        assert_eq!(cfg.deny, vec!["file_write".to_string()]);
+        assert_eq!(cfg.api_keys.get("openai"), Some(&"sk-test123".to_string()));
+    }
+
+    #[test]
+    fn test_parse_minimal_config() {
+        let input = r#"{"default_provider":"test","default_model":"m"}"#;
+        let cfg = parse_config(input).unwrap();
+        assert_eq!(cfg.default_provider, "test");
+        assert_eq!(cfg.default_model, "m");
+        assert!(cfg.auto_allow.contains(&"file_read".to_string()));
+    }
+
+    #[test]
+    fn test_roundtrip_config() {
+        let mut cfg = Config::default();
+        cfg.default_provider = "openai".into();
+        cfg.default_model = "gpt-4o".into();
+        cfg.auto_allow = vec!["file_read".into(), "glob".into()];
+        cfg.ask = vec!["shell".into()];
+        cfg.deny = vec!["file_write".into()];
+        cfg.api_keys.insert("openai".into(), "sk-abc".into());
+
+        let output = crate::json::serialize(&crate::json::JsonValue::Object(std::collections::HashMap::from([
+            ("default_provider".into(), crate::json::JsonValue::String(cfg.default_provider.clone())),
+            ("default_model".into(), crate::json::JsonValue::String(cfg.default_model.clone())),
+            ("permissions".into(), crate::json::JsonValue::Object(std::collections::HashMap::from([
+                ("auto_allow".into(), crate::json::JsonValue::Array(cfg.auto_allow.iter().map(|s| crate::json::JsonValue::String(s.clone())).collect())),
+                ("ask".into(), crate::json::JsonValue::Array(cfg.ask.iter().map(|s| crate::json::JsonValue::String(s.clone())).collect())),
+                ("deny".into(), crate::json::JsonValue::Array(cfg.deny.iter().map(|s| crate::json::JsonValue::String(s.clone())).collect())),
+            ]))),
+        ])));
+
+        let parsed = parse_config(&output).unwrap();
+        assert_eq!(parsed.default_provider, "openai");
+        assert_eq!(parsed.auto_allow, vec!["file_read", "glob"]);
+    }
+
+    #[test]
+    fn test_config_path() {
+        let path = config_path();
+        assert!(path.to_string_lossy().contains("cairn-code"));
+    }
 }

@@ -61,5 +61,6 @@ pub fn default_registry() -> Registry {
     r.register(Box::new(crate::tools::web_search::WebSearchTool));
     r.register(Box::new(crate::tools::web_fetch::WebFetchTool));
     r.register(Box::new(crate::tools::todo::TodoTool));
+    r.register(Box::new(crate::tools::memory::MemoryTool));
     r
 }

@@ -62,7 +62,12 @@ pub struct Tui {
     picker_session_sel: usize,
     picker_session_scrl: usize,
     agent_tx: Option<mpsc::Sender<String>>,
+    perm_tx: Option<mpsc::Sender<String>>,
     cancel_flag: Option<Arc<AtomicBool>>,
+    show_permission_prompt: bool,
+    perm_tool_name: String,
+    perm_tool_input: String,
+    perm_selection: usize,
 }
 
 impl Tui {
@@ -100,12 +105,21 @@ impl Tui {
             picker_session_sel: 0,
             picker_session_scrl: 0,
             agent_tx: None,
+            perm_tx: None,
             cancel_flag: None,
+            show_permission_prompt: false,
+            perm_tool_name: String::new(),
+            perm_tool_input: String::new(),
+            perm_selection: 0,
         }
     }
 
     pub fn set_agent_tx(&mut self, tx: mpsc::Sender<String>) {
         self.agent_tx = Some(tx);
+    }
+
+    pub fn set_perm_tx(&mut self, tx: mpsc::Sender<String>) {
+        self.perm_tx = Some(tx);
     }
 
     pub fn set_cancel_flag(&mut self, flag: Arc<AtomicBool>) {
@@ -143,6 +157,13 @@ impl Tui {
                                 type_: "error".into(), content: e, tool_name: String::new(), duration: String::new(),
                             });
                         }
+                        AgentEvent::PermissionRequest(name, input) => {
+                            self.flush_streaming();
+                            self.show_permission_prompt = true;
+                            self.perm_tool_name = name;
+                            self.perm_tool_input = input;
+                            self.perm_selection = 0;
+                        }
                         AgentEvent::TurnEnd(u) => {
                             self.total_usage.input_tokens += u.input_tokens;
                             self.total_usage.output_tokens += u.output_tokens;
@@ -175,18 +196,8 @@ impl Tui {
                 let event_avail = ratatui::crossterm::event::poll(Duration::from_millis(1)).unwrap_or(false);
                 if event_avail {
                     if let Ok(ratatui::crossterm::event::Event::Key(key)) = ratatui::crossterm::event::read() {
-                        if key.kind == ratatui::crossterm::event::KeyEventKind::Press
-                            && key.code == ratatui::crossterm::event::KeyCode::Esc
-                        {
-                            if let Some(flag) = &self.cancel_flag {
-                                flag.store(true, Ordering::Relaxed);
-                            }
-                            self.state = State::Idle;
-                            self.flush_streaming();
-                            self.output_lines.push(OutputLine {
-                                type_: "system".into(), content: "Cancelled.".into(),
-                                tool_name: String::new(), duration: String::new(),
-                            });
+                        if key.kind == ratatui::crossterm::event::KeyEventKind::Press {
+                            self.handle_key(key);
                         }
                     }
                 }
@@ -215,6 +226,36 @@ impl Tui {
         use ratatui::crossterm::event::{KeyCode, KeyModifiers, KeyEventKind};
 
         if key.kind != KeyEventKind::Press {
+            return true;
+        }
+
+        if self.show_permission_prompt {
+            match key.code {
+                KeyCode::Left => {
+                    self.perm_selection = self.perm_selection.saturating_sub(1);
+                }
+                KeyCode::Right => {
+                    if self.perm_selection < 2 { self.perm_selection += 1; }
+                }
+                KeyCode::Enter => {
+                    let selected = match self.perm_selection {
+                        0 => "allow",
+                        1 => "always_allow",
+                        _ => "deny",
+                    };
+                    self.show_permission_prompt = false;
+                    if let Some(tx) = &self.perm_tx {
+                        let _ = tx.send(selected.to_string());
+                    }
+                }
+                KeyCode::Esc => {
+                    self.show_permission_prompt = false;
+                    if let Some(tx) = &self.perm_tx {
+                        let _ = tx.send("deny".to_string());
+                    }
+                }
+                _ => {}
+            }
             return true;
         }
 
@@ -419,6 +460,8 @@ impl Tui {
                     return true;
                 }
 
+                if !matches!(self.state, State::Idle) { return true; }
+
                 let input = self.input_buf.trim().to_string();
                 self.input_buf.clear(); self.cursor = 0;
                 if input.is_empty() { return true; }
@@ -534,10 +577,19 @@ impl Tui {
                 self.list_sessions();
             }
             "/resume" => {
-                self.show_session_picker = true;
-                self.picker_sessions = session::list(&self.sessions_dir()).unwrap_or_default();
-                self.picker_session_sel = 0;
-                self.picker_session_scrl = 0;
+                let sessions = session::list(&self.sessions_dir()).unwrap_or_default();
+                if sessions.is_empty() {
+                    self.output_lines.push(OutputLine {
+                        type_: "system".into(),
+                        content: "No saved sessions. Use /save to save the current conversation first.".into(),
+                        tool_name: String::new(), duration: String::new(),
+                    });
+                } else {
+                    self.show_session_picker = true;
+                    self.picker_sessions = sessions;
+                    self.picker_session_sel = 0;
+                    self.picker_session_scrl = 0;
+                }
             }
             "/exit" | "/quit" | "/q" => {
                 std::process::exit(0);
@@ -663,8 +715,8 @@ impl Tui {
                 self.provider = sess.provider.clone();
 
                 if let Some(tx) = &self.agent_tx {
-                    let _ = tx.send(format!("__load_session__:{}", sess.id));
                     let _ = tx.send(format!("__switch__:{}:{}", sess.provider, sess.model));
+                    let _ = tx.send(format!("__load_session__:{}", sess.id));
                 }
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
@@ -749,9 +801,7 @@ impl Tui {
                     lines.push(Line::from(""));
                 }
                 "text" => {
-                    for part in line.content.split('\n') {
-                        lines.push(Line::from(Span::raw(part)));
-                    }
+                    lines.extend(crate::markdown::render(&line.content));
                 }
                 "tool_use" => {
                     let inner = if line.content.len() > 80 { format!("\n  {}", line.content) } else { format!("({})", line.content) };
@@ -781,9 +831,7 @@ impl Tui {
             }
         }
         if !self.streaming_text.is_empty() {
-            for part in self.streaming_text.split('\n') {
-                lines.push(Line::from(Span::raw(part)));
-            }
+            lines.extend(crate::markdown::render(&self.streaming_text));
         }
         if matches!(self.state, State::Running) && self.streaming_text.is_empty() {
             let spin = SPINNER_CHARS[self.spinner_idx % SPINNER_CHARS.len()];
@@ -896,6 +944,43 @@ impl Tui {
                     ]));
                 }
             }
+        } else if self.show_permission_prompt {
+            let cursor = self.cursor.min(self.input_buf.len());
+            let (before, after) = self.input_buf.split_at(cursor);
+            let prompt_line_idx = lines.len();
+            lines.push(Line::from(vec![
+                Span::styled("❯ ", orange_fg),
+                Span::raw(before),
+                Span::styled("▋", orange_fg),
+                Span::raw(after),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(format!("Tool '{}' wants to run:", self.perm_tool_name), white),
+            ]));
+            if !self.perm_tool_input.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {}", self.perm_tool_input), dim),
+                ]));
+            }
+            lines.push(Line::from(""));
+            let options = ["Allow", "Always Allow", "Deny"];
+            let mut option_spans = Vec::new();
+            for (i, opt) in options.iter().enumerate() {
+                if i > 0 { option_spans.push(Span::raw("  ")); }
+                let is_sel = i == self.perm_selection;
+                let open = if is_sel { "[" } else { " " };
+                let close = if is_sel { "]" } else { " " };
+                option_spans.push(Span::styled(
+                    format!("{open}{opt}{close}"),
+                    if is_sel { orange_fg.add_modifier(Modifier::BOLD) } else { dim },
+                ));
+            }
+            lines.push(Line::from(option_spans));
+            lines.push(Line::from(vec![
+                Span::styled("(← → navigate  Enter confirm  Esc deny)", dim),
+            ]));
+            cursor_pos = Some((area.x + display_width("❯ ") as u16 + display_width(before) as u16, prompt_line_idx));
         } else if self.awaiting_api_key {
             let cursor = self.cursor.min(self.input_buf.len());
             let nchars = self.input_buf[..cursor].chars().count();

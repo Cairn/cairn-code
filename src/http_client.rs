@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 pub struct HttpRequest {
@@ -11,17 +12,39 @@ pub struct HttpResponse {
     pub body: String,
 }
 
-fn build_curl_args(req: &HttpRequest) -> Vec<String> {
+fn temp_body_path() -> PathBuf {
+    let id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!("cairn_body_{id}.json"))
+}
+
+fn debug_log_request(url: &str, body: &str) {
+    let dir = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    let path = std::path::PathBuf::from(dir).join(".config/cairn-code/debug_request.json");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, format!("URL: {url}\n\nBody:\n{body}"));
+}
+
+pub fn request(req: &HttpRequest) -> Result<HttpResponse, String> {
     let mut args = vec!["-sS".to_string()];
     args.push("-w".to_string());
     args.push("\n%{http_code}\n".to_string());
 
-    if let Some(body) = &req.body {
-        args.push("-X".to_string());
-        args.push("POST".to_string());
-        args.push("-d".to_string());
-        args.push(body.clone());
-    }
+    let temp_file = if let Some(body) = &req.body {
+        let path = temp_body_path();
+        std::fs::write(&path, body).map_err(|e| format!("write temp: {e}"))?;
+        args.push("--data-binary".to_string());
+        args.push(format!("@{}", path.to_string_lossy()));
+        Some(path)
+    } else {
+        None
+    };
 
     for (name, value) in &req.headers {
         args.push("-H".to_string());
@@ -29,11 +52,6 @@ fn build_curl_args(req: &HttpRequest) -> Vec<String> {
     }
 
     args.push(req.url.clone());
-    args
-}
-
-pub fn request(req: &HttpRequest) -> Result<HttpResponse, String> {
-    let args = build_curl_args(req);
 
     let child = Command::new("curl")
         .args(&args)
@@ -43,6 +61,10 @@ pub fn request(req: &HttpRequest) -> Result<HttpResponse, String> {
         .map_err(|e| format!("failed to spawn curl: {e}"))?;
 
     let output = child.wait_with_output().map_err(|e| format!("curl failed: {e}"))?;
+
+    if let Some(path) = &temp_file {
+        let _ = std::fs::remove_file(path);
+    }
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -71,7 +93,27 @@ pub fn request_streaming<F>(req: &HttpRequest, mut on_line: F) -> Result<(), Str
 where
     F: FnMut(&str),
 {
-    let args = build_curl_args(req);
+    let mut args = vec!["-sS".to_string()];
+    args.push("-w".to_string());
+    args.push("\n%{http_code}\n".to_string());
+
+    let temp_file = if let Some(body) = &req.body {
+        let path = temp_body_path();
+        std::fs::write(&path, body).map_err(|e| format!("write temp: {e}"))?;
+        debug_log_request(&req.url, body);
+        args.push("--data-binary".to_string());
+        args.push(format!("@{}", path.to_string_lossy()));
+        Some(path)
+    } else {
+        None
+    };
+
+    for (name, value) in &req.headers {
+        args.push("-H".to_string());
+        args.push(format!("{name}: {value}"));
+    }
+
+    args.push(req.url.clone());
 
     let mut child = Command::new("curl")
         .args(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
@@ -86,6 +128,7 @@ where
     let mut prev_line = String::new();
     let mut http_status: Option<u16> = None;
     let mut http_body = String::new();
+    let mut last_non_empty = String::new();
 
     for line in reader.lines() {
         match line {
@@ -95,7 +138,10 @@ where
                     http_body.push_str(&prev_line);
                     http_body.push('\n');
                 }
-                prev_line = l;
+                prev_line = l.clone();
+                if !l.trim().is_empty() {
+                    last_non_empty = l;
+                }
             }
             Err(e) => return Err(format!("read error: {e}")),
         }
@@ -103,9 +149,15 @@ where
 
     if !prev_line.is_empty() {
         http_status = prev_line.trim().parse::<u16>().ok();
+    } else if !last_non_empty.is_empty() {
+        http_status = last_non_empty.trim().parse::<u16>().ok();
     }
 
     let _ = child.wait();
+
+    if let Some(path) = &temp_file {
+        let _ = std::fs::remove_file(path);
+    }
 
     let status = http_status.unwrap_or(200);
     if status < 100 || status >= 300 {

@@ -7,6 +7,7 @@ mod llm;
 mod agent;
 mod tools;
 mod tui;
+mod markdown;
 
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +63,7 @@ fn main() {
 
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>();
     let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
+    let (perm_tx, perm_rx) = mpsc::channel::<String>();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel2 = cancel.clone();
 
@@ -98,7 +100,7 @@ fn main() {
                 }
                 Ok(prompt) => {
                     cancel2.store(false, Ordering::Relaxed);
-                    let _ = agent.run(&prompt, event_tx.clone(), &cancel2);
+                    let _ = agent.run(&prompt, event_tx.clone(), &cancel2, &perm_rx);
                 }
                 Err(_) => break,
             }
@@ -113,6 +115,7 @@ fn main() {
 
     let mut tui = tui::Tui::new(version, &p_model_for_print, &provider_name_str, &work_dir);
     tui.set_agent_tx(cmd_tx.clone());
+    tui.set_perm_tx(perm_tx);
     tui.set_cancel_flag(cancel);
     tui.set_picker_models(models);
 
