@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build windows
 
 package tools
 
@@ -10,26 +10,26 @@ import (
 	"time"
 )
 
-// BashTool executes shell commands.
-type BashTool struct{}
+// PowerShellTool executes PowerShell commands on Windows.
+type PowerShellTool struct{}
 
-func NewBashTool() *BashTool {
-	return &BashTool{}
+func NewPowerShellTool() *PowerShellTool {
+	return &PowerShellTool{}
 }
 
-func (t *BashTool) Name() string { return "bash" }
+func (t *PowerShellTool) Name() string { return "powershell" }
 
-func (t *BashTool) Description() string {
-	return "Executes a bash command in a subprocess with combined stdout/stderr. Respects timeout and captures exit code."
+func (t *PowerShellTool) Description() string {
+	return "Executes a PowerShell command in a subprocess with combined stdout/stderr. Respects timeout and captures exit code."
 }
 
-func (t *BashTool) InputSchema() map[string]any {
+func (t *PowerShellTool) InputSchema() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"command": map[string]any{
 				"type":        "string",
-				"description": "The shell command to execute.",
+				"description": "The PowerShell command to execute.",
 			},
 			"timeout": map[string]any{
 				"type":        "integer",
@@ -44,16 +44,16 @@ func (t *BashTool) InputSchema() map[string]any {
 	}
 }
 
-func (t *BashTool) NeedsPermission() bool { return true }
+func (t *PowerShellTool) NeedsPermission() bool { return true }
 
-type bashInput struct {
+type powerShellInput struct {
 	Command     string `json:"command"`
 	Timeout     *int   `json:"timeout,omitempty"`
 	Description string `json:"description,omitempty"`
 }
 
-func (t *BashTool) Execute(ctx context.Context, input json.RawMessage) (string, error) {
-	var params bashInput
+func (t *PowerShellTool) Execute(ctx context.Context, input json.RawMessage) (string, error) {
+	var params powerShellInput
 	if err := json.Unmarshal(input, &params); err != nil {
 		return "", fmt.Errorf("invalid input: %w", err)
 	}
@@ -76,8 +76,8 @@ func (t *BashTool) Execute(ctx context.Context, input json.RawMessage) (string, 
 	execCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
 	defer cancel()
 
-	// Execute command using bash
-	cmd := exec.CommandContext(execCtx, "bash", "-c", params.Command)
+	// Execute command using PowerShell
+	cmd := exec.CommandContext(execCtx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", params.Command)
 	cmd.Dir = "" // use current working directory
 
 	output, err := cmd.CombinedOutput()

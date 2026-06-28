@@ -16,6 +16,7 @@ import (
         "github.com/charmbracelet/lipgloss"
 
         "github.com/cairn/cairn-code/internal/agent"
+        "github.com/cairn/cairn-code/internal/cost"
         "github.com/cairn/cairn-code/internal/llm"
         "github.com/cairn/cairn-code/internal/session"
 )
@@ -1474,13 +1475,19 @@ func (m *replModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
                 }
                 return m, nil
 
-        case "/cost":
-                cost := fmt.Sprintf("Token usage:\n  Input: %d\n  Output: %d", m.totalUsage.InputTokens, m.totalUsage.OutputTokens)
-                m.output = append(m.output, OutputLine{
-                        Type:    "system",
-                        Content: cost,
-                })
-                return m, nil
+	case "/cost":
+		model := m.agent.Model()
+		est := cost.EstimateCost(model, m.totalUsage.InputTokens, m.totalUsage.OutputTokens, m.totalUsage.CacheRead, m.totalUsage.CacheCreate)
+		msg := fmt.Sprintf("Token usage:\n  Input: %d\n  Output: %d", m.totalUsage.InputTokens, m.totalUsage.OutputTokens)
+		if m.totalUsage.CacheRead > 0 || m.totalUsage.CacheCreate > 0 {
+			msg += fmt.Sprintf("\n  Cache read: %d\n  Cache write: %d", m.totalUsage.CacheRead, m.totalUsage.CacheCreate)
+		}
+		msg += fmt.Sprintf("\nModel: %s\nEstimated cost: %s", model, cost.FormatCostShort(est))
+		m.output = append(m.output, OutputLine{
+			Type:    "system",
+			Content: msg,
+		})
+		return m, nil
 
         case "/provider":
                 m.output = append(m.output, OutputLine{
