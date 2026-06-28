@@ -67,11 +67,51 @@ impl Config {
     }
 }
 
-fn dirs_config_path() -> PathBuf {
+pub fn config_path() -> PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".config/cairn-code/config.json")
+}
+
+fn dirs_config_path() -> PathBuf {
+    config_path()
+}
+
+pub fn save_config(provider: &str, model: &str, api_key: Option<&str>) -> Result<(), String> {
+    use crate::json::JsonValue;
+    let path = config_path();
+    let mut obj: std::collections::HashMap<String, JsonValue> = if path.exists() {
+        let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        crate::json::parse(&content).map_err(|e| e.to_string())?.as_object().cloned().unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    obj.insert("default_provider".into(), JsonValue::String(provider.into()));
+    obj.insert("default_model".into(), JsonValue::String(model.into()));
+
+    if let Some(key) = api_key {
+        let mut keys = obj.get("api_keys").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        keys.insert("openrouter".into(), JsonValue::String(key.into()));
+        obj.insert("api_keys".into(), JsonValue::Object(keys));
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let output = crate::json::serialize(&JsonValue::Object(obj));
+    std::fs::write(&path, &output).map_err(|e| e.to_string())
+}
+
+pub fn config_has_api_key(provider: &str) -> bool {
+    let path = config_path();
+    if !path.exists() { return false; }
+    let content = std::fs::read_to_string(&path).ok()?;
+    let val = crate::json::parse(&content).ok()?;
+    let obj = val.as_object()?;
+    let keys = obj.get("api_keys")?.as_object()?;
+    keys.get(provider).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).is_some()
 }
 
 fn parse_config(content: &str) -> Result<Config, String> {

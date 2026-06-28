@@ -11,19 +11,16 @@ pub struct HttpResponse {
     pub body: String,
 }
 
-fn build_curl_args(req: &HttpRequest, include_status: bool) -> Vec<String> {
+fn build_curl_args(req: &HttpRequest) -> Vec<String> {
     let mut args = vec!["-sS".to_string()];
+    args.push("-w".to_string());
+    args.push("\n%{http_code}\n".to_string());
 
     if let Some(body) = &req.body {
         args.push("-X".to_string());
         args.push("POST".to_string());
         args.push("-d".to_string());
         args.push(body.clone());
-    }
-
-    if include_status {
-        args.push("-w".to_string());
-        args.push("\n%{http_code}\n".to_string());
     }
 
     for (name, value) in &req.headers {
@@ -35,9 +32,11 @@ fn build_curl_args(req: &HttpRequest, include_status: bool) -> Vec<String> {
     args
 }
 
-fn run_curl(args: &[String]) -> Result<(u16, String), String> {
+pub fn request(req: &HttpRequest) -> Result<HttpResponse, String> {
+    let args = build_curl_args(req);
+
     let child = Command::new("curl")
-        .args(args)
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -53,7 +52,6 @@ fn run_curl(args: &[String]) -> Result<(u16, String), String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let trimmed = stdout.trim_end();
 
-    // Parse status code from last line (added by -w "\n%{http_code}\n")
     let (body, status) = if let Some(last_nl) = trimmed.rfind('\n') {
         let code_str = trimmed[last_nl + 1..].trim();
         let st = code_str.parse::<u16>().unwrap_or(200);
@@ -62,12 +60,10 @@ fn run_curl(args: &[String]) -> Result<(u16, String), String> {
         (trimmed.to_string(), 200)
     };
 
-    Ok((status, body))
-}
+    if status < 100 || status >= 300 {
+        return Err(format!("HTTP {status}: {body}"));
+    }
 
-pub fn request(req: &HttpRequest) -> Result<HttpResponse, String> {
-    let args = build_curl_args(req, true);
-    let (_status, body) = run_curl(&args)?;
     Ok(HttpResponse { body })
 }
 
@@ -75,7 +71,7 @@ pub fn request_streaming<F>(req: &HttpRequest, mut on_line: F) -> Result<(), Str
 where
     F: FnMut(&str),
 {
-    let args = build_curl_args(req, false);
+    let args = build_curl_args(req);
 
     let mut child = Command::new("curl")
         .args(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
@@ -87,16 +83,33 @@ where
     let stdout = child.stdout.take().ok_or("no stdout from curl")?;
     let reader = BufReader::new(stdout);
 
+    let mut prev_line = String::new();
+    let mut http_status: Option<u16> = None;
+    let mut http_body = String::new();
+
     for line in reader.lines() {
         match line {
-            Ok(l) => on_line(&l),
+            Ok(l) => {
+                if !prev_line.is_empty() {
+                    on_line(&prev_line);
+                    http_body.push_str(&prev_line);
+                    http_body.push('\n');
+                }
+                prev_line = l;
+            }
             Err(e) => return Err(format!("read error: {e}")),
         }
     }
 
-    let status = child.wait().map_err(|e| format!("wait failed: {e}"))?;
-    if !status.success() {
-        return Err(format!("curl exited with {status}"));
+    if !prev_line.is_empty() {
+        http_status = prev_line.trim().parse::<u16>().ok();
+    }
+
+    let _ = child.wait();
+
+    let status = http_status.unwrap_or(200);
+    if status < 100 || status >= 300 {
+        return Err(format!("HTTP {status}: {}", http_body.trim_end()));
     }
 
     Ok(())

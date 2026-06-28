@@ -46,6 +46,11 @@ pub struct Tui {
     picker_models: Vec<llm::ModelInfo>,
     picker_sel: usize,
     picker_scrl: usize,
+    show_provider_picker: bool,
+    provider_picker_list: Vec<String>,
+    provider_picker_sel: usize,
+    awaiting_api_key: bool,
+    pending_openrouter_setup: bool,
     agent_tx: Option<mpsc::Sender<String>>,
     cancel_flag: Option<Arc<AtomicBool>>,
 }
@@ -71,6 +76,11 @@ impl Tui {
             picker_models: Vec::new(),
             picker_sel: 0,
             picker_scrl: 0,
+            show_provider_picker: false,
+            provider_picker_list: Vec::new(),
+            provider_picker_sel: 0,
+            awaiting_api_key: false,
+            pending_openrouter_setup: false,
             agent_tx: None,
             cancel_flag: None,
         }
@@ -88,8 +98,9 @@ impl Tui {
         let mut terminal = ratatui::init();
         terminal.clear().map_err(|e| e.to_string())?;
 
-        let poll_ms = Duration::from_millis(100);
         let mut result = Ok(());
+        let mut last_spinner_update = std::time::Instant::now();
+        let mut needs_rebuild = false;
 
         'outer: loop {
             if matches!(self.state, State::Running) {
@@ -133,6 +144,9 @@ impl Tui {
                             break 'outer;
                         }
                     }
+                    Ok(ratatui::crossterm::event::Event::Resize(_, _)) => {
+                        needs_rebuild = true;
+                    }
                     Err(e) => {
                         result = Err(format!("Event error: {e}"));
                         break 'outer;
@@ -140,7 +154,8 @@ impl Tui {
                     _ => {}
                 }
             } else {
-                if let Ok(true) = ratatui::crossterm::event::poll(poll_ms) {
+                let event_avail = ratatui::crossterm::event::poll(Duration::from_millis(1)).unwrap_or(false);
+                if event_avail {
                     if let Ok(ratatui::crossterm::event::Event::Key(key)) = ratatui::crossterm::event::read() {
                         if key.kind == ratatui::crossterm::event::KeyEventKind::Press
                             && key.code == ratatui::crossterm::event::KeyCode::Char('c')
@@ -158,7 +173,15 @@ impl Tui {
                         }
                     }
                 }
-                self.spinner_idx += 1;
+                if last_spinner_update.elapsed() >= Duration::from_millis(80) {
+                    self.spinner_idx = self.spinner_idx.wrapping_add(1);
+                    last_spinner_update = std::time::Instant::now();
+                }
+            }
+
+            if needs_rebuild {
+                let _ = terminal.clear();
+                needs_rebuild = false;
             }
 
             if let Err(e) = terminal.draw(|f| self.render(f)) {
@@ -180,6 +203,10 @@ impl Tui {
 
         match key.code {
             KeyCode::Up => {
+                if self.show_provider_picker {
+                    if self.provider_picker_sel > 0 { self.provider_picker_sel -= 1; }
+                    return true;
+                }
                 if self.show_model_picker {
                     if self.picker_sel > 0 { self.picker_sel -= 1; }
                     return true;
@@ -192,6 +219,10 @@ impl Tui {
                 true
             }
             KeyCode::Down => {
+                if self.show_provider_picker {
+                    if self.provider_picker_sel + 1 < self.provider_picker_list.len() { self.provider_picker_sel += 1; }
+                    return true;
+                }
                 if self.show_model_picker {
                     if self.picker_sel + 1 < self.picker_models.len() {
                         self.picker_sel += 1;
@@ -219,19 +250,93 @@ impl Tui {
                 true
             }
             KeyCode::Esc => {
-                if self.show_model_picker { self.show_model_picker = false; }
+                if self.awaiting_api_key {
+                    self.awaiting_api_key = false;
+                    self.pending_openrouter_setup = false;
+                    self.input_buf.clear();
+                    self.cursor = 0;
+                } else if self.show_provider_picker { self.show_provider_picker = false; }
+                else if self.show_model_picker { self.show_model_picker = false; }
                 true
             }
             KeyCode::Enter => {
+                if self.show_provider_picker {
+                    if self.provider_picker_sel < self.provider_picker_list.len() {
+                        let name = self.provider_picker_list[self.provider_picker_sel].clone();
+                        let providers = crate::llm::default_providers();
+                        if let Some(p) = providers.get(&name) {
+                            let default_model = p.default_model().to_string();
+                            self.provider = name.clone();
+                            self.picker_models = p.available_models();
+                            if name == "openrouter" {
+                                self.model = "gpt-5-mini".to_string();
+                                self.show_provider_picker = false;
+                                self.show_model_picker = true;
+                                self.picker_sel = self.picker_models.iter().position(|m| m.id == "gpt-5-mini").unwrap_or(0);
+                                self.picker_scrl = 0;
+                                self.pending_openrouter_setup = true;
+                            } else {
+                                self.model = default_model;
+                                self.show_provider_picker = false;
+                                self.output_lines.push(OutputLine {
+                                    type_: "system".into(), content: format!("Provider set to: {}", self.provider),
+                                    tool_name: String::new(), duration: String::new(),
+                                });
+                                if let Some(tx) = &self.agent_tx {
+                                    let _ = tx.send(format!("__switch__:{name}:{}", self.model));
+                                }
+                            }
+                        } else { self.show_provider_picker = false; }
+                    } else { self.show_provider_picker = false; }
+                    return true;
+                }
                 if self.show_model_picker {
                     if self.picker_sel < self.picker_models.len() {
                         self.model = self.picker_models[self.picker_sel].id.clone();
                         self.show_model_picker = false;
-                        self.output_lines.push(OutputLine {
-                            type_: "system".into(), content: format!("Model set to: {}", self.model),
-                            tool_name: String::new(), duration: String::new(),
-                        });
+                        if self.pending_openrouter_setup {
+                            self.pending_openrouter_setup = false;
+                            if std::env::var("OPENROUTER_API_KEY").is_ok() || has_stored_openrouter_key() {
+                                self.output_lines.push(OutputLine {
+                                    type_: "system".into(), content: format!("Provider set to: {}\nModel set to: {}", self.provider, self.model),
+                                    tool_name: String::new(), duration: String::new(),
+                                });
+                                if let Some(tx) = &self.agent_tx {
+                                    let _ = tx.send(format!("__switch__:openrouter:{}", self.model));
+                                }
+                            } else {
+                                self.awaiting_api_key = true;
+                                self.input_buf.clear();
+                                self.cursor = 0;
+                                self.output_lines.push(OutputLine {
+                                    type_: "system".into(), content: "Enter your OpenRouter API key:".into(),
+                                    tool_name: String::new(), duration: String::new(),
+                                });
+                            }
+                        } else {
+                            self.output_lines.push(OutputLine {
+                                type_: "system".into(), content: format!("Model set to: {}", self.model),
+                                tool_name: String::new(), duration: String::new(),
+                            });
+                        }
                     } else { self.show_model_picker = false; }
+                    return true;
+                }
+
+                if self.awaiting_api_key {
+                    let key = self.input_buf.trim().to_string();
+                    self.input_buf.clear(); self.cursor = 0;
+                    if key.is_empty() { return true; }
+                    self.awaiting_api_key = false;
+                    std::env::set_var("OPENROUTER_API_KEY", &key);
+                    let _ = save_openrouter_key(&key);
+                    self.output_lines.push(OutputLine {
+                        type_: "system".into(), content: "OpenRouter API key set.".into(),
+                        tool_name: String::new(), duration: String::new(),
+                    });
+                    if let Some(tx) = &self.agent_tx {
+                        let _ = tx.send(format!("__switch__:openrouter:{}", self.model));
+                    }
                     return true;
                 }
 
@@ -267,7 +372,9 @@ impl Tui {
                 true
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.show_model_picker {
+                if self.show_provider_picker {
+                    self.show_provider_picker = false;
+                } else if self.show_model_picker {
                     self.show_model_picker = false;
                 } else if matches!(self.state, State::Running) {
                     if let Some(flag) = &self.cancel_flag {
@@ -285,7 +392,7 @@ impl Tui {
                 true
             }
             KeyCode::Char(ch) => {
-                if !self.show_model_picker {
+                if !self.show_model_picker && !self.show_provider_picker {
                     self.input_buf.insert(self.cursor, ch);
                     self.cursor += ch.len_utf8();
                 }
@@ -331,10 +438,12 @@ impl Tui {
                 });
             }
             "/provider" => {
-                self.output_lines.push(OutputLine {
-                    type_: "system".into(), content: format!("Provider: {}", self.provider),
-                    tool_name: String::new(), duration: String::new(),
-                });
+                let providers = crate::llm::default_providers();
+                let mut names: Vec<String> = providers.into_keys().collect();
+                names.sort();
+                self.provider_picker_list = names;
+                self.provider_picker_sel = self.provider_picker_list.iter().position(|n| n == &self.provider).unwrap_or(0);
+                self.show_provider_picker = true;
             }
             "/help" => {
                 self.output_lines.push(OutputLine {
@@ -451,8 +560,31 @@ impl Tui {
             ]));
         }
 
-        // Prompt or model picker
-        if self.show_model_picker {
+        // Prompt or pickers
+        if self.show_provider_picker {
+            let bg_orange = Style::new().bg(Color::Indexed(215)).fg(Color::Indexed(230));
+            let mut names: Vec<String> = self.provider_picker_list.clone();
+            let current = self.provider.clone();
+            names.sort_by(|a, b| {
+                let ac = if *a == current { 0 } else { 1 };
+                let bc = if *b == current { 0 } else { 1 };
+                ac.cmp(&bc)
+            });
+
+            lines.push(Line::from(vec![
+                Span::styled("── Provider ", orange_fg.add_modifier(Modifier::BOLD)),
+                Span::styled("(↑↓ navigate  Enter select  Esc cancel) ──", bold_dim),
+            ]));
+            for (i, name) in names.iter().enumerate() {
+                let is_sel = i == self.provider_picker_sel;
+                let is_cur = *name == current;
+                let check = if is_cur { "  ✓" } else { "" };
+                let prefix = if is_sel { "▸ " } else { "  " };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{prefix}{}{check}", name), if is_sel { bg_orange } else { dim }),
+                ]));
+            }
+        } else if self.show_model_picker {
             let visible = self.picker_visible_height();
             let end = (self.picker_scrl + visible).min(self.picker_models.len());
             let num = self.picker_models.len();
@@ -477,6 +609,16 @@ impl Tui {
                     Span::styled(format!("{prefix}{}  {}{ctx}{check}", m.name, m.id), if is_sel { bg_orange } else { dim }),
                 ]));
             }
+        } else if self.awaiting_api_key {
+            let cursor = self.cursor.min(self.input_buf.len());
+            let nchars = self.input_buf[..cursor].chars().count();
+            let ntotal = self.input_buf.chars().count();
+            let masked: Vec<char> = (0..ntotal).map(|_| '•').collect();
+            let before: String = masked.iter().take(nchars).collect();
+            let after: String = masked.iter().skip(nchars).collect();
+            lines.push(Line::from(vec![
+                Span::styled(format!("OpenRouter API key: {before}▋{after}"), orange_fg),
+            ]));
         } else {
             let cursor = self.cursor.min(self.input_buf.len());
             let (before, after) = self.input_buf.split_at(cursor);
@@ -521,4 +663,30 @@ impl Tui {
 
 fn terminal_height() -> Option<usize> {
     std::env::var("LINES").ok().and_then(|v| v.parse().ok()).or(Some(24))
+}
+
+fn keys_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(home).join(".config/cairn-code")
+}
+
+fn has_stored_openrouter_key() -> bool {
+    keys_dir().join("openrouter_key").exists()
+}
+
+fn save_openrouter_key(key: &str) -> Result<(), String> {
+    let dir = keys_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("openrouter_key"), key).map_err(|e| e.to_string())
+}
+
+pub fn load_openrouter_key() -> Option<String> {
+    let path = keys_dir().join("openrouter_key");
+    if path.exists() {
+        std::fs::read_to_string(&path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    } else {
+        None
+    }
 }

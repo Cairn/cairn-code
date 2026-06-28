@@ -75,6 +75,12 @@ fn main() {
                 Ok(cmd) if cmd == "cancel" => {
                     cancel2.store(true, Ordering::Relaxed);
                 }
+                Ok(cmd) if cmd.starts_with("__switch__:") => {
+                    let rest = cmd.trim_start_matches("__switch__:");
+                    if let Some((prov, modl)) = rest.split_once(':') {
+                        let _ = agent.switch_provider(prov, modl);
+                    }
+                }
                 Ok(prompt) => {
                     cancel2.store(false, Ordering::Relaxed);
                     let _ = agent.run(&prompt, event_tx.clone(), &cancel2);
@@ -83,6 +89,12 @@ fn main() {
             }
         }
     });
+
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        if let Some(key) = tui::load_openrouter_key() {
+            std::env::set_var("OPENROUTER_API_KEY", key);
+        }
+    }
 
     let mut tui = tui::Tui::new(version, &p_model_for_print, &provider_name_str, &work_dir);
     tui.set_agent_tx(cmd_tx.clone());
