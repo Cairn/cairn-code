@@ -51,8 +51,13 @@ pub struct Tui {
     provider_picker_sel: usize,
     awaiting_api_key: bool,
     pending_openrouter_setup: bool,
+    show_command_picker: bool,
+    cmd_picker_list: Vec<String>,
+    cmd_picker_filtered: Vec<String>,
+    cmd_picker_sel: usize,
     agent_tx: Option<mpsc::Sender<String>>,
     cancel_flag: Option<Arc<AtomicBool>>,
+    cancel_pressed_at: Option<std::time::Instant>,
 }
 
 impl Tui {
@@ -81,8 +86,13 @@ impl Tui {
             provider_picker_sel: 0,
             awaiting_api_key: false,
             pending_openrouter_setup: false,
+            show_command_picker: false,
+            cmd_picker_list: vec!["/clear".into(), "/cost".into(), "/exit".into(), "/help".into(), "/model".into(), "/provider".into(), "/quit".into(), "/q".into()],
+            cmd_picker_filtered: Vec::new(),
+            cmd_picker_sel: 0,
             agent_tx: None,
             cancel_flag: None,
+            cancel_pressed_at: None,
         }
     }
 
@@ -166,8 +176,9 @@ impl Tui {
                             }
                             self.state = State::Idle;
                             self.flush_streaming();
+                            self.cancel_pressed_at = Some(std::time::Instant::now());
                             self.output_lines.push(OutputLine {
-                                type_: "system".into(), content: "Cancelled.".into(),
+                                type_: "system".into(), content: "Cancelled. Press Ctrl+C again or type /exit to quit.".into(),
                                 tool_name: String::new(), duration: String::new(),
                             });
                         }
@@ -203,6 +214,10 @@ impl Tui {
 
         match key.code {
             KeyCode::Up => {
+                if self.show_command_picker {
+                    if self.cmd_picker_sel > 0 { self.cmd_picker_sel -= 1; }
+                    return true;
+                }
                 if self.show_provider_picker {
                     if self.provider_picker_sel > 0 { self.provider_picker_sel -= 1; }
                     return true;
@@ -219,6 +234,10 @@ impl Tui {
                 true
             }
             KeyCode::Down => {
+                if self.show_command_picker {
+                    if self.cmd_picker_sel + 1 < self.cmd_picker_filtered.len() { self.cmd_picker_sel += 1; }
+                    return true;
+                }
                 if self.show_provider_picker {
                     if self.provider_picker_sel + 1 < self.provider_picker_list.len() { self.provider_picker_sel += 1; }
                     return true;
@@ -249,17 +268,37 @@ impl Tui {
                 if self.cursor < self.input_buf.len() { self.cursor += 1; }
                 true
             }
+            KeyCode::Tab => {
+                if self.show_command_picker && !self.cmd_picker_filtered.is_empty() {
+                    let cmd = &self.cmd_picker_filtered[self.cmd_picker_sel];
+                    self.input_buf = cmd.clone();
+                    self.cursor = cmd.len();
+                    self.show_command_picker = false;
+                    self.cmd_picker_filtered.clear();
+                }
+                true
+            }
             KeyCode::Esc => {
                 if self.awaiting_api_key {
                     self.awaiting_api_key = false;
                     self.pending_openrouter_setup = false;
                     self.input_buf.clear();
                     self.cursor = 0;
-                } else if self.show_provider_picker { self.show_provider_picker = false; }
+                } else if self.show_command_picker { self.show_command_picker = false; }
+                else if self.show_provider_picker { self.show_provider_picker = false; }
                 else if self.show_model_picker { self.show_model_picker = false; }
                 true
             }
             KeyCode::Enter => {
+                if self.show_command_picker && !self.cmd_picker_filtered.is_empty() {
+                    let cmd = self.cmd_picker_filtered[self.cmd_picker_sel].clone();
+                    self.show_command_picker = false;
+                    self.cmd_picker_filtered.clear();
+                    self.input_buf.clear();
+                    self.cursor = 0;
+                    self.handle_command(&cmd);
+                    return true;
+                }
                 if self.show_provider_picker {
                     if self.provider_picker_sel < self.provider_picker_list.len() {
                         let name = self.provider_picker_list[self.provider_picker_sel].clone();
@@ -278,13 +317,14 @@ impl Tui {
                             } else {
                                 self.model = default_model;
                                 self.show_provider_picker = false;
-                                self.output_lines.push(OutputLine {
-                                    type_: "system".into(), content: format!("Provider set to: {}", self.provider),
-                                    tool_name: String::new(), duration: String::new(),
-                                });
-                                if let Some(tx) = &self.agent_tx {
-                                    let _ = tx.send(format!("__switch__:{name}:{}", self.model));
-                                }
+                        let _ = crate::config::save_config(&self.provider, &self.model, None);
+                        self.output_lines.push(OutputLine {
+                            type_: "system".into(), content: format!("Provider set to: {}", self.provider),
+                            tool_name: String::new(), duration: String::new(),
+                        });
+                        if let Some(tx) = &self.agent_tx {
+                            let _ = tx.send(format!("__switch__:{name}:{}", self.model));
+                        }
                             }
                         } else { self.show_provider_picker = false; }
                     } else { self.show_provider_picker = false; }
@@ -296,7 +336,8 @@ impl Tui {
                         self.show_model_picker = false;
                         if self.pending_openrouter_setup {
                             self.pending_openrouter_setup = false;
-                            if std::env::var("OPENROUTER_API_KEY").is_ok() || has_stored_openrouter_key() {
+                            if std::env::var("OPENROUTER_API_KEY").is_ok() || crate::config::config_has_api_key("openrouter") {
+                                let _ = crate::config::save_config(&self.provider, &self.model, None);
                                 self.output_lines.push(OutputLine {
                                     type_: "system".into(), content: format!("Provider set to: {}\nModel set to: {}", self.provider, self.model),
                                     tool_name: String::new(), duration: String::new(),
@@ -314,6 +355,7 @@ impl Tui {
                                 });
                             }
                         } else {
+                            let _ = crate::config::save_config(&self.provider, &self.model, None);
                             self.output_lines.push(OutputLine {
                                 type_: "system".into(), content: format!("Model set to: {}", self.model),
                                 tool_name: String::new(), duration: String::new(),
@@ -329,7 +371,7 @@ impl Tui {
                     if key.is_empty() { return true; }
                     self.awaiting_api_key = false;
                     std::env::set_var("OPENROUTER_API_KEY", &key);
-                    let _ = save_openrouter_key(&key);
+                    let _ = crate::config::save_config(&self.provider, &self.model, Some(&key));
                     self.output_lines.push(OutputLine {
                         type_: "system".into(), content: "OpenRouter API key set.".into(),
                         tool_name: String::new(), duration: String::new(),
@@ -359,9 +401,10 @@ impl Tui {
                 true
             }
             KeyCode::Backspace => {
-                if self.cursor > 0 && !self.show_model_picker {
+                if self.cursor > 0 && !self.show_model_picker && !self.show_provider_picker {
                     self.input_buf.remove(self.cursor - 1);
                     self.cursor -= 1;
+                    self.update_cmd_picker();
                 }
                 true
             }
@@ -372,7 +415,9 @@ impl Tui {
                 true
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.show_provider_picker {
+                if self.show_command_picker {
+                    self.show_command_picker = false;
+                } else if self.show_provider_picker {
                     self.show_provider_picker = false;
                 } else if self.show_model_picker {
                     self.show_model_picker = false;
@@ -382,19 +427,26 @@ impl Tui {
                     }
                     self.state = State::Idle;
                     self.flush_streaming();
+                    self.cancel_pressed_at = Some(std::time::Instant::now());
                     self.output_lines.push(OutputLine {
-                        type_: "system".into(), content: "Cancelled.".into(),
+                        type_: "system".into(), content: "Cancelled. Press Ctrl+C again or type /exit to quit.".into(),
                         tool_name: String::new(), duration: String::new(),
                     });
-                } else {
+                } else if self.cancel_pressed_at.map_or(false, |t| t.elapsed() < std::time::Duration::from_secs(2)) {
                     return false;
+                } else {
+                    self.output_lines.push(OutputLine {
+                        type_: "system".into(), content: "Press Ctrl+C again or type /exit to quit.".into(),
+                        tool_name: String::new(), duration: String::new(),
+                    });
                 }
                 true
             }
             KeyCode::Char(ch) => {
-                if !self.show_model_picker && !self.show_provider_picker {
+                if !self.show_model_picker && !self.show_provider_picker && !self.awaiting_api_key {
                     self.input_buf.insert(self.cursor, ch);
                     self.cursor += ch.len_utf8();
+                    self.update_cmd_picker();
                 }
                 true
             }
@@ -415,6 +467,7 @@ impl Tui {
             "/model" => {
                 if parts.len() > 1 {
                     self.model = parts[1..].join(" ");
+                    let _ = crate::config::save_config(&self.provider, &self.model, None);
                     self.output_lines.push(OutputLine {
                         type_: "system".into(), content: format!("Model set to: {}", self.model),
                         tool_name: String::new(), duration: String::new(),
@@ -561,7 +614,24 @@ impl Tui {
         }
 
         // Prompt or pickers
-        if self.show_provider_picker {
+        if self.show_command_picker {
+            let bg_orange = Style::new().bg(Color::Indexed(215)).fg(Color::Indexed(230));
+            let cursor = self.cursor.min(self.input_buf.len());
+            let (before, after) = self.input_buf.split_at(cursor);
+            lines.push(Line::from(vec![
+                Span::styled("❯ ", orange_fg),
+                Span::raw(before),
+                Span::styled("▋", orange_fg),
+                Span::raw(after),
+            ]));
+            for (i, cmd) in self.cmd_picker_filtered.iter().enumerate() {
+                let is_sel = i == self.cmd_picker_sel;
+                let prefix = if is_sel { "▸ " } else { "  " };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{prefix}{cmd}"), if is_sel { bg_orange } else { dim }),
+                ]));
+            }
+        } else if self.show_provider_picker {
             let bg_orange = Style::new().bg(Color::Indexed(215)).fg(Color::Indexed(230));
             let mut names: Vec<String> = self.provider_picker_list.clone();
             let current = self.provider.clone();
@@ -659,34 +729,27 @@ impl Tui {
     pub fn add_output_line(&mut self, line: OutputLine) {
         self.output_lines.push(line);
     }
+
+    fn update_cmd_picker(&mut self) {
+        if self.input_buf.starts_with('/') && !self.input_buf.is_empty() {
+            let filter = self.input_buf[1..].to_lowercase();
+            self.cmd_picker_filtered = self.cmd_picker_list.iter()
+                .filter(|c| c[1..].to_lowercase().starts_with(&filter))
+                .cloned()
+                .collect();
+            if self.cmd_picker_sel >= self.cmd_picker_filtered.len() {
+                self.cmd_picker_sel = self.cmd_picker_filtered.len().saturating_sub(1);
+            }
+            self.show_command_picker = !self.cmd_picker_filtered.is_empty();
+        } else {
+            self.show_command_picker = false;
+            self.cmd_picker_filtered.clear();
+        }
+    }
 }
 
 fn terminal_height() -> Option<usize> {
     std::env::var("LINES").ok().and_then(|v| v.parse().ok()).or(Some(24))
 }
 
-fn keys_dir() -> std::path::PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home).join(".config/cairn-code")
-}
 
-fn has_stored_openrouter_key() -> bool {
-    keys_dir().join("openrouter_key").exists()
-}
-
-fn save_openrouter_key(key: &str) -> Result<(), String> {
-    let dir = keys_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("openrouter_key"), key).map_err(|e| e.to_string())
-}
-
-pub fn load_openrouter_key() -> Option<String> {
-    let path = keys_dir().join("openrouter_key");
-    if path.exists() {
-        std::fs::read_to_string(&path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-    } else {
-        None
-    }
-}

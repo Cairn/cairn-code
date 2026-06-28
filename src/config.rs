@@ -104,14 +104,18 @@ pub fn save_config(provider: &str, model: &str, api_key: Option<&str>) -> Result
     std::fs::write(&path, &output).map_err(|e| e.to_string())
 }
 
-pub fn config_has_api_key(provider: &str) -> bool {
+pub fn config_get_api_key(provider: &str) -> Option<String> {
     let path = config_path();
-    if !path.exists() { return false; }
+    if !path.exists() { return None; }
     let content = std::fs::read_to_string(&path).ok()?;
     let val = crate::json::parse(&content).ok()?;
     let obj = val.as_object()?;
     let keys = obj.get("api_keys")?.as_object()?;
-    keys.get(provider).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).is_some()
+    keys.get(provider)?.as_str().map(|s| s.to_string()).filter(|s| !s.is_empty())
+}
+
+pub fn config_has_api_key(provider: &str) -> bool {
+    config_get_api_key(provider).is_some()
 }
 
 fn parse_config(content: &str) -> Result<Config, String> {

@@ -91,7 +91,7 @@ fn main() {
     });
 
     if std::env::var("OPENROUTER_API_KEY").is_err() {
-        if let Some(key) = tui::load_openrouter_key() {
+        if let Some(key) = config::config_get_api_key("openrouter") {
             std::env::set_var("OPENROUTER_API_KEY", key);
         }
     }
