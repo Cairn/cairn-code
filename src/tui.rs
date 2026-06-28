@@ -57,7 +57,6 @@ pub struct Tui {
     cmd_picker_sel: usize,
     agent_tx: Option<mpsc::Sender<String>>,
     cancel_flag: Option<Arc<AtomicBool>>,
-    cancel_pressed_at: Option<std::time::Instant>,
 }
 
 impl Tui {
@@ -92,7 +91,6 @@ impl Tui {
             cmd_picker_sel: 0,
             agent_tx: None,
             cancel_flag: None,
-            cancel_pressed_at: None,
         }
     }
 
@@ -168,17 +166,15 @@ impl Tui {
                 if event_avail {
                     if let Ok(ratatui::crossterm::event::Event::Key(key)) = ratatui::crossterm::event::read() {
                         if key.kind == ratatui::crossterm::event::KeyEventKind::Press
-                            && key.code == ratatui::crossterm::event::KeyCode::Char('c')
-                            && key.modifiers.contains(ratatui::crossterm::event::KeyModifiers::CONTROL)
+                            && key.code == ratatui::crossterm::event::KeyCode::Esc
                         {
                             if let Some(flag) = &self.cancel_flag {
                                 flag.store(true, Ordering::Relaxed);
                             }
                             self.state = State::Idle;
                             self.flush_streaming();
-                            self.cancel_pressed_at = Some(std::time::Instant::now());
                             self.output_lines.push(OutputLine {
-                                type_: "system".into(), content: "Cancelled. Press Ctrl+C again or type /exit to quit.".into(),
+                                type_: "system".into(), content: "Cancelled.".into(),
                                 tool_name: String::new(), duration: String::new(),
                             });
                         }
@@ -287,6 +283,17 @@ impl Tui {
                 } else if self.show_command_picker { self.show_command_picker = false; }
                 else if self.show_provider_picker { self.show_provider_picker = false; }
                 else if self.show_model_picker { self.show_model_picker = false; }
+                else if matches!(self.state, State::Running) {
+                    if let Some(flag) = &self.cancel_flag {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                    self.state = State::Idle;
+                    self.flush_streaming();
+                    self.output_lines.push(OutputLine {
+                        type_: "system".into(), content: "Cancelled.".into(),
+                        tool_name: String::new(), duration: String::new(),
+                    });
+                }
                 true
             }
             KeyCode::Enter => {
@@ -421,24 +428,9 @@ impl Tui {
                     self.show_provider_picker = false;
                 } else if self.show_model_picker {
                     self.show_model_picker = false;
-                } else if matches!(self.state, State::Running) {
-                    if let Some(flag) = &self.cancel_flag {
-                        flag.store(true, Ordering::Relaxed);
-                    }
-                    self.state = State::Idle;
-                    self.flush_streaming();
-                    self.cancel_pressed_at = Some(std::time::Instant::now());
-                    self.output_lines.push(OutputLine {
-                        type_: "system".into(), content: "Cancelled. Press Ctrl+C again or type /exit to quit.".into(),
-                        tool_name: String::new(), duration: String::new(),
-                    });
-                } else if self.cancel_pressed_at.map_or(false, |t| t.elapsed() < std::time::Duration::from_secs(2)) {
-                    return false;
                 } else {
-                    self.output_lines.push(OutputLine {
-                        type_: "system".into(), content: "Press Ctrl+C again or type /exit to quit.".into(),
-                        tool_name: String::new(), duration: String::new(),
-                    });
+                    self.input_buf.clear();
+                    self.cursor = 0;
                 }
                 true
             }
@@ -572,7 +564,11 @@ impl Tui {
                     lines.push(Line::from(vec![Span::styled("❯ ", orange), Span::raw(&line.content)]));
                     lines.push(Line::from(""));
                 }
-                "text" => lines.push(Line::from(Span::raw(&line.content))),
+                "text" => {
+                    for part in line.content.split('\n') {
+                        lines.push(Line::from(Span::raw(part)));
+                    }
+                }
                 "tool_use" => {
                     let inner = if line.content.len() > 80 { format!("\n  {}", line.content) } else { format!("({})", line.content) };
                     lines.push(Line::from(vec![
@@ -596,10 +592,14 @@ impl Tui {
         // Streaming
         if !self.stream_thinking.is_empty() {
             lines.push(Line::from(vec![Span::styled("── Thinking ──", bold_dim)]));
-            lines.push(Line::from(vec![Span::styled(&self.stream_thinking, dim)]));
+            for part in self.stream_thinking.split('\n') {
+                lines.push(Line::from(vec![Span::styled(part, dim)]));
+            }
         }
         if !self.streaming_text.is_empty() {
-            lines.push(Line::from(Span::raw(&self.streaming_text)));
+            for part in self.streaming_text.split('\n') {
+                lines.push(Line::from(Span::raw(part)));
+            }
         }
         if matches!(self.state, State::Running) && self.streaming_text.is_empty() {
             let spin = SPINNER_CHARS[self.spinner_idx % SPINNER_CHARS.len()];

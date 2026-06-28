@@ -189,7 +189,30 @@ impl Parser {
                     }
                     self.pos += 1;
                 }
-                _ => s.push(c as char),
+                _ if c & 0x80 == 0 => s.push(c as char),
+                _ => {
+                    let n = if c & 0xE0 == 0xC0 { 2 }
+                        else if c & 0xF0 == 0xE0 { 3 }
+                        else if c & 0xF8 == 0xF0 { 4 }
+                        else { return Err(self.err("invalid UTF-8 start byte")); };
+                    if self.pos + n > self.input.len() + 1 {
+                        return Err(self.err("truncated UTF-8 sequence"));
+                    }
+                    let mut code = (c & (0x7F >> n)) as u32;
+                    for _ in 1..n {
+                        let b = self.input[self.pos];
+                        if b & 0xC0 != 0x80 {
+                            return Err(self.err("invalid continuation byte"));
+                        }
+                        code = (code << 6) | (b & 0x3F) as u32;
+                        self.pos += 1;
+                    }
+                    if let Some(ch) = char::from_u32(code) {
+                        s.push(ch);
+                    } else {
+                        return Err(self.err("invalid Unicode code point"));
+                    }
+                }
             }
         }
     }
