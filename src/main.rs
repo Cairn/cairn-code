@@ -1,0 +1,153 @@
+mod json;
+mod http_client;
+mod config;
+mod cost;
+mod session;
+mod llm;
+mod agent;
+mod tools;
+mod tui;
+
+use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+
+use agent::Agent;
+use agent::AgentEvent;
+use config::Config;
+use llm::provider;
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let version = "0.1.0";
+    let mut is_print_mode = false;
+    let mut initial_prompt: Option<String> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-p" | "--print" => is_print_mode = true,
+            arg if !arg.starts_with('-') => {
+                initial_prompt = Some(arg.to_string());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let cfg = Config::load();
+    let provider_name = std::env::var("CAIRN_PROVIDER").unwrap_or(cfg.default_provider.clone());
+    let model_name = std::env::var("CAIRN_MODEL").unwrap_or(cfg.default_model.clone());
+
+    let mut providers = provider::default_providers();
+    let (p_name, p_model) = if let Some(p) = providers.get(&provider_name) {
+        let model = if model_name.is_empty() { p.default_model().to_string() } else { model_name };
+        (provider_name, model)
+    } else {
+        ("opencode".to_string(), "deepseek-v4-flash-free".to_string())
+    };
+
+    let chosen_provider = providers.remove(&p_name).unwrap_or_else(|| {
+        provider::default_providers().into_values().next().unwrap()
+    });
+
+    let models = chosen_provider.available_models();
+    let provider_name_str = chosen_provider.name().to_string();
+
+    let tool_registry = tools::registry::default_registry();
+    let work_dir = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    let (event_tx, event_rx) = mpsc::channel::<AgentEvent>();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel2 = cancel.clone();
+
+    let p_model_for_agent = p_model.clone();
+    let p_model_for_print = p_model.clone();
+
+    thread::spawn(move || {
+        let mut agent = Agent::new(chosen_provider, p_model_for_agent, tool_registry, cfg);
+        loop {
+            match cmd_rx.recv() {
+                Ok(cmd) if cmd == "cancel" => {
+                    cancel2.store(true, Ordering::Relaxed);
+                }
+                Ok(prompt) => {
+                    cancel2.store(false, Ordering::Relaxed);
+                    let _ = agent.run(&prompt, event_tx.clone(), &cancel2);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut tui = tui::Tui::new(version, &p_model_for_print, &provider_name_str, &work_dir);
+    tui.set_agent_tx(cmd_tx.clone());
+    tui.set_cancel_flag(cancel);
+    tui.set_picker_models(models);
+
+    if is_print_mode {
+        if let Some(prompt) = initial_prompt {
+            // Simple non-streaming mode
+            drop(event_rx);
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                // Recreate for print mode — simplified
+                let mut providers = provider::default_providers();
+                let provider = providers.remove(&p_name).unwrap_or_else(|| {
+                    provider::default_providers().into_values().next().unwrap()
+                });
+                let registry = tools::registry::default_registry();
+                let cfg = Config::load();
+                let pm = p_model_for_print.clone();
+                let mut agent = Agent::new(provider, pm, registry, cfg);
+                let _ = tx.send(agent.run_simple(&prompt));
+            });
+            if let Ok(result) = rx.recv() {
+                match result {
+                    Ok(output) => println!("{output}"),
+                    Err(e) => eprintln!("Error: {e}"),
+                }
+            }
+        } else {
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_ok() {
+                let input = input.trim().to_string();
+                let (tx, rx) = mpsc::channel();
+                thread::spawn(move || {
+                    let mut providers = provider::default_providers();
+                    let provider = providers.remove(&p_name).unwrap_or_else(|| {
+                        provider::default_providers().into_values().next().unwrap()
+                    });
+                    let registry = tools::registry::default_registry();
+                    let cfg = Config::load();
+                    let pm = p_model_for_print.clone();
+                    let mut agent = Agent::new(provider, pm, registry, cfg);
+                    let _ = tx.send(agent.run_simple(&input));
+                });
+                if let Ok(result) = rx.recv() {
+                    match result {
+                        Ok(output) => println!("{output}"),
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if let Some(prompt) = initial_prompt {
+        tui.add_output_line(tui::OutputLine {
+            type_: "user".into(),
+            content: prompt.clone(),
+            tool_name: String::new(),
+            duration: String::new(),
+        });
+        let _ = cmd_tx.send(prompt);
+    }
+
+    let _ = tui.run(event_rx);
+}
