@@ -54,6 +54,7 @@ type replModel struct {
         spinner    int
         currentVerb string // picked once per turn, stays fixed (Claude Code style)
         streamingText string // text accumulating during streaming (rendered raw, no glamour yet)
+        streamThinking string // thinking accumulating during streaming
         streamChunkCh  chan string          // channel for receiving streaming chunks and tool events from agent goroutine
         streamResultCh chan agentCompleteMsg // receives final agent result when goroutine finishes
         agentCancel   context.CancelFunc    // cancels the agent goroutine context
@@ -127,6 +128,10 @@ var (
 
         successStyle = lipgloss.NewStyle().
                         Foreground(lipgloss.Color("78")) // green ●
+
+        thinkingStyle = lipgloss.NewStyle().
+                        Foreground(lipgloss.Color("243")).
+                        Italic(true)
 
         // Spinner: smooth braille wave pattern
         spinnerChars = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -713,6 +718,7 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                                         m.totalUsage.CacheRead += result.usage.CacheRead
                                                         m.totalUsage.CacheCreate += result.usage.CacheCreate
                                                         m.streamingText = ""
+                                                        m.streamThinking = ""
                                                         if result.err != nil {
                                                                 m.err = result.err
                                                         }
@@ -734,8 +740,14 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                                                                 })
                                                         }
                                                         m.streamingText = ""
+                                                        m.streamThinking = ""
                                                         m.output = append(m.output, line)
                                                 }
+                                                continue
+                                        }
+                                        // Handle thinking chunks
+                                        if strings.HasPrefix(chunk, "\x00THINKING\x00") {
+                                                m.streamThinking += strings.TrimPrefix(chunk, "\x00THINKING\x00")
                                                 continue
                                         }
                                         m.streamingText += chunk
@@ -805,6 +817,10 @@ func (m replModel) View() string {
         }
 
         // Streaming text (rendered live as it arrives)
+        if m.streamThinking != "" {
+                content.WriteString(thinkingStyle.Render(m.streamThinking))
+                content.WriteString("\n")
+        }
         if m.streamingText != "" {
                 // Split into complete lines + partial last line
                 // Render all complete lines as a single markdown block through glamour,
@@ -1632,6 +1648,12 @@ func (m *replModel) runAgent(input string) tea.Cmd {
                                 OnStreamChunk: func(chunk string) {
                                         select {
                                         case chunkCh <- chunk:
+                                        default:
+                                        }
+                                },
+                                OnThinking: func(text string) {
+                                        select {
+                                        case chunkCh <- "\x00THINKING\x00" + text:
                                         default:
                                         }
                                 },

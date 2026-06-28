@@ -371,7 +371,7 @@ func streamOpenAIFormat(ctx context.Context, url, apiKey, orgID string, messages
                 if choice.Delta.Content != "" {
                         accumulatedText += choice.Delta.Content
                         if cb != nil {
-                                cb(choice.Delta.Content, false)
+                                cb(choice.Delta.Content, "text", false)
                         }
                 }
 
@@ -398,7 +398,7 @@ func streamOpenAIFormat(ctx context.Context, url, apiKey, orgID string, messages
 
         // Signal done
         if cb != nil {
-                cb("", true)
+                cb("", "text", true)
         }
 
         // Assemble tool calls with accumulated arguments

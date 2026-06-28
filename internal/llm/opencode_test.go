@@ -672,7 +672,7 @@ func TestOpenCodeStreamMessage_Callbacks(t *testing.T) {
 	p := newTestProvider(server)
 	ctx := context.Background()
 
-	cb := func(chunk string, done bool) {
+	cb := func(chunk string, chunkType string, done bool) {
 		mu.Lock()
 		defer mu.Unlock()
 		if done {
@@ -742,7 +742,7 @@ func TestOpenCodeStreamMessage_ToolUseStreaming(t *testing.T) {
 	result, err := p.StreamMessage(ctx,
 		[]Message{{Role: RoleUser, Content: "list files"}},
 		nil, "", "big-pickle",
-		func(s string, done bool) {})
+		func(s string, chunkType string, done bool) {})
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -796,7 +796,7 @@ func TestOpenCodeStreamMessage_ContextCancellation(t *testing.T) {
 	_, err := p.StreamMessage(ctx,
 		[]Message{{Role: RoleUser, Content: "test"}},
 		nil, "", "big-pickle",
-		func(s string, done bool) {})
+		func(s string, chunkType string, done bool) {})
 
 	if err == nil {
 		t.Error("expected error from cancelled context, got nil")
@@ -827,7 +827,7 @@ func TestOpenCodeStreamMessage_MalformedChunksSkipped(t *testing.T) {
 	result, err := p.StreamMessage(ctx,
 		[]Message{{Role: RoleUser, Content: "test"}},
 		nil, "", "big-pickle",
-		func(s string, done bool) {})
+		func(s string, chunkType string, done bool) {})
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -862,7 +862,7 @@ func TestOpenCodeStreamMessage_NoAuthHeaders(t *testing.T) {
 	_, err := p.StreamMessage(ctx,
 		[]Message{{Role: RoleUser, Content: "test"}},
 		nil, "", "big-pickle",
-		func(s string, done bool) {})
+		func(s string, chunkType string, done bool) {})
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -883,7 +883,7 @@ func TestOpenCodeStreamMessage_ErrorStatus(t *testing.T) {
 	_, err := p.StreamMessage(ctx,
 		[]Message{{Role: RoleUser, Content: "test"}},
 		nil, "", "big-pickle",
-		func(s string, done bool) {})
+		func(s string, chunkType string, done bool) {})
 
 	if err == nil {
 		t.Fatal("expected error for 500 status, got nil")

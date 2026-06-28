@@ -77,13 +77,15 @@ type anthropicResponse struct {
 }
 
 type anthropicContent struct {
-        Type    string         `json:"type"`
-        Text    string         `json:"text,omitempty"`
-        ID      string         `json:"id,omitempty"`
-        Name    string         `json:"name,omitempty"`
-        Input   json.RawMessage `json:"input,omitempty"`
-        Content string         `json:"content,omitempty"`
-        IsError bool           `json:"is_error,omitempty"`
+        Type      string         `json:"type"`
+        Text      string         `json:"text,omitempty"`
+        ID        string         `json:"id,omitempty"`
+        Name      string         `json:"name,omitempty"`
+        Input     json.RawMessage `json:"input,omitempty"`
+        Content   string         `json:"content,omitempty"`
+        IsError   bool           `json:"is_error,omitempty"`
+        Thinking  string         `json:"thinking,omitempty"`
+        Signature string         `json:"signature,omitempty"`
 }
 
 type anthropicUsage struct {
@@ -101,6 +103,12 @@ type anthropicStreamRequest struct {
         Messages  []anthropicMessage  `json:"messages"`
         Tools     []anthropicTool     `json:"tools,omitempty"`
         Stream    bool                `json:"stream,omitempty"`
+        Thinking  *anthropicThinking  `json:"thinking,omitempty"`
+}
+
+type anthropicThinking struct {
+        Type         string `json:"type"`
+        BudgetTokens int    `json:"budget_tokens"`
 }
 
 // anthropicStreamEvent represents a single SSE event from Anthropic's streaming API.
@@ -114,10 +122,12 @@ type anthropicStreamEvent struct {
 
 // anthropicStreamDelta represents the delta in a streaming event.
 type anthropicStreamDelta struct {
-        Type       string `json:"type"`                  // "text_delta", "input_json_delta"
-        Text       string `json:"text,omitempty"`        // for text_delta
+        Type        string `json:"type"`                  // "text_delta", "input_json_delta", "thinking_delta", "signature_delta"
+        Text        string `json:"text,omitempty"`        // for text_delta
         PartialJSON string `json:"partial_json,omitempty"` // for input_json_delta
-        StopReason string `json:"stop_reason,omitempty"`  // for message_delta
+        Thinking    string `json:"thinking,omitempty"`    // for thinking_delta
+        Signature   string `json:"signature,omitempty"`   // for signature_delta
+        StopReason  string `json:"stop_reason,omitempty"`  // for message_delta
 }
 
 // anthropicStreamUsage represents partial usage in streaming events.
@@ -159,6 +169,14 @@ func (p *AnthropicProvider) StreamMessage(ctx context.Context, messages []Messag
                 System:    system,
                 Messages:  anthMessages,
                 Stream:    cb != nil,
+        }
+
+        // Enable extended thinking for Claude 3.7 Sonnet
+        if model == "claude-3-7-sonnet-20250219" || model == "claude-3-7-sonnet" {
+                reqBody.Thinking = &anthropicThinking{
+                        Type:         "enabled",
+                        BudgetTokens: 2048,
+                }
         }
 
         // Convert tools
@@ -221,6 +239,8 @@ func (p *AnthropicProvider) StreamMessage(ctx context.Context, messages []Messag
 // parseAnthropicStream reads Anthropic's SSE stream and fires the callback per chunk.
 func (p *AnthropicProvider) parseAnthropicStream(body io.Reader, cb StreamingCallback) (*Response, error) {
         var accumulatedText string
+        var accumulatedThinking strings.Builder
+        var accumulatedSignature strings.Builder
         var contentBlocks []anthropicContent
         var currentBlock *anthropicContent
         var toolCallArgs map[int]*strings.Builder
@@ -261,6 +281,10 @@ func (p *AnthropicProvider) parseAnthropicStream(body io.Reader, cb StreamingCal
                                 if block.Type == "tool_use" {
                                         toolCallArgs[len(contentBlocks)-1] = &strings.Builder{}
                                 }
+                                if block.Type == "thinking" {
+                                        accumulatedThinking.Reset()
+                                        accumulatedSignature.Reset()
+                                }
                         }
 
                 case "content_block_delta":
@@ -269,7 +293,16 @@ func (p *AnthropicProvider) parseAnthropicStream(body io.Reader, cb StreamingCal
                                 case "text_delta":
                                         if event.Delta.Text != "" {
                                                 accumulatedText += event.Delta.Text
-                                                cb(event.Delta.Text, false)
+                                                cb(event.Delta.Text, "text", false)
+                                        }
+                                case "thinking_delta":
+                                        if event.Delta.Thinking != "" {
+                                                accumulatedThinking.WriteString(event.Delta.Thinking)
+                                                cb(event.Delta.Thinking, "thinking", false)
+                                        }
+                                case "signature_delta":
+                                        if event.Delta.Signature != "" {
+                                                accumulatedSignature.WriteString(event.Delta.Signature)
                                         }
                                 case "input_json_delta":
                                         if currentBlock != nil && event.Delta.PartialJSON != "" {
@@ -282,11 +315,15 @@ func (p *AnthropicProvider) parseAnthropicStream(body io.Reader, cb StreamingCal
                         }
 
                 case "content_block_stop":
-                        // Finalize tool_use arguments
-                        if currentBlock != nil && currentBlock.Type == "tool_use" {
-                                idx := len(contentBlocks) - 1
-                                if builder, ok := toolCallArgs[idx]; ok {
-                                        currentBlock.Input = json.RawMessage(builder.String())
+                        if currentBlock != nil {
+                                if currentBlock.Type == "tool_use" {
+                                        idx := len(contentBlocks) - 1
+                                        if builder, ok := toolCallArgs[idx]; ok {
+                                                currentBlock.Input = json.RawMessage(builder.String())
+                                        }
+                                } else if currentBlock.Type == "thinking" {
+                                        currentBlock.Thinking = accumulatedThinking.String()
+                                        currentBlock.Signature = accumulatedSignature.String()
                                 }
                         }
                         currentBlock = nil
@@ -300,24 +337,26 @@ func (p *AnthropicProvider) parseAnthropicStream(body io.Reader, cb StreamingCal
                         }
 
                 case "message_stop":
-                        cb("", true)
+                        cb("", "text", true)
                 }
         }
 
         // Safety net: if stream ended without message_stop, still signal done
         if cb != nil {
-                cb("", true)
+                cb("", "text", true)
         }
 
         // Build content blocks from accumulated stream data
         blocks := make([]ContentBlock, 0, len(contentBlocks))
         for _, c := range contentBlocks {
                 block := ContentBlock{
-                        Type:    c.Type,
-                        Text:    c.Text,
-                        ID:      c.ID,
-                        Name:    c.Name,
-                        IsError: c.IsError,
+                        Type:      c.Type,
+                        Text:      c.Text,
+                        ID:        c.ID,
+                        Name:      c.Name,
+                        IsError:   c.IsError,
+                        Thinking:  c.Thinking,
+                        Signature: c.Signature,
                 }
                 if c.Input != nil {
                         var input any
@@ -349,12 +388,14 @@ func convertContentToAnthropic(content any) any {
                 blocks := make([]anthropicContent, 0, len(c))
                 for _, b := range c {
                         ab := anthropicContent{
-                                Type:    b.Type,
-                                Text:    b.Text,
-                                ID:      b.ID,
-                                Name:    b.Name,
-                                Content: b.Content,
-                                IsError: b.IsError,
+                                Type:      b.Type,
+                                Text:      b.Text,
+                                ID:        b.ID,
+                                Name:      b.Name,
+                                Content:   b.Content,
+                                IsError:   b.IsError,
+                                Thinking:  b.Thinking,
+                                Signature: b.Signature,
                         }
                         if b.Input != nil {
                                 inputJSON, _ := json.Marshal(b.Input)

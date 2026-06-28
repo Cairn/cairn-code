@@ -288,9 +288,9 @@ func TestStreamingProviderFiresCallbacks(t *testing.T) {
                         // Simulate streaming tokens
                         chunks := []string{"Hello", " ", "world", "!"}
                         for _, c := range chunks {
-                                cb(c, false)
+                                cb(c, "text", false)
                         }
-                        cb("", true)
+                        cb("", "text", true)
                         return &llm.Response{
                                 Content:    []llm.ContentBlock{{Type: "text", Text: "Hello world!"}},
                                 StopReason: "end_turn",

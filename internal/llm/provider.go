@@ -22,13 +22,15 @@ type Message struct {
 
 // ContentBlock represents a structured content block within a message.
 type ContentBlock struct {
-        Type    string `json:"type"` // "text", "tool_use", "tool_result", "image"
-        Text    string `json:"text,omitempty"`
-        ID      string `json:"id,omitempty"`
-        Name    string `json:"name,omitempty"`
-        Input   any    `json:"input,omitempty"`
-        Content string `json:"content,omitempty"`
-        IsError bool   `json:"is_error,omitempty"`
+        Type      string `json:"type"` // "text", "tool_use", "tool_result", "image", "thinking", "redacted_thinking"
+        Text      string `json:"text,omitempty"`
+        ID        string `json:"id,omitempty"`
+        Name      string `json:"name,omitempty"`
+        Input     any    `json:"input,omitempty"`
+        Content   string `json:"content,omitempty"`
+        IsError   bool   `json:"is_error,omitempty"`
+        Thinking  string `json:"thinking,omitempty"`
+        Signature string `json:"signature,omitempty"`
 }
 
 // ToolDefinition describes a tool available to the LLM.
@@ -62,8 +64,8 @@ type ModelInfo struct {
 }
 
 // StreamingCallback is called for each chunk during streaming.
-// chunk is the incremental text delta, done is true on the final call.
-type StreamingCallback func(chunk string, done bool)
+// chunk is the incremental text delta, chunkType is "text" or "thinking", done is true on the final call.
+type StreamingCallback func(chunk string, chunkType string, done bool)
 
 // StreamingProvider is an optional interface for providers that support SSE streaming.
 type StreamingProvider interface {
@@ -80,6 +82,11 @@ type Provider interface {
 // TextBlock creates a text content block.
 func TextBlock(text string) ContentBlock {
         return ContentBlock{Type: "text", Text: text}
+}
+
+// ThinkingBlock creates a thinking content block.
+func ThinkingBlock(thinking, signature string) ContentBlock {
+        return ContentBlock{Type: "thinking", Thinking: thinking, Signature: signature}
 }
 
 // ToolUseBlock creates a tool_use content block.
@@ -151,6 +158,12 @@ func mapToContentBlock(m map[string]any) ContentBlock {
         }
         if ie, ok := m["is_error"].(bool); ok {
                 cb.IsError = ie
+        }
+        if th, ok := m["thinking"].(string); ok {
+                cb.Thinking = th
+        }
+        if sig, ok := m["signature"].(string); ok {
+                cb.Signature = sig
         }
         return cb
 }

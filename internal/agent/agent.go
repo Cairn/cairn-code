@@ -32,6 +32,7 @@ type TodoItem = tools.TodoItem
 // Callbacks provides hooks for the UI to observe agent behavior.
 type Callbacks struct {
         OnText        func(text string)
+        OnThinking    func(text string)
         OnStreamChunk func(chunk string) // called per-token during streaming
         OnToolUse     func(name string, input any)
         OnToolResult  func(name string, output string, duration time.Duration)
@@ -118,7 +119,7 @@ func (a *Agent) Run(ctx context.Context, prompt string) error {
                 // Append assistant message FIRST (with tool_use blocks, before tool results)
                 assistantBlocks := make([]llm.ContentBlock, 0, len(resp.Content))
                 for _, block := range resp.Content {
-                        if block.Type == "text" || block.Type == "tool_use" {
+                        if block.Type == "text" || block.Type == "tool_use" || block.Type == "thinking" {
                                 assistantBlocks = append(assistantBlocks, block)
                         }
                 }
@@ -186,12 +187,19 @@ func (a *Agent) Run(ctx context.Context, prompt string) error {
 func (a *Agent) callStreaming(ctx context.Context, sp llm.StreamingProvider, tools []llm.ToolDefinition, system string) (*llm.Response, error) {
         var streamedText strings.Builder
 
-        resp, err := sp.StreamMessage(ctx, a.messages, tools, system, a.model, func(chunk string, done bool) {
+        resp, err := sp.StreamMessage(ctx, a.messages, tools, system, a.model, func(chunk string, chunkType string, done bool) {
                 if !done && chunk != "" {
-                        streamedText.WriteString(chunk)
-                        // Fire per-token callback for live UI streaming
-                        if a.callbacks.OnStreamChunk != nil {
-                                a.callbacks.OnStreamChunk(chunk)
+                        switch chunkType {
+                        case "thinking":
+                                if a.callbacks.OnThinking != nil {
+                                        a.callbacks.OnThinking(chunk)
+                                }
+                        default:
+                                streamedText.WriteString(chunk)
+                                // Fire per-token callback for live UI streaming
+                                if a.callbacks.OnStreamChunk != nil {
+                                        a.callbacks.OnStreamChunk(chunk)
+                                }
                         }
                 }
         })

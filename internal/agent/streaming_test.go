@@ -20,9 +20,9 @@ func TestStreamingProviderIsUsed(t *testing.T) {
                 mockProvider: &mockProvider{name: "mock-stream"},
                 streamFn: func(ctx context.Context, messages []llm.Message, toolDefs []llm.ToolDefinition, system string, model string, cb llm.StreamingCallback) (*llm.Response, error) {
                         streamCalled = true
-                        cb("chunk1", false)
-                        cb("chunk2", false)
-                        cb("", true)
+                        cb("chunk1", "text", false)
+                        cb("chunk2", "text", false)
+                        cb("", "text", true)
                         return &llm.Response{
                                 Content:    []llm.ContentBlock{{Type: "text", Text: "chunk1chunk2"}},
                                 StopReason: "end_turn",
@@ -97,8 +97,8 @@ func TestStreamingToolUseAccumulation(t *testing.T) {
                 mockProvider: &mockProvider{name: "mock-stream"},
                 streamFn: func(ctx context.Context, messages []llm.Message, toolDefs []llm.ToolDefinition, system string, model string, cb llm.StreamingCallback) (*llm.Response, error) {
                         // Simulate a response with text + tool_use
-                        cb("Let me run that.", false)
-                        cb("", true)
+                        cb("Let me run that.", "text", false)
+                        cb("", "text", true)
                         return &llm.Response{
                                 Content: []llm.ContentBlock{
                                         {Type: "text", Text: "Let me run that."},
@@ -203,9 +203,9 @@ func TestAgentMultipleTurnStreaming(t *testing.T) {
                 streamFn: func(ctx context.Context, messages []llm.Message, toolDefs []llm.ToolDefinition, system string, model string, cb llm.StreamingCallback) (*llm.Response, error) {
                         callCount++
                         if callCount == 1 {
-                                cb("Checking", false)
-                                cb(" files", false)
-                                cb("", true)
+                                cb("Checking", "text", false)
+                                cb(" files", "text", false)
+                                cb("", "text", true)
                                 return &llm.Response{
                                         Content: []llm.ContentBlock{
                                                 {Type: "text", Text: "Checking files"},
@@ -215,8 +215,8 @@ func TestAgentMultipleTurnStreaming(t *testing.T) {
                                 }, nil
                         }
                         // Second turn
-                        cb("Done", false)
-                        cb("", true)
+                        cb("Done", "text", false)
+                        cb("", "text", true)
                         return &llm.Response{
                                 Content:    []llm.ContentBlock{{Type: "text", Text: "Done"}},
                                 StopReason: "end_turn",
