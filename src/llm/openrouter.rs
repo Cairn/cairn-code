@@ -164,7 +164,7 @@ fn do_complete_request(key: &str, body: String) -> Result<(Vec<Message>, Usage),
         body: Some(body),
     };
     let resp = http_client::request(&req)?;
-    parse_openrouter_response(&resp.body)
+    parse_openrouter_complete_response(&resp.body)
 }
 
 fn openrouter_request_body(
@@ -308,6 +308,44 @@ fn parse_openrouter_response(raw: &str) -> Result<(Vec<Message>, Usage), String>
             Content::ToolUse(tu)
         };
         messages.push(Message { role: "assistant".into(), content });
+    }
+    Ok((messages, usage))
+}
+
+fn parse_openrouter_complete_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
+    let mut messages = Vec::new();
+    let mut usage = Usage::default();
+
+    let val = json::parse(raw).map_err(|e| format!("Failed to parse response: {e}"))?;
+
+    if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
+        if let Some(choice) = choices.first() {
+            if let Some(msg) = choice.get("message") {
+                let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("assistant").to_string();
+                let content = if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
+                    Content::Text(text.to_string())
+                } else if let Some(tc_arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                    let mut calls: Vec<_> = tc_arr.iter().enumerate().collect();
+                    calls.sort_by_key(|(i, _)| *i);
+                    let tu = calls.into_iter().next().map(|(_, tc)| {
+                        let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let name = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let args = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}").to_string();
+                        super::provider::ToolUse { id, name, input: args }
+                    }).unwrap_or(super::provider::ToolUse {
+                        id: String::new(), name: String::new(), input: "{}".into(),
+                    });
+                    Content::ToolUse(tu)
+                } else {
+                    Content::Text(String::new())
+                };
+                messages.push(Message { role, content });
+            }
+        }
+    }
+    if let Some(u) = val.get("usage") {
+        usage.input_tokens = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        usage.output_tokens = u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
     }
     Ok((messages, usage))
 }
