@@ -53,6 +53,9 @@ pub struct Tui {
     provider_picker_sel: usize,
     awaiting_api_key: bool,
     pending_openrouter_setup: bool,
+    /// Provider name to capture an API key for (e.g. "openrouter", "opencode", "openai").
+    /// When Some, the awaiting_api_key flow stores the key under this provider.
+    api_key_target: Option<String>,
     show_command_picker: bool,
     cmd_picker_list: Vec<String>,
     cmd_picker_filtered: Vec<String>,
@@ -96,6 +99,7 @@ impl Tui {
             provider_picker_sel: 0,
             awaiting_api_key: false,
             pending_openrouter_setup: false,
+            api_key_target: None,
             show_command_picker: false,
             cmd_picker_list: vec!["/clear".into(), "/cost".into(), "/exit".into(), "/help".into(), "/model".into(), "/provider".into(), "/quit".into(), "/q".into(), "/resume".into(), "/save".into(), "/sessions".into()],
             cmd_picker_filtered: Vec::new(),

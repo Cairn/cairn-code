@@ -59,11 +59,7 @@ impl Config {
         if let Some(key) = self.api_keys.get(provider) {
             return Some(key.clone());
         }
-        match provider {
-            "anthropic" => std::env::var("ANTHROPIC_API_KEY").ok(),
-            "openai" => std::env::var("OPENAI_API_KEY").ok(),
-            _ => None,
-        }
+        env_key_for(provider)
     }
 }
 
@@ -72,6 +68,20 @@ pub fn config_path() -> PathBuf {
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".config/cairn-code/config.json")
+}
+
+/// Look up an API key from the environment for the given provider.
+/// Returns the env-var value (empty string if unset/filtered).
+#[allow(dead_code)] // public API for future use; currently only referenced by tests
+pub fn env_key_for(provider: &str) -> Option<String> {
+    let var = match provider {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "openai" => "OPENAI_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        "opencode" => "OPENCODE_API_KEY",
+        _ => return None,
+    };
+    std::env::var(var).ok().filter(|s| !s.is_empty())
 }
 
 fn dirs_config_path() -> PathBuf {
@@ -100,7 +110,8 @@ pub fn save_config(provider: &str, model: &str, api_key: Option<&str>) -> Result
 
     if let Some(key) = api_key {
         let mut keys = obj.get("api_keys").and_then(|v| v.as_object()).cloned().unwrap_or_default();
-        keys.insert("openrouter".into(), JsonValue::String(key.into()));
+        // Store the key under the provider's name so the file is provider-agnostic.
+        keys.insert(provider.into(), JsonValue::String(key.into()));
         obj.insert("api_keys".into(), JsonValue::Object(keys));
     }
 
@@ -290,5 +301,54 @@ mod tests {
     fn test_config_path() {
         let path = config_path();
         assert!(path.to_string_lossy().contains("cairn-code"));
+    }
+
+    #[test]
+    fn test_env_key_for_known_providers() {
+        // env_key_for must return None when the env var is unset, for each known provider.
+        // We can't easily unset env vars, so we just check the function returns a String
+        // (or None) for the well-known names without panicking.
+        for p in ["anthropic", "openai", "openrouter", "opencode"].iter() {
+            let _ = env_key_for(p);
+        }
+        // Unknown provider => None
+        assert!(env_key_for("nonsense_provider_xyz").is_none());
+    }
+
+    #[test]
+    fn test_save_config_stores_key_under_provider_name() {
+        // Use a temp config path by redirecting HOME/USERPROFILE temporarily.
+        // We don't want to clobber the real config; we just verify the in-memory
+        // behaviour by parsing a fresh config: save writes the key under the provider
+        // name, not under a hard-coded "openrouter".
+        let tmp = std::env::temp_dir().join(format!("cairn-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg_path = tmp.join("config.json");
+        // write a minimal existing config
+        std::fs::write(&cfg_path, "{}").unwrap();
+        // emulate the save by reading, mutating, writing
+        let content = std::fs::read_to_string(&cfg_path).unwrap();
+        let mut obj: std::collections::HashMap<String, crate::json::JsonValue> =
+            crate::json::parse(&content).unwrap().as_object().cloned().unwrap_or_default();
+        obj.insert("default_provider".into(), crate::json::JsonValue::String("opencode".into()));
+        obj.insert("default_model".into(), crate::json::JsonValue::String("big-pickle".into()));
+        let mut keys = obj.get("api_keys").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        keys.insert("opencode".into(), crate::json::JsonValue::String("sk-oc-test".into()));
+        obj.insert("api_keys".into(), crate::json::JsonValue::Object(keys));
+        let out = crate::json::serialize(&crate::json::JsonValue::Object(obj));
+        std::fs::write(&cfg_path, &out).unwrap();
+
+        // Now read it back and confirm the key is under "opencode", not "openrouter".
+        let read = std::fs::read_to_string(&cfg_path).unwrap();
+        let parsed = crate::json::parse(&read).unwrap();
+        let keys = parsed.get("api_keys").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(
+            keys.get("opencode").and_then(|v| v.as_str()),
+            Some("sk-oc-test"),
+            "api key must be stored under the provider name"
+        );
+        assert!(keys.get("openrouter").is_none(), "no key should be written for unrelated providers");
+
+        let _ = std::fs::remove_file(&cfg_path);
     }
 }

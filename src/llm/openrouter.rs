@@ -12,6 +12,11 @@ impl OpenRouterProvider {
         OpenRouterProvider { api_key: String::new() }
     }
 
+    pub fn with_api_key(mut self, key: &str) -> Self {
+        self.api_key = key.to_string();
+        self
+    }
+
     fn get_key(&self) -> String {
         if !self.api_key.is_empty() { return self.api_key.clone(); }
         std::env::var("OPENROUTER_API_KEY").unwrap_or_default()
