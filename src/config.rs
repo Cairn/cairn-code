@@ -70,18 +70,21 @@ pub fn config_path() -> PathBuf {
     PathBuf::from(home).join(".config/cairn-code/config.json")
 }
 
+/// Name of the environment variable that holds the API key for the given provider.
+pub fn env_var_name(provider: &str) -> Option<&'static str> {
+    match provider {
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "openai" => Some("OPENAI_API_KEY"),
+        "openrouter" => Some("OPENROUTER_API_KEY"),
+        "opencode" => Some("OPENCODE_API_KEY"),
+        _ => None,
+    }
+}
+
 /// Look up an API key from the environment for the given provider.
 /// Returns the env-var value (empty string if unset/filtered).
-#[allow(dead_code)] // public API for future use; currently only referenced by tests
 pub fn env_key_for(provider: &str) -> Option<String> {
-    let var = match provider {
-        "anthropic" => "ANTHROPIC_API_KEY",
-        "openai" => "OPENAI_API_KEY",
-        "openrouter" => "OPENROUTER_API_KEY",
-        "opencode" => "OPENCODE_API_KEY",
-        _ => return None,
-    };
-    std::env::var(var).ok().filter(|s| !s.is_empty())
+    std::env::var(env_var_name(provider)?).ok().filter(|s| !s.is_empty())
 }
 
 fn dirs_config_path() -> PathBuf {
@@ -166,6 +169,30 @@ pub fn config_get_api_key(provider: &str) -> Option<String> {
 
 pub fn config_has_api_key(provider: &str) -> bool {
     config_get_api_key(provider).is_some()
+}
+
+/// Remove the saved API key for `provider` from the config file.
+/// Only the `api_keys` entry is touched; everything else is preserved.
+/// Returns Ok(true) if a key was removed, Ok(false) if none was stored.
+pub fn remove_api_key(provider: &str) -> Result<bool, String> {
+    remove_api_key_at(&config_path(), provider)
+}
+
+fn remove_api_key_at(path: &std::path::Path, provider: &str) -> Result<bool, String> {
+    use crate::json::JsonValue;
+    if !path.exists() { return Ok(false); }
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut obj = crate::json::parse(&content).map_err(|e| e.to_string())?
+        .as_object().cloned().unwrap_or_default();
+    let mut keys = match obj.get("api_keys").and_then(|v| v.as_object()) {
+        Some(k) => k.clone(),
+        None => return Ok(false),
+    };
+    if keys.remove(provider).is_none() { return Ok(false); }
+    obj.insert("api_keys".into(), JsonValue::Object(keys));
+    let output = crate::json::serialize(&JsonValue::Object(obj));
+    std::fs::write(path, &output).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 fn parse_config(content: &str) -> Result<Config, String> {
@@ -348,6 +375,37 @@ mod tests {
             "api key must be stored under the provider name"
         );
         assert!(keys.get("openrouter").is_none(), "no key should be written for unrelated providers");
+
+        let _ = std::fs::remove_file(&cfg_path);
+    }
+
+    #[test]
+    fn test_remove_api_key_at() {
+        let tmp = std::env::temp_dir().join(format!("cairn-test-rm-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg_path = tmp.join("config.json");
+        std::fs::write(&cfg_path, r#"{
+            "default_provider": "openrouter",
+            "default_model": "gpt-5-mini",
+            "api_keys": { "openrouter": "sk-or-1", "opencode": "sk-oc-2" }
+        }"#).unwrap();
+
+        // Removing a stored key returns true and only deletes that entry.
+        assert_eq!(remove_api_key_at(&cfg_path, "openrouter"), Ok(true));
+        let content = std::fs::read_to_string(&cfg_path).unwrap();
+        let parsed = crate::json::parse(&content).unwrap();
+        let obj = parsed.as_object().unwrap();
+        let keys = obj.get("api_keys").and_then(|v| v.as_object()).unwrap();
+        assert!(keys.get("openrouter").is_none());
+        assert_eq!(keys.get("opencode").and_then(|v| v.as_str()), Some("sk-oc-2"));
+        assert_eq!(obj.get("default_provider").and_then(|v| v.as_str()), Some("openrouter"),
+            "other settings must be preserved");
+
+        // Removing a key that isn't stored is a no-op.
+        assert_eq!(remove_api_key_at(&cfg_path, "anthropic"), Ok(false));
+
+        // Missing file is a no-op, not an error.
+        assert_eq!(remove_api_key_at(&tmp.join("nope.json"), "openrouter"), Ok(false));
 
         let _ = std::fs::remove_file(&cfg_path);
     }

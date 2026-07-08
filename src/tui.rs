@@ -51,6 +51,11 @@ pub struct Tui {
     show_provider_picker: bool,
     provider_picker_list: Vec<String>,
     provider_picker_sel: usize,
+    /// Whether each provider in provider_picker_list has an API key saved in the config file.
+    provider_picker_keys: Vec<bool>,
+    /// When Some, a confirmation prompt to remove this provider's saved API key is shown.
+    confirm_remove_provider: Option<String>,
+    confirm_remove_sel: usize,
     awaiting_api_key: bool,
     pending_openrouter_setup: bool,
     /// Provider name to capture an API key for (e.g. "openrouter", "opencode", "openai").
@@ -98,6 +103,9 @@ impl Tui {
             show_provider_picker: false,
             provider_picker_list: Vec::new(),
             provider_picker_sel: 0,
+            provider_picker_keys: Vec::new(),
+            confirm_remove_provider: None,
+            confirm_remove_sel: 0,
             awaiting_api_key: false,
             pending_openrouter_setup: false,
             api_key_target: None,
@@ -276,6 +284,43 @@ impl Tui {
                     self.show_permission_prompt = false;
                     if let Some(tx) = &self.perm_tx {
                         let _ = tx.send("deny".to_string());
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+
+        if let Some(name) = self.confirm_remove_provider.clone() {
+            match key.code {
+                KeyCode::Left => { self.confirm_remove_sel = 0; }
+                KeyCode::Right => { self.confirm_remove_sel = 1; }
+                KeyCode::Esc => { self.confirm_remove_provider = None; }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.confirm_remove_provider = None;
+                }
+                KeyCode::Enter => {
+                    let remove = self.confirm_remove_sel == 1;
+                    self.confirm_remove_provider = None;
+                    if remove {
+                        let (type_, content) = match crate::config::remove_api_key(&name) {
+                            Ok(true) => {
+                                let env_note = match crate::config::env_key_for(&name) {
+                                    Some(_) => format!(" Note: {} is still set in the environment and will still be used.",
+                                        crate::config::env_var_name(&name).unwrap_or("its environment variable")),
+                                    None => String::new(),
+                                };
+                                ("system", format!("Removed saved API key for {name}.{env_note}"))
+                            }
+                            Ok(false) => ("system", format!("No saved API key for {name}.")),
+                            Err(e) => ("error", format!("Failed to remove API key for {name}: {e}")),
+                        };
+                        self.output_lines.push(OutputLine {
+                            type_: type_.into(), content,
+                            tool_name: String::new(), duration: String::new(),
+                        });
+                        self.provider_picker_keys = self.provider_picker_list.iter()
+                            .map(|n| crate::config::config_has_api_key(n)).collect();
                     }
                 }
                 _ => {}
@@ -513,6 +558,22 @@ impl Tui {
                 true
             }
             KeyCode::Delete => {
+                if self.show_provider_picker {
+                    if self.provider_picker_sel < self.provider_picker_list.len() {
+                        let name = self.provider_picker_list[self.provider_picker_sel].clone();
+                        if crate::config::config_has_api_key(&name) {
+                            self.confirm_remove_provider = Some(name);
+                            self.confirm_remove_sel = 0;
+                        } else {
+                            self.output_lines.push(OutputLine {
+                                type_: "system".into(),
+                                content: format!("No saved API key for {name} in the config file."),
+                                tool_name: String::new(), duration: String::new(),
+                            });
+                        }
+                    }
+                    return true;
+                }
                 if self.cursor < self.input_buf.len() && !self.show_model_picker {
                     self.input_buf.remove(self.cursor);
                 }
@@ -583,8 +644,13 @@ impl Tui {
                 let providers = crate::llm::default_providers();
                 let mut names: Vec<String> = providers.into_keys().collect();
                 names.sort();
+                // Current provider first, matching render order so the
+                // selection index always points at the displayed row.
+                names.sort_by_key(|n| usize::from(*n != self.provider));
+                self.provider_picker_keys = names.iter()
+                    .map(|n| crate::config::config_has_api_key(n)).collect();
                 self.provider_picker_list = names;
-                self.provider_picker_sel = self.provider_picker_list.iter().position(|n| n == &self.provider).unwrap_or(0);
+                self.provider_picker_sel = 0;
                 self.show_provider_picker = true;
             }
             "/help" => {
@@ -888,27 +954,45 @@ impl Tui {
                     Span::styled(format!("{prefix}{cmd}"), if is_sel { bg_orange } else { dim }),
                 ]));
             }
+        } else if let Some(name) = &self.confirm_remove_provider {
+            lines.push(Line::from(vec![
+                Span::styled(format!("Remove saved API key for '{name}'?"), white),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("This only deletes the key from the config file.", dim),
+            ]));
+            lines.push(Line::from(""));
+            let options = ["Cancel", "Remove"];
+            let mut option_spans = Vec::new();
+            for (i, opt) in options.iter().enumerate() {
+                if i > 0 { option_spans.push(Span::raw("  ")); }
+                let is_sel = i == self.confirm_remove_sel;
+                let open = if is_sel { "[" } else { " " };
+                let close = if is_sel { "]" } else { " " };
+                option_spans.push(Span::styled(
+                    format!("{open}{opt}{close}"),
+                    if is_sel { orange_fg.add_modifier(Modifier::BOLD) } else { dim },
+                ));
+            }
+            lines.push(Line::from(option_spans));
+            lines.push(Line::from(vec![
+                Span::styled("(← → navigate  Enter confirm  Esc cancel)", dim),
+            ]));
         } else if self.show_provider_picker {
             let bg_orange = Style::new().bg(Color::Indexed(215)).fg(Color::Indexed(230));
-            let mut names: Vec<String> = self.provider_picker_list.clone();
-            let current = self.provider.clone();
-            names.sort_by(|a, b| {
-                let ac = if *a == current { 0 } else { 1 };
-                let bc = if *b == current { 0 } else { 1 };
-                ac.cmp(&bc)
-            });
 
             lines.push(Line::from(vec![
                 Span::styled("── Provider ", orange_fg.add_modifier(Modifier::BOLD)),
-                Span::styled("(↑↓ navigate  Enter select  Esc cancel) ──", bold_dim),
+                Span::styled("(↑↓ navigate  Enter select  Del remove key  Esc cancel) ──", bold_dim),
             ]));
-            for (i, name) in names.iter().enumerate() {
+            for (i, name) in self.provider_picker_list.iter().enumerate() {
                 let is_sel = i == self.provider_picker_sel;
-                let is_cur = *name == current;
-                let check = if is_cur { "  ✓" } else { "" };
+                let is_cur = *name == self.provider;
+                let cur_mark = if is_cur { "  (current)" } else { "" };
+                let key_mark = if self.provider_picker_keys.get(i).copied().unwrap_or(false) { "  [key saved]" } else { "" };
                 let prefix = if is_sel { "▸ " } else { "  " };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{prefix}{}{check}", name), if is_sel { bg_orange } else { dim }),
+                    Span::styled(format!("{prefix}{name}{key_mark}{cur_mark}"), if is_sel { bg_orange } else { dim }),
                 ]));
             }
         } else if self.show_model_picker {
