@@ -67,6 +67,7 @@ pub struct Tui {
     agent_tx: Option<mpsc::Sender<String>>,
     perm_tx: Option<mpsc::Sender<String>>,
     cancel_flag: Option<Arc<AtomicBool>>,
+    dirty: bool,
     show_permission_prompt: bool,
     perm_tool_name: String,
     perm_tool_input: String,
@@ -111,6 +112,7 @@ impl Tui {
             agent_tx: None,
             perm_tx: None,
             cancel_flag: None,
+            dirty: false,
             show_permission_prompt: false,
             perm_tool_name: String::new(),
             perm_tool_input: String::new(),
@@ -136,11 +138,16 @@ impl Tui {
 
         let mut result = Ok(());
         let mut last_spinner_update = std::time::Instant::now();
+        let mut last_draw = std::time::Instant::now();
+        const MIN_FRAME: std::time::Duration = std::time::Duration::from_micros(1_000_000 / 240);
         let mut needs_rebuild = false;
+        self.dirty = true;
 
         'outer: loop {
             if matches!(self.state, State::Running) {
+                let mut got_event = false;
                 while let Ok(event) = rx.try_recv() {
+                    got_event = true;
                     match event {
                         AgentEvent::Text(t) => { self.streaming_text.push_str(&t); }
                         AgentEvent::Thinking(t) => { self.stream_thinking.push_str(&t); }
@@ -178,6 +185,7 @@ impl Tui {
                         }
                     }
                 }
+                if got_event { self.dirty = true; }
             }
 
             if matches!(self.state, State::Idle) {
@@ -185,10 +193,13 @@ impl Tui {
                     Ok(ratatui::crossterm::event::Event::Key(key)) => {
                         if !self.handle_key(key) {
                             break 'outer;
+                        } else {
+                            self.dirty = true;
                         }
                     }
                     Ok(ratatui::crossterm::event::Event::Resize(_, _)) => {
                         needs_rebuild = true;
+                        self.dirty = true;
                     }
                     Err(e) => {
                         result = Err(format!("Event error: {e}"));
@@ -202,12 +213,14 @@ impl Tui {
                     if let Ok(ratatui::crossterm::event::Event::Key(key)) = ratatui::crossterm::event::read() {
                         if key.kind == ratatui::crossterm::event::KeyEventKind::Press {
                             self.handle_key(key);
+                            self.dirty = true;
                         }
                     }
                 }
                 if last_spinner_update.elapsed() >= Duration::from_millis(80) {
                     self.spinner_idx = self.spinner_idx.wrapping_add(1);
                     last_spinner_update = std::time::Instant::now();
+                    self.dirty = true;
                 }
             }
 
@@ -216,9 +229,16 @@ impl Tui {
                 needs_rebuild = false;
             }
 
-            if let Err(e) = terminal.draw(|f| self.render(f)) {
-                result = Err(format!("Render error: {e}"));
-                break 'outer;
+            if self.dirty {
+                if let Some(sleep) = MIN_FRAME.checked_sub(last_draw.elapsed()) {
+                    std::thread::sleep(sleep);
+                }
+                if let Err(e) = terminal.draw(|f| self.render(f)) {
+                    result = Err(format!("Render error: {e}"));
+                    break 'outer;
+                }
+                last_draw = std::time::Instant::now();
+                self.dirty = false;
             }
         }
 
