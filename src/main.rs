@@ -12,6 +12,8 @@ mod redact;
 mod theme;
 mod oauth;
 mod notify;
+mod skills;
+mod mcp;
 
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,7 +70,19 @@ fn main() {
     let models = chosen_provider.available_models();
     let provider_name_str = chosen_provider.name().to_string();
 
-    let tool_registry = tools::registry::default_registry();
+    // Skills: optional dir override from config, else CAIRN_SKILLS_DIR / defaults.
+    if let Some(dir) = cfg.skills_dir.clone() {
+        std::env::set_var("CAIRN_SKILLS_DIR", dir);
+    }
+    let skills = skills::load_skills();
+    let skills_for_agent = skills.clone();
+    let (tool_registry, mcp_runtime) = tools::registry::build_registry(skills, &cfg.mcp);
+    let mcp_warnings = mcp_runtime.warnings.clone();
+    let mcp_tool_count = mcp_runtime.tool_names.len();
+    let skill_count = skills_for_agent.len();
+    // Keep MCP processes alive for the agent thread lifetime.
+    let _mcp_keepalive = mcp_runtime;
+
     let work_dir = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| ".".to_string());
@@ -88,7 +102,13 @@ fn main() {
     let show_suggestions = cfg.show_suggestions;
 
     thread::spawn(move || {
-        let mut agent = Agent::new(chosen_provider, p_model_for_agent, tool_registry, cfg);
+        let mut agent = Agent::new_with_skills(
+            chosen_provider,
+            p_model_for_agent,
+            tool_registry,
+            cfg,
+            skills_for_agent,
+        );
         agent.set_live_mirror(live_mirror_agent);
         loop {
             match cmd_rx.recv() {
@@ -199,6 +219,34 @@ fn main() {
     tui.set_cancel_flag(cancel);
     tui.set_live_mirror(live_mirror);
     tui.set_picker_models(models);
+
+    if skill_count > 0 {
+        tui.add_output_line(tui::OutputLine {
+            type_: "system".into(),
+            content: format!(
+                "Loaded {skill_count} skill(s) from {}. Use the skill tool or /skills.",
+                skills::default_skills_dir().display()
+            ),
+            tool_name: String::new(),
+            duration: String::new(),
+        });
+    }
+    if mcp_tool_count > 0 {
+        tui.add_output_line(tui::OutputLine {
+            type_: "system".into(),
+            content: format!("Loaded {mcp_tool_count} MCP tool(s). Use /mcp to list."),
+            tool_name: String::new(),
+            duration: String::new(),
+        });
+    }
+    for w in mcp_warnings {
+        tui.add_output_line(tui::OutputLine {
+            type_: "system".into(),
+            content: w,
+            tool_name: String::new(),
+            duration: String::new(),
+        });
+    }
 
     if is_print_mode {
         if let Some(prompt) = initial_prompt {

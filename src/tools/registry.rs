@@ -82,6 +82,22 @@ pub fn default_registry() -> Registry {
     r
 }
 
+/// Built-in registry plus optional skill tool and MCP tools from config.
+pub fn build_registry(
+    skills: Vec<crate::skills::Skill>,
+    mcp: &crate::mcp::McpConfig,
+) -> (Registry, crate::mcp::McpRuntime) {
+    let mut r = default_registry();
+    if !skills.is_empty() {
+        r.register(Box::new(crate::tools::skill_tool::SkillTool::new(skills)));
+    } else {
+        // Still register skill tool so the model can discover "no skills" errors cleanly.
+        r.register(Box::new(crate::tools::skill_tool::SkillTool::new(Vec::new())));
+    }
+    let runtime = crate::mcp::register_mcp_tools(&mut r, mcp);
+    (r, runtime)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,7 +105,7 @@ mod tests {
     #[test]
     fn default_registry_has_expected_tools() {
         let r = default_registry();
-        assert_eq!(r.len(), 14);
+        assert_eq!(r.len(), 14, "builtins only (skill/MCP added in build_registry)");
         for name in [
             "file_read",
             "file_write",

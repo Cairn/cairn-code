@@ -43,6 +43,8 @@ pub struct Agent {
     last_input_tokens: u64,
     /// Mirrors full message history for session autosave (shared with TUI).
     live_mirror: Option<crate::session::LiveMirror>,
+    /// Skill catalog (names/descriptions); bodies loaded via the `skill` tool.
+    skills: Vec<crate::skills::Skill>,
 }
 
 impl Agent {
@@ -51,6 +53,16 @@ impl Agent {
         model: String,
         tools: Registry,
         config: Config,
+    ) -> Self {
+        Self::new_with_skills(provider, model, tools, config, Vec::new())
+    }
+
+    pub fn new_with_skills(
+        provider: Box<dyn llm::Provider>,
+        model: String,
+        tools: Registry,
+        config: Config,
+        skills: Vec<crate::skills::Skill>,
     ) -> Self {
         Agent {
             provider,
@@ -61,6 +73,7 @@ impl Agent {
             usage: Usage::default(),
             last_input_tokens: 0,
             live_mirror: None,
+            skills,
         }
     }
 
@@ -210,7 +223,7 @@ impl Agent {
             content: llm::Content::Text(input.to_string()),
         });
 
-        let system = load_system_prompt(&self.config.system_prompt_file);
+        let system = load_system_prompt(&self.config.system_prompt_file, &self.skills);
         // At most one reactive compact-and-retry per user turn so a provider
         // that keeps returning context errors cannot loop forever.
         let mut reactive_compact_attempted = false;
@@ -412,7 +425,7 @@ impl Agent {
             content: llm::Content::Text(input.to_string()),
         });
 
-        let system = load_system_prompt(&self.config.system_prompt_file);
+        let system = load_system_prompt(&self.config.system_prompt_file, &self.skills);
         let tool_defs = self.tools.definitions();
 
         if self.should_proactively_compact() {
@@ -470,12 +483,19 @@ impl Agent {
     }
 }
 
-fn load_system_prompt(path: &str) -> String {
-    if let Ok(content) = fs::read_to_string(path) {
-        content
-    } else {
-        String::new()
+fn load_system_prompt(path: &str, skills: &[crate::skills::Skill]) -> String {
+    let mut content = fs::read_to_string(path).unwrap_or_default();
+    let catalog = crate::skills::catalog_prompt(skills);
+    if !catalog.is_empty() {
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&catalog);
     }
+    content
 }
 
 /// Index at which to split history for compaction: `messages[..split]` is
