@@ -116,8 +116,8 @@ impl Tui {
             api_key_target: None,
             show_command_picker: false,
             cmd_picker_list: vec![
-                "/clear".into(), "/cost".into(), "/delete".into(), "/exit".into(), "/help".into(),
-                "/model".into(), "/provider".into(), "/quit".into(), "/q".into(),
+                "/clear".into(), "/compact".into(), "/cost".into(), "/delete".into(), "/exit".into(),
+                "/help".into(), "/model".into(), "/provider".into(), "/quit".into(), "/q".into(),
                 "/resume".into(), "/save".into(), "/sessions".into(),
             ],
             cmd_picker_filtered: Vec::new(),
@@ -184,14 +184,19 @@ impl Tui {
                         }
                         AgentEvent::Error(e) => {
                             self.flush_streaming();
+                            let is_llm = e.starts_with("LLM error:");
                             self.output_lines.push(OutputLine {
-                                type_: "error".into(), content: e, tool_name: String::new(), duration: String::new(),
+                                type_: "error".into(),
+                                content: crate::redact::redact_secrets(&e),
+                                tool_name: String::new(),
+                                duration: String::new(),
                             });
-                            // AgentEvent::Error is only emitted for LLM/provider failures
-                            // (tool failures become tool results). Offer a manual switch,
-                            // never silent fallback to another provider.
-                            self.show_recovery_prompt = true;
-                            self.recovery_selection = 0;
+                            // Offer a manual model/provider switch after LLM failures only
+                            // (not for compact/session errors). Never silent multi-provider fallback.
+                            if is_llm {
+                                self.show_recovery_prompt = true;
+                                self.recovery_selection = 0;
+                            }
                         }
                         AgentEvent::PermissionRequest(name, input) => {
                             self.flush_streaming();
@@ -716,9 +721,21 @@ impl Tui {
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /clear /cost /delete /exit /help /model /provider /resume /save /sessions\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)".into(),
+                    content: "Commands: /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
+            }
+            "/compact" => {
+                if !matches!(self.state, State::Idle) {
+                    self.output_lines.push(OutputLine {
+                        type_: "system".into(),
+                        content: "Wait for the current turn to finish before compacting.".into(),
+                        tool_name: String::new(), duration: String::new(),
+                    });
+                } else if let Some(tx) = &self.agent_tx {
+                    self.state = State::Running;
+                    let _ = tx.send("__compact__".into());
+                }
             }
             "/save" => {
                 self.save_session();

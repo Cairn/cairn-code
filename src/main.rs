@@ -8,6 +8,7 @@ mod agent;
 mod tools;
 mod tui;
 mod markdown;
+mod redact;
 
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -105,6 +106,15 @@ fn main() {
                             agent.set_state(session.messages, usage);
                         }
                     }
+                }
+                Ok(cmd) if cmd == "__compact__" => {
+                    match agent.compact_now(&event_tx) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            let _ = event_tx.send(AgentEvent::Error(e));
+                        }
+                    }
+                    let _ = event_tx.send(AgentEvent::Done);
                 }
                 Ok(prompt) => {
                     cancel2.store(false, Ordering::Relaxed);

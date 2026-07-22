@@ -72,8 +72,10 @@ fn extract_error_detail(body: &str) -> String {
     }
 }
 
-fn looks_like_context_limit(detail: &str) -> bool {
-    let lower = detail.to_ascii_lowercase();
+/// True when an error string looks like a context-window / prompt-too-long
+/// failure from a common provider. Used for reactive compaction.
+pub fn is_context_limit_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
     [
         "context length",
         "context window",
@@ -84,14 +86,21 @@ fn looks_like_context_limit(detail: &str) -> bool {
         "too many tokens",
         "reduce the length of the messages",
         "input is too long",
-        "max_tokens",
+        // avoid bare "max_tokens" alone: it appears in normal request logs
+        "max_tokens is too large",
+        "exceeds the model's",
+        "exceeds model",
     ]
     .iter()
     .any(|n| lower.contains(n))
 }
 
+fn looks_like_context_limit(detail: &str) -> bool {
+    is_context_limit_error(detail)
+}
+
 fn format_status_error(status: u16, body: &str) -> String {
-    let detail = extract_error_detail(body);
+    let detail = crate::redact::redact_secrets(&extract_error_detail(body));
     let advice = if looks_like_context_limit(&detail) {
         "Prompt exceeds the model context window. Start a new session (/clear) or continue so compaction can shrink history."
     } else {
@@ -158,7 +167,7 @@ fn now_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
-fn debug_log_request(url: &str, body: &str) {
+fn debug_log_request(req: &HttpRequest) {
     let dir = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
@@ -166,13 +175,24 @@ fn debug_log_request(url: &str, body: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&path, format!("URL: {url}\n\nBody:\n{body}"));
+    let mut dump = format!("URL: {}\n\nHeaders:\n", req.url);
+    for (k, v) in &req.headers {
+        let val = if crate::redact::is_sensitive_header(k) {
+            "[REDACTED]".to_string()
+        } else {
+            crate::redact::redact_secrets(v)
+        };
+        dump.push_str(&format!("{k}: {val}\n"));
+    }
+    dump.push_str("\nBody:\n");
+    if let Some(body) = &req.body {
+        dump.push_str(&crate::redact::redact_secrets(body));
+    }
+    let _ = std::fs::write(&path, dump);
 }
 
 fn spawn_curl(req: &HttpRequest) -> Result<Child, String> {
-    if let Some(body) = &req.body {
-        debug_log_request(&req.url, body);
-    }
+    debug_log_request(req);
 
     let mut cmd = Command::new("curl");
     cmd.args(["-sS", "-i", "-X", "POST", &req.url]);
@@ -525,6 +545,7 @@ mod tests {
             r#"{"error":{"message":"This model's maximum context length is 128000 tokens"}}"#,
         );
         assert!(msg.to_ascii_lowercase().contains("context"), "{msg}");
+        assert!(is_context_limit_error(&msg), "{msg}");
     }
 
     #[test]

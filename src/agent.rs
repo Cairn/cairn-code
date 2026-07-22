@@ -114,8 +114,8 @@ impl Agent {
     /// message, keeping the most recent turns verbatim. Returns the number
     /// of original messages folded into the summary, or 0 if it skipped
     /// (no safe split point, too few messages, or the summarization call
-    /// itself failed).
-    fn compact_history(&mut self, tx: &mpsc::Sender<AgentEvent>) -> usize {
+    /// itself failed). When `tx` is `Some`, emits usage and Compacted events.
+    fn compact_history(&mut self, tx: Option<&mpsc::Sender<AgentEvent>>) -> usize {
         let Some(split) = find_safe_split_point(&self.messages) else { return 0; };
 
         let transcript = render_transcript(&self.messages[..split]);
@@ -147,15 +147,34 @@ impl Agent {
 
         self.usage.input_tokens += summary_usage.input_tokens;
         self.usage.output_tokens += summary_usage.output_tokens;
-        let _ = tx.send(AgentEvent::TurnEnd(llm::Usage {
-            input_tokens: summary_usage.input_tokens,
-            output_tokens: summary_usage.output_tokens,
-            cache_read: summary_usage.cache_read,
-            cache_create: summary_usage.cache_create,
-        }));
-        let _ = tx.send(AgentEvent::Compacted(split));
+        if let Some(tx) = tx {
+            let _ = tx.send(AgentEvent::TurnEnd(llm::Usage {
+                input_tokens: summary_usage.input_tokens,
+                output_tokens: summary_usage.output_tokens,
+                cache_read: summary_usage.cache_read,
+                cache_create: summary_usage.cache_create,
+            }));
+            let _ = tx.send(AgentEvent::Compacted(split));
+        }
 
         split
+    }
+
+    /// Manual `/compact`: fold history now. Emits Compacted on success.
+    pub fn compact_now(&mut self, tx: &mpsc::Sender<AgentEvent>) -> Result<usize, String> {
+        let n = self.compact_history(Some(tx));
+        if n == 0 {
+            return Err(
+                "Could not compact history (need more messages, a safe split point, or a working summarizer)."
+                    .into(),
+            );
+        }
+        Ok(n)
+    }
+
+    fn format_llm_err(e: String) -> String {
+        let e = crate::redact::redact_secrets(&e);
+        if e.starts_with("LLM error:") { e } else { format!("LLM error: {e}") }
     }
 
     pub fn run(&mut self, input: &str, tx: mpsc::Sender<AgentEvent>, cancel: &AtomicBool, perm_rx: &mpsc::Receiver<String>) -> Result<(), String> {
@@ -165,6 +184,9 @@ impl Agent {
         });
 
         let system = load_system_prompt(&self.config.system_prompt_file);
+        // At most one reactive compact-and-retry per user turn so a provider
+        // that keeps returning context errors cannot loop forever.
+        let mut reactive_compact_attempted = false;
 
         let result = (|| -> Result<(), String> {
             for _turn in 0..self.config.max_turns {
@@ -173,13 +195,13 @@ impl Agent {
                 }
 
                 if self.should_proactively_compact() {
-                    self.compact_history(&tx);
+                    self.compact_history(Some(&tx));
                 }
 
                 let tool_defs = self.tools.definitions();
 
                 let tx_clone = tx.clone();
-                let (new_msgs, usage) = self.provider.stream_complete(
+                let stream_result = self.provider.stream_complete(
                     &self.messages,
                     &tool_defs,
                     &system,
@@ -192,10 +214,23 @@ impl Agent {
                         });
                     }),
                     cancel,
-                ).map_err(|e| {
-                    // Providers/http_client already produce actionable text; keep a stable prefix for the TUI.
-                    if e.starts_with("LLM error:") { e } else { format!("LLM error: {e}") }
-                })?;
+                );
+
+                let (new_msgs, usage) = match stream_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let err = Self::format_llm_err(e);
+                        if !reactive_compact_attempted
+                            && crate::http_client::is_context_limit_error(&err)
+                        {
+                            reactive_compact_attempted = true;
+                            if self.compact_history(Some(&tx)) > 0 {
+                                continue;
+                            }
+                        }
+                        return Err(err);
+                    }
+                };
 
                 if cancel.load(Ordering::Relaxed) {
                     return Ok(());
@@ -314,16 +349,37 @@ impl Agent {
         let system = load_system_prompt(&self.config.system_prompt_file);
         let tool_defs = self.tools.definitions();
 
-        let (new_msgs, usage) = self.provider.complete(
+        if self.should_proactively_compact() {
+            self.compact_history(None);
+        }
+
+        let (new_msgs, usage) = match self.provider.complete(
             &self.messages,
             &tool_defs,
             &system,
             &self.model,
             self.config.max_tokens,
-        )?;
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                let err = Self::format_llm_err(e);
+                if crate::http_client::is_context_limit_error(&err) && self.compact_history(None) > 0 {
+                    self.provider.complete(
+                        &self.messages,
+                        &tool_defs,
+                        &system,
+                        &self.model,
+                        self.config.max_tokens,
+                    ).map_err(Self::format_llm_err)?
+                } else {
+                    return Err(err);
+                }
+            }
+        };
 
         self.usage.input_tokens += usage.input_tokens;
         self.usage.output_tokens += usage.output_tokens;
+        self.last_input_tokens = usage.input_tokens;
 
         let mut output = String::new();
         for msg in &new_msgs {
@@ -590,6 +646,113 @@ mod tests {
         // Pre-compact peak is seed(16)+user+asst+user ≈ 19; compacted should be smaller.
         let seen = *last_count.lock().unwrap();
         assert!(seen < 20, "second stream should see a compacted history, got {seen} messages");
+    }
+
+    /// First stream fails with a context-limit error; after compact, second stream succeeds.
+    struct ReactiveMock {
+        stream_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        complete_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl llm::Provider for ReactiveMock {
+        fn name(&self) -> &str { "mock" }
+        fn default_model(&self) -> &str { "mock-model" }
+        fn available_models(&self) -> Vec<llm::ModelInfo> {
+            vec![llm::ModelInfo { id: "mock-model".into(), name: "Mock".into(), max_ctx: 1000 }]
+        }
+        fn stream_complete(
+            &self,
+            _messages: &[llm::Message],
+            _tools: &[llm::ToolDefinition],
+            _system: &str,
+            _model: &str,
+            _max_tokens: usize,
+            mut on_chunk: llm::StreamingCallback,
+            _cancel: &AtomicBool,
+        ) -> Result<(Vec<llm::Message>, Usage), String> {
+            let n = self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                return Err("prompt is too long: exceeds the model context window".into());
+            }
+            on_chunk("ok", "text");
+            Ok((
+                vec![llm::Message {
+                    role: "assistant".into(),
+                    content: llm::Content::Text("recovered".into()),
+                }],
+                Usage { input_tokens: 50, output_tokens: 3, cache_read: 0, cache_create: 0 },
+            ))
+        }
+        fn complete(
+            &self,
+            _messages: &[llm::Message],
+            _tools: &[llm::ToolDefinition],
+            _system: &str,
+            _model: &str,
+            _max_tokens: usize,
+        ) -> Result<(Vec<llm::Message>, Usage), String> {
+            self.complete_calls.fetch_add(1, Ordering::SeqCst);
+            Ok((
+                vec![llm::Message {
+                    role: "assistant".into(),
+                    content: llm::Content::Text("summary".into()),
+                }],
+                Usage { input_tokens: 10, output_tokens: 5, cache_read: 0, cache_create: 0 },
+            ))
+        }
+    }
+
+    #[test]
+    fn reactive_compaction_retries_after_context_limit() {
+        let stream_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let complete_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut seed = Vec::new();
+        for i in 0..8 {
+            seed.push(text("user", &format!("u{i}")));
+            seed.push(text("assistant", &format!("a{i}")));
+        }
+        let mut agent = Agent::new(
+            Box::new(ReactiveMock {
+                stream_calls: stream_calls.clone(),
+                complete_calls: complete_calls.clone(),
+            }),
+            "mock-model".into(),
+            crate::tools::registry::Registry::new(),
+            crate::config::Config::default(),
+        );
+        agent.set_state(seed, Usage::default());
+
+        let (tx, rx) = mpsc::channel();
+        let (_perm_tx, perm_rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        agent.run("big prompt", tx, &cancel, &perm_rx).unwrap();
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 2, "fail then retry");
+        assert_eq!(complete_calls.load(Ordering::SeqCst), 1, "summarizer once");
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Compacted(_))));
+        assert!(agent.messages().iter().any(|m| {
+            matches!(&m.content, llm::Content::Text(t) if t.contains("[Earlier conversation summary]"))
+        }));
+    }
+
+    #[test]
+    fn compact_now_returns_error_when_too_short() {
+        let stream_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let complete_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut agent = Agent::new(
+            Box::new(SharedMock {
+                stream_calls,
+                complete_calls,
+                last_stream_message_count: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            }),
+            "mock-model".into(),
+            crate::tools::registry::Registry::new(),
+            crate::config::Config::default(),
+        );
+        let (tx, _rx) = mpsc::channel();
+        let err = agent.compact_now(&tx).unwrap_err();
+        assert!(err.to_ascii_lowercase().contains("could not compact"), "{err}");
     }
 }
 

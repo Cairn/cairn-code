@@ -30,7 +30,7 @@
 zero (`~/source/repos/zero`) is a much larger, mature agent CLI (~167k lines vs
 cairn-code's ~6k). These are gaps confirmed against it that are each a
 standalone system, not a small port:
-- [x] Context/history compaction — proactive summarize-and-trim in `agent.rs` when input tokens hit 70% of model `max_ctx`
+- [x] Context/history compaction — proactive, reactive (context-limit retry), `/compact`, and `run_simple`
 - Session fork/lineage/rewind/checkpointing
 - Parallel execution of read-only tool calls
 - LSP integration (diagnostics, go-to-definition)
@@ -38,7 +38,7 @@ standalone system, not a small port:
 - OAuth login flows for providers (vs. raw API keys only)
 - Model registry with live pricing/context-window/vision metadata
 - Three-way config layering (user/project/env), currently first-match-wins
-- Output/log secret redaction
+- [x] Output/log secret redaction — `redact.rs` on debug dumps, error text, sensitive headers
 - Provider catalog expansion beyond the current 4 (anthropic/openai/openrouter/ollama)
 
 ## Standing Rules

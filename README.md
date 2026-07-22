@@ -155,6 +155,7 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 |---------|-------------|
 | `/help` | Show available commands |
 | `/clear` | Clear conversation history |
+| `/compact` | Summarize older history into a shorter context now |
 | `/model` | Show or change the current model |
 | `/cost` | Show token usage for the session |
 | `/provider` | Show or change the current provider |
