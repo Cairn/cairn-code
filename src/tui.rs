@@ -1736,6 +1736,9 @@ impl Tui {
             Ok(sess) => {
                 // Rebuild TUI transcript including tool calls/results for continuity.
                 let mut lines = Vec::new();
+                // Pair each tool_result with the preceding tool_use name so compact
+                // display rules still apply after /resume (results alone have no name).
+                let mut pending_tool_name = String::new();
                 for msg in &sess.messages {
                     match &msg.content {
                         llm::Content::Text(t) => {
@@ -1769,6 +1772,7 @@ impl Tui {
                             }
                         }
                         llm::Content::ToolUse(tu) => {
+                            pending_tool_name = tu.name.clone();
                             lines.push(OutputLine {
                                 type_: "tool_use".into(),
                                 content: tu.input.clone(),
@@ -1777,10 +1781,15 @@ impl Tui {
                             });
                         }
                         llm::Content::ToolResult(tr) => {
+                            let name = if pending_tool_name.is_empty() {
+                                "tool".into()
+                            } else {
+                                std::mem::take(&mut pending_tool_name)
+                            };
                             lines.push(OutputLine {
                                 type_: "tool_result".into(),
                                 content: tr.content.clone(),
-                                tool_name: "tool".into(),
+                                tool_name: name,
                                 duration: String::new(),
                             });
                         }
@@ -1916,26 +1925,17 @@ impl Tui {
                     lines.extend(crate::markdown::render(&line.content, &self.theme));
                 }
                 "tool_use" => {
+                    // One line: name + short arg hint (no multi-line JSON dump).
+                    let hint = compact_tool_arg_hint(&line.content);
+                    let label = if hint.is_empty() {
+                        line.tool_name.clone()
+                    } else {
+                        format!("{}  {}", line.tool_name, hint)
+                    };
                     lines.push(Line::from(vec![
                         Span::styled("● ", white),
-                        Span::raw(&line.tool_name),
+                        Span::styled(label, dim),
                     ]));
-                    // Multi-line args (pretty JSON) need separate Lines; a single
-                    // Line with embedded \n does not wrap as real newlines in ratatui.
-                    let arg = line.content.trim();
-                    if !arg.is_empty() {
-                        let shown = if arg.chars().count() > 240 {
-                            let head: String = arg.chars().take(240).collect();
-                            format!("{head}…")
-                        } else {
-                            arg.to_string()
-                        };
-                        for part in shown.split('\n') {
-                            lines.push(Line::from(vec![
-                                Span::styled(format!("  {part}"), dim),
-                            ]));
-                        }
-                    }
                 }
                 "tool_result" => {
                     let is_err = line.content.starts_with("Error:")
@@ -1947,27 +1947,33 @@ impl Tui {
                     } else {
                         format!(" ({})", line.duration)
                     };
+                    // Summary-first body. Agent still has the full tool payload.
+                    let kind = infer_tool_display_kind(&line.tool_name, &line.content);
+                    let display = compact_tool_result_display(kind, &line.content);
+                    let name = if line.tool_name == "tool" || line.tool_name.is_empty() {
+                        kind
+                    } else {
+                        line.tool_name.as_str()
+                    };
+                    let header = if display.lines().count() <= 1 && !display.is_empty() {
+                        // Fold single-line summaries onto the status row.
+                        format!("{name}{dur}  {display}")
+                    } else {
+                        format!("{name}{dur}")
+                    };
                     lines.push(Line::from(vec![
                         Span::styled("● ", color),
-                        Span::styled(format!("{}{dur}", line.tool_name), dim),
+                        Span::styled(header, dim),
                     ]));
-                    // Compact on-screen tool output. Agent still receives full results
-                    // via the tool channel; this only thins the transcript view.
-                    let display = match line.tool_name.as_str() {
-                        "file_read" => compact_file_read_display(&line.content),
-                        "glob" => truncate_display(&line.content, 18, 2),
-                        "grep" => truncate_display(&line.content, 12, 4),
-                        // Shell keeps more head+tail so test summaries / exit codes survive.
-                        "shell" => truncate_display(&line.content, 20, 12),
-                        _ => truncate_display(&line.content, 12, 6),
-                    };
-                    for part in display.split('\n') {
-                        if part.is_empty() {
-                            continue;
+                    if display.lines().count() > 1 {
+                        for part in display.split('\n') {
+                            if part.is_empty() {
+                                continue;
+                            }
+                            lines.push(Line::from(vec![
+                                Span::styled(format!("  {part}"), dim),
+                            ]));
                         }
-                        lines.push(Line::from(vec![
-                            Span::styled(format!("  {part}"), dim),
-                        ]));
                     }
                 }
                 "error" => {
@@ -3047,50 +3053,142 @@ fn truncate_display(s: &str, head_lines: usize, tail_lines: usize) -> String {
     out
 }
 
-/// Transcript view for `file_read`: prefer the tool's range footer, not the
-/// full body. The model still sees the complete numbered content.
-fn compact_file_read_display(content: &str) -> String {
-    let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
-    if lines.is_empty() {
+/// One-line arg preview for tool_use rows (avoid dumping pretty JSON).
+fn compact_tool_arg_hint(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
         return String::new();
     }
-    // Tool appends: `path:N (showing lines A-B of T)`
-    if let Some(summary) = lines.iter().rev().find(|l| l.contains("(showing lines")) {
-        let body_n = lines.iter().filter(|l| !l.contains("(showing lines")).count();
-        if body_n == 0 {
-            return (*summary).to_string();
-        }
-        // Tiny reads: show all. Larger: short peek + range footer.
-        const PEEK: usize = 3;
-        if body_n <= PEEK {
-            let mut out = String::new();
-            for l in &lines {
-                if *l == *summary {
-                    continue;
+    // Prefer a few common fields when the arg is a JSON object.
+    if let Ok(val) = crate::json::parse(trimmed) {
+        if let Some(obj) = val.as_object() {
+            for key in [
+                "pattern",
+                "file_path",
+                "path",
+                "command",
+                "query",
+                "url",
+                "old_string",
+                "args",
+            ] {
+                if let Some(v) = obj.get(key).and_then(|x| x.as_str()) {
+                    let v = v.replace('\n', " ");
+                    let shown: String = v.chars().take(64).collect();
+                    let ellipsis = if v.chars().count() > 64 { "…" } else { "" };
+                    return format!("{key}={shown}{ellipsis}");
                 }
-                out.push_str(l);
-                out.push('\n');
             }
-            out.push_str(summary);
-            return out;
         }
-        let body: Vec<&str> = lines
-            .iter()
-            .copied()
-            .filter(|l| !l.contains("(showing lines"))
-            .collect();
-        let mut out = String::new();
-        for l in body.iter().take(PEEK) {
-            out.push_str(l);
-            out.push('\n');
-        }
-        let omitted = body_n - PEEK;
-        out.push_str(&format!("… ({omitted} more lines) …\n"));
-        out.push_str(summary);
-        return out;
     }
-    // Fallback when the footer is missing (errors, older sessions).
-    truncate_display(content, 4, 2)
+    let one_line = trimmed.replace('\n', " ");
+    let shown: String = one_line.chars().take(72).collect();
+    if one_line.chars().count() > 72 {
+        format!("{shown}…")
+    } else {
+        shown
+    }
+}
+
+/// Resolve display kind from stored name, or sniff content when name was lost
+/// (older resumes used a generic `"tool"` label).
+fn infer_tool_display_kind<'a>(tool_name: &'a str, content: &str) -> &'a str {
+    if tool_name != "tool" && !tool_name.is_empty() {
+        return tool_name;
+    }
+    if content.contains("(showing lines") {
+        return "file_read";
+    }
+    if content.contains("result(s)") || content.contains(" more (") && content.contains(" total)") {
+        return "glob";
+    }
+    if content.contains("(exit code") {
+        return "shell";
+    }
+    if content.lines().take(5).any(|l| l.contains(':') && !l.starts_with('{'))
+        && content.lines().count() > 3
+        && !content.contains("(showing lines")
+    {
+        // Heuristic: path:line:text style matches.
+        if content.lines().take(8).filter(|l| l.matches(':').count() >= 2).count() >= 2 {
+            return "grep";
+        }
+    }
+    tool_name
+}
+
+/// Summary-first transcript body for a tool result. Full payload stays with the agent.
+fn compact_tool_result_display(kind: &str, content: &str) -> String {
+    let content = content.trim();
+    if content.is_empty() {
+        return String::new();
+    }
+    match kind {
+        "file_read" => {
+            if let Some(summary) = content
+                .lines()
+                .rev()
+                .find(|l| l.contains("(showing lines"))
+            {
+                return summary.to_string();
+            }
+            let n = content.lines().filter(|l| !l.trim().is_empty()).count();
+            format!("({n} lines read)")
+        }
+        "glob" => {
+            if content.contains("No matches") {
+                return "No matches found.".into();
+            }
+            if let Some(summary) = content.lines().rev().find(|l| {
+                let t = l.trim();
+                t.contains("result(s)") || t.contains(" total)") || t.starts_with('…')
+            }) {
+                // Pull a clean count when the summary is "… and N more (M total)"
+                // or "M result(s)".
+                let s = summary.trim();
+                if let Some(rest) = s.strip_suffix(" result(s)") {
+                    if rest.chars().all(|c| c.is_ascii_digit()) {
+                        return format!("{rest} matches");
+                    }
+                }
+                if let Some(i) = s.rfind('(') {
+                    if let Some(j) = s.rfind(" total)") {
+                        if j > i {
+                            let n = s[i + 1..j].trim();
+                            if n.chars().all(|c| c.is_ascii_digit()) {
+                                return format!("{n} matches");
+                            }
+                        }
+                    }
+                }
+                return s.to_string();
+            }
+            let n = content.lines().filter(|l| !l.trim().is_empty()).count();
+            format!("{n} matches")
+        }
+        "grep" => {
+            let hits: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+            if hits.is_empty() {
+                return "No matches.".into();
+            }
+            if hits.len() == 1 {
+                return hits[0].chars().take(100).collect();
+            }
+            format!("{} matches", hits.len())
+        }
+        // Keep a little shell context so test summaries / exit codes remain visible.
+        "shell" => truncate_display(content, 2, 3),
+        _ => {
+            let n = content.lines().filter(|l| !l.trim().is_empty()).count();
+            if n <= 2 {
+                return content.to_string();
+            }
+            // One-line summary for unknown tools.
+            let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+            let first: String = first.chars().take(80).collect();
+            format!("{first}… ({n} lines)")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3098,29 +3196,42 @@ mod tool_display_tests {
     use super::*;
 
     #[test]
-    fn compact_file_read_uses_footer_not_full_body() {
+    fn compact_file_read_is_summary_only() {
         let mut body = String::new();
         for i in 151..=188 {
             body.push_str(&format!("{i}:line {i}\n"));
         }
         body.push_str("\nREADME.md:151 (showing lines 151-188 of 188)");
-        let out = compact_file_read_display(&body);
-        assert!(out.contains("README.md:151 (showing lines 151-188 of 188)"), "{out}");
-        assert!(out.contains("151:line 151"), "{out}");
-        assert!(!out.contains("160:line 160"), "should not dump the middle: {out}");
-        assert!(out.contains("more lines"), "{out}");
-        // Far shorter than the raw tool payload.
-        assert!(out.lines().count() < 10, "got {} lines", out.lines().count());
+        let out = compact_tool_result_display("file_read", &body);
+        assert_eq!(out, "README.md:151 (showing lines 151-188 of 188)");
+        assert_eq!(out.lines().count(), 1);
     }
 
     #[test]
-    fn compact_file_read_keeps_short_bodies() {
-        let content = "1:a\n2:b\n\nfoo.txt:1 (showing lines 1-2 of 2)";
-        let out = compact_file_read_display(content);
-        assert!(out.contains("1:a"));
-        assert!(out.contains("2:b"));
-        assert!(out.contains("foo.txt:1"));
-        assert!(!out.contains("more lines"));
+    fn compact_glob_is_match_count() {
+        let mut body = String::new();
+        for i in 0..15 {
+            body.push_str(&format!("src/f{i}.rs\n"));
+        }
+        body.push_str("… and 24 more (39 total)");
+        let out = compact_tool_result_display("glob", &body);
+        assert_eq!(out, "39 matches");
+    }
+
+    #[test]
+    fn infer_kind_from_content_when_name_lost() {
+        let body = "1:x\n\nfoo.rs:1 (showing lines 1-1 of 10)";
+        assert_eq!(infer_tool_display_kind("tool", body), "file_read");
+        assert_eq!(
+            infer_tool_display_kind("tool", "a.rs\nb.rs\n2 result(s)"),
+            "glob"
+        );
+    }
+
+    #[test]
+    fn compact_tool_arg_hint_extracts_pattern() {
+        let h = compact_tool_arg_hint(r#"{"pattern":"src/**/*.rs"}"#);
+        assert!(h.contains("pattern=src/**/*.rs"), "{h}");
     }
 }
 
