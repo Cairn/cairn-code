@@ -13,11 +13,9 @@ pub struct ShellTool;
 impl Tool for ShellTool {
     fn name(&self) -> &str { "shell" }
     fn description(&self) -> &str {
-        "Execute a shell command. On Windows the command runs in PowerShell \
-         (-Command); on Unix it runs in bash (-c). Prefer PowerShell-native \
-         constructs on Windows (Select-Object -Last N instead of tail; \
-         Select-String instead of grep when possible). Always check the exit \
-         code footer in the result."
+        "Execute a shell command. On Windows this uses PowerShell (-Command); \
+         on Unix it uses bash (-c). For intentional PowerShell work on Windows, \
+         prefer the dedicated `powershell` tool. Always check the exit code footer."
     }
     fn needs_permission(&self) -> bool { true }
 
