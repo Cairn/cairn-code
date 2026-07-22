@@ -20,8 +20,8 @@ pub struct Config {
     /// When true, show grayed ready-to-send idle prompts in the empty composer.
     /// Default off; enable with `/suggestions on`.
     pub show_suggestions: bool,
-    /// When true, write request metadata (URL, header names, body size — never
-    /// header values, body content, or secrets) to
+    /// When true, write request metadata (sanitized URL, header names, body
+    /// size — never header values, body content, or secrets) to
     /// `~/.config/cairn-code/debug_request.json` for troubleshooting.
     /// Off by default (H-03); can also be enabled with `CAIRN_DEBUG_HTTP=1`.
     pub debug_log_requests: bool,

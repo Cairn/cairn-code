@@ -180,17 +180,22 @@ pub fn set_debug_logging_enabled(enabled: bool) {
 }
 
 fn debug_logging_enabled() -> bool {
-    if DEBUG_LOGGING_ENABLED.load(Ordering::Relaxed) {
-        return true;
-    }
-    matches!(
-        std::env::var("CAIRN_DEBUG_HTTP").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE")
+    let env_value = std::env::var("CAIRN_DEBUG_HTTP").ok();
+    debug_logging_enabled_for(
+        DEBUG_LOGGING_ENABLED.load(Ordering::Relaxed),
+        env_value.as_deref(),
     )
 }
 
-/// When explicitly enabled, records request *metadata* only — URL, header
-/// names (never values), and body size — to
+fn debug_logging_enabled_for(config_enabled: bool, env_value: Option<&str>) -> bool {
+    config_enabled
+        || env_value
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
+/// When explicitly enabled, records request *metadata* only — a URL with
+/// userinfo, query, and fragment removed, header names (never values), and body size — to
 /// `~/.config/cairn-code/debug_request.json`. Header values and body content
 /// (which can contain full prompts, source code, and credentials) are never
 /// written, so there is nothing here for heuristic redaction to miss. The
@@ -219,9 +224,34 @@ fn debug_dump_content(req: &HttpRequest) -> String {
     format!(
         "timestamp_ms: {}\nurl: {}\nheader_names: {}\nbody_bytes: {}\n",
         now_millis(),
-        req.url,
+        sanitize_debug_url(&req.url),
         header_names,
         body_bytes,
+    )
+}
+
+fn sanitize_debug_url(url: &str) -> String {
+    let metadata_end = url.find(|c| c == '?' || c == '#').unwrap_or(url.len());
+    let base = &url[..metadata_end];
+
+    let Some(scheme_end) = base.find("://") else {
+        return base.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = base[authority_start..]
+        .find('/')
+        .map(|offset| authority_start + offset)
+        .unwrap_or(base.len());
+    let authority = &base[authority_start..authority_end];
+    let Some(userinfo_end) = authority.rfind('@') else {
+        return base.to_string();
+    };
+
+    format!(
+        "{}{}{}",
+        &base[..authority_start],
+        &authority[userinfo_end + 1..],
+        &base[authority_end..],
     )
 }
 
@@ -666,26 +696,20 @@ mod tests {
     /// `CAIRN_DEBUG_HTTP` escape hatch.
     #[test]
     fn debug_logging_disabled_by_default() {
-        set_debug_logging_enabled(false);
-        std::env::remove_var("CAIRN_DEBUG_HTTP");
-        assert!(!debug_logging_enabled());
+        assert!(!debug_logging_enabled_for(false, None));
     }
 
     #[test]
     fn debug_logging_enabled_via_config_flag() {
-        set_debug_logging_enabled(true);
-        assert!(debug_logging_enabled());
-        set_debug_logging_enabled(false);
-        assert!(!debug_logging_enabled());
+        assert!(debug_logging_enabled_for(true, None));
     }
 
     #[test]
     fn debug_logging_enabled_via_env_var() {
-        set_debug_logging_enabled(false);
-        std::env::set_var("CAIRN_DEBUG_HTTP", "1");
-        assert!(debug_logging_enabled());
-        std::env::remove_var("CAIRN_DEBUG_HTTP");
-        assert!(!debug_logging_enabled());
+        assert!(debug_logging_enabled_for(false, Some("1")));
+        assert!(debug_logging_enabled_for(false, Some("TRUE")));
+        assert!(debug_logging_enabled_for(false, Some("True")));
+        assert!(!debug_logging_enabled_for(false, Some("0")));
     }
 
     /// H-03: even when logging is enabled, the dump must never contain
@@ -694,7 +718,7 @@ mod tests {
     #[test]
     fn debug_dump_never_contains_header_values_or_body() {
         let req = HttpRequest {
-            url: "https://api.example.com/v1/messages".into(),
+            url: "https://user:secret-url-password@api.example.com/v1/messages?api_key=secret-query#secret-fragment".into(),
             headers: vec![
                 ("Authorization".into(), "Bearer sk-ant-supersecretvalue123456".into()),
                 ("Content-Type".into(), "application/json".into()),
@@ -704,12 +728,25 @@ mod tests {
         let dump = debug_dump_content(&req);
 
         assert!(dump.contains("api.example.com"), "{dump}");
+        assert!(dump.contains("/v1/messages"), "{dump}");
+        assert!(!dump.contains("secret-url-password"), "leaked URL userinfo: {dump}");
+        assert!(!dump.contains("secret-query"), "leaked URL query: {dump}");
+        assert!(!dump.contains("secret-fragment"), "leaked URL fragment: {dump}");
         assert!(dump.contains("Authorization"), "header *names* are metadata: {dump}");
         assert!(dump.contains("Content-Type"), "{dump}");
         assert!(!dump.contains("sk-ant-supersecretvalue123456"), "leaked header value: {dump}");
         assert!(!dump.contains("sk-supersecret"), "leaked body secret: {dump}");
         assert!(!dump.contains("delete all my files"), "leaked prompt content: {dump}");
         assert!(dump.contains("body_bytes"), "{dump}");
+    }
+
+    #[test]
+    fn sanitize_debug_url_handles_urls_without_credentials() {
+        assert_eq!(
+            sanitize_debug_url("https://api.example.com/v1/messages?debug=true#response"),
+            "https://api.example.com/v1/messages"
+        );
+        assert_eq!(sanitize_debug_url("not-a-url?secret=value"), "not-a-url");
     }
 
     #[test]

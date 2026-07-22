@@ -182,7 +182,7 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | `permissions.auto_allow` | []string | `[]` | Tools to auto-approve |
 | `permissions.ask` | []string | `[]` | Tools that require confirmation |
 | `permissions.deny` | []string | `[]` | Tools to block |
-| `debug_log_requests` | bool | `false` | Write provider request *metadata* (URL, header names, body size — never header values, body content, or secrets) to `~/.config/cairn-code/debug_request.json` for troubleshooting. Also toggled with `CAIRN_DEBUG_HTTP=1`. The file is overwritten (never appended) on every request and, on Unix, created with owner-only (`0600`) permissions. |
+| `debug_log_requests` | bool | `false` | Write provider request *metadata* (URL with userinfo/query/fragment removed, header names, body size — never header values, body content, or secrets) to `~/.config/cairn-code/debug_request.json` for troubleshooting. Also toggled with `CAIRN_DEBUG_HTTP=1`. The file is overwritten (never appended) on every request and, on Unix, created with owner-only (`0600`) permissions. |
 
 ## License
 
