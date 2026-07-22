@@ -95,7 +95,7 @@ impl Provider for OllamaProvider {
             body: Some(body),
         };
         let resp = http_client::request(&req)?;
-        parse_ollama_response(&resp.body)
+        parse_ollama_complete_response(&resp.body)
     }
 }
 
@@ -161,6 +161,7 @@ fn parse_ollama_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
     let mut messages = Vec::new();
     let mut usage = Usage::default();
     let mut collected = String::new();
+    let mut tool_calls: std::collections::HashMap<u64, (String, String, String)> = std::collections::HashMap::new();
     for line in raw.lines() {
         if let Some(data) = line.strip_prefix("data: ") {
             if data == "[DONE]" { continue; }
@@ -170,6 +171,23 @@ fn parse_ollama_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
                         if let Some(delta) = choice.get("delta") {
                             if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
                                 collected.push_str(text);
+                            }
+                            if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                for tc in tc_arr {
+                                    let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let entry = tool_calls.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
+                                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                        if !id.is_empty() { entry.0 = id.to_string(); }
+                                    }
+                                    if let Some(func) = tc.get("function") {
+                                        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                            if !name.is_empty() { entry.1 = name.to_string(); }
+                                        }
+                                        if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                            entry.2.push_str(args);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -181,8 +199,128 @@ fn parse_ollama_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
             }
         }
     }
-    if !collected.is_empty() {
-        messages.push(Message { role: "assistant".into(), content: Content::Text(collected) });
+    if !collected.is_empty() || !tool_calls.is_empty() {
+        let content = if !collected.is_empty() {
+            Content::Text(collected)
+        } else {
+            let mut calls: Vec<_> = tool_calls.into_iter().collect();
+            calls.sort_by_key(|(idx, _)| *idx);
+            let tu = calls.into_iter().next().map(|(_, (id, name, args))| {
+                super::provider::ToolUse { id, name, input: args }
+            }).unwrap_or(super::provider::ToolUse {
+                id: String::new(), name: String::new(), input: "{}".into(),
+            });
+            Content::ToolUse(tu)
+        };
+        messages.push(Message { role: "assistant".into(), content });
     }
     Ok((messages, usage))
+}
+
+fn parse_ollama_complete_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
+    let mut messages = Vec::new();
+    let mut usage = Usage::default();
+
+    let val = json::parse(raw).map_err(|e| format!("Failed to parse response: {e}"))?;
+
+    if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
+        if let Some(choice) = choices.first() {
+            if let Some(msg) = choice.get("message") {
+                let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("assistant").to_string();
+                let content = if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
+                    Content::Text(text.to_string())
+                } else if let Some(tc_arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                    let mut calls: Vec<_> = tc_arr.iter().enumerate().collect();
+                    calls.sort_by_key(|(i, _)| *i);
+                    let tu = calls.into_iter().next().map(|(_, tc)| {
+                        let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let name = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let args = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}").to_string();
+                        super::provider::ToolUse { id, name, input: args }
+                    }).unwrap_or(super::provider::ToolUse {
+                        id: String::new(), name: String::new(), input: "{}".into(),
+                    });
+                    Content::ToolUse(tu)
+                } else {
+                    Content::Text(String::new())
+                };
+                messages.push(Message { role, content });
+            }
+        }
+    }
+    if let Some(u) = val.get("usage") {
+        usage.input_tokens = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        usage.output_tokens = u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    }
+    Ok((messages, usage))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_provider_name_and_default_model() {
+        let p = OllamaProvider::new();
+        assert_eq!(p.name(), "ollama");
+        assert_eq!(p.default_model(), "llama3.2");
+    }
+
+    #[test]
+    fn test_parse_complete_response_collects_text() {
+        let raw = r#"{"choices":[{"message":{"role":"assistant","content":"pong"}}],"usage":{"prompt_tokens":10,"completion_tokens":1}}"#;
+        let (msgs, usage) = parse_ollama_complete_response(raw).unwrap();
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0].content {
+            Content::Text(t) => assert_eq!(t, "pong"),
+            _ => panic!("expected Text content"),
+        }
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 1);
+    }
+
+    #[test]
+    fn test_parse_complete_response_tool_call() {
+        let raw = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","function":{"name":"glob","arguments":"{\"pattern\":\"*.rs\"}"}}]}}]}"#;
+        let (msgs, _usage) = parse_ollama_complete_response(raw).unwrap();
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0].content {
+            Content::ToolUse(tu) => {
+                assert_eq!(tu.id, "call_1");
+                assert_eq!(tu.name, "glob");
+            }
+            _ => panic!("expected ToolUse content"),
+        }
+    }
+
+    #[test]
+    fn test_parse_response_streaming_text() {
+        let raw = "data: {\"choices\":[{\"delta\":{\"content\":\"hello \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"world\"}}]}\n\ndata: [DONE]\n";
+        let (msgs, _usage) = parse_ollama_response(raw).unwrap();
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0].content {
+            Content::Text(t) => assert_eq!(t, "hello world"),
+            _ => panic!("expected Text content"),
+        }
+    }
+
+    #[test]
+    fn test_parse_response_streaming_tool_call() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"glob\",\"arguments\":\"\"}}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"pattern\\\":\"}}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"*.rs\\\"}\"}}]}}]}\n",
+            "data: [DONE]\n",
+        );
+        let (msgs, _usage) = parse_ollama_response(raw).unwrap();
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0].content {
+            Content::ToolUse(tu) => {
+                assert_eq!(tu.id, "call_1");
+                assert_eq!(tu.name, "glob");
+                assert_eq!(tu.input, r#"{"pattern":"*.rs"}"#);
+            }
+            _ => panic!("expected ToolUse content"),
+        }
+    }
 }
