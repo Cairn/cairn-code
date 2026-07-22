@@ -7,13 +7,14 @@ use ratatui::{
     Frame,
     layout::Position,
     widgets::{Paragraph, Wrap},
-    style::{Style, Color, Modifier},
+    style::Modifier,
     text::{Span, Line, Text},
 };
 
 use crate::llm;
 use crate::session;
 use crate::agent::AgentEvent;
+use crate::theme::{self, Theme};
 
 pub struct OutputLine {
     pub type_: String,
@@ -82,6 +83,12 @@ pub struct Tui {
     /// After an LLM/provider failure: offer Switch model / Switch provider / Dismiss.
     show_recovery_prompt: bool,
     recovery_selection: usize,
+    theme: Theme,
+    show_theme_picker: bool,
+    theme_picker_list: Vec<Theme>,
+    theme_picker_sel: usize,
+    /// Theme name before opening the picker (restored on Esc).
+    theme_before_picker: Option<String>,
 }
 
 impl Tui {
@@ -118,7 +125,7 @@ impl Tui {
             cmd_picker_list: vec![
                 "/clear".into(), "/compact".into(), "/cost".into(), "/delete".into(), "/exit".into(),
                 "/help".into(), "/model".into(), "/provider".into(), "/quit".into(), "/q".into(),
-                "/resume".into(), "/save".into(), "/sessions".into(),
+                "/resume".into(), "/save".into(), "/sessions".into(), "/theme".into(),
             ],
             cmd_picker_filtered: Vec::new(),
             cmd_picker_sel: 0,
@@ -137,7 +144,20 @@ impl Tui {
             perm_selection: 0,
             show_recovery_prompt: false,
             recovery_selection: 0,
+            theme: theme::default_theme(),
+            show_theme_picker: false,
+            theme_picker_list: theme::all_themes(),
+            theme_picker_sel: 0,
+            theme_before_picker: None,
         }
+    }
+
+    pub fn set_theme_name(&mut self, name: &str) {
+        self.theme = theme::lookup(name);
+        self.theme_picker_list = theme::all_themes();
+        self.theme_picker_sel = self.theme_picker_list.iter()
+            .position(|t| t.name == self.theme.name)
+            .unwrap_or(0);
     }
 
     pub fn set_agent_tx(&mut self, tx: mpsc::Sender<String>) {
@@ -400,6 +420,13 @@ impl Tui {
                     if self.picker_session_sel > 0 { self.picker_session_sel -= 1; }
                     return true;
                 }
+                if self.show_theme_picker {
+                    if self.theme_picker_sel > 0 {
+                        self.theme_picker_sel -= 1;
+                        self.theme = self.theme_picker_list[self.theme_picker_sel].clone();
+                    }
+                    return true;
+                }
                 if self.show_command_picker {
                     if self.cmd_picker_sel > 0 { self.cmd_picker_sel -= 1; }
                     return true;
@@ -422,6 +449,13 @@ impl Tui {
             KeyCode::Down => {
                 if self.show_session_picker {
                     if self.picker_session_sel + 1 < self.picker_sessions.len() { self.picker_session_sel += 1; }
+                    return true;
+                }
+                if self.show_theme_picker {
+                    if self.theme_picker_sel + 1 < self.theme_picker_list.len() {
+                        self.theme_picker_sel += 1;
+                        self.theme = self.theme_picker_list[self.theme_picker_sel].clone();
+                    }
                     return true;
                 }
                 if self.show_command_picker {
@@ -480,6 +514,12 @@ impl Tui {
                 else if self.show_session_picker {
                     self.show_session_picker = false;
                     self.session_picker_delete = false;
+                }
+                else if self.show_theme_picker {
+                    self.show_theme_picker = false;
+                    if let Some(prev) = self.theme_before_picker.take() {
+                        self.theme = theme::lookup(&prev);
+                    }
                 }
                 else if matches!(self.state, State::Running) {
                     if let Some(flag) = &self.cancel_flag {
@@ -585,6 +625,24 @@ impl Tui {
                         self.show_session_picker = false;
                         self.session_picker_delete = false;
                     }
+                    return true;
+                }
+
+                if self.show_theme_picker {
+                    if self.theme_picker_sel < self.theme_picker_list.len() {
+                        self.theme = self.theme_picker_list[self.theme_picker_sel].clone();
+                        let name = self.theme.name.to_string();
+                        let label = self.theme.label.to_string();
+                        let _ = crate::config::save_theme(&name);
+                        self.output_lines.push(OutputLine {
+                            type_: "system".into(),
+                            content: format!("Theme set to: {label} ({name})"),
+                            tool_name: String::new(),
+                            duration: String::new(),
+                        });
+                    }
+                    self.show_theme_picker = false;
+                    self.theme_before_picker = None;
                     return true;
                 }
 
@@ -721,9 +779,35 @@ impl Tui {
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)".into(),
+                    content: "Commands: /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions /theme\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
+            }
+            "/theme" => {
+                if parts.get(1) == Some(&"list") {
+                    let names = theme::theme_names().join(", ");
+                    self.output_lines.push(OutputLine {
+                        type_: "system".into(),
+                        content: format!("Active theme: {}\nThemes: {names}", self.theme.name),
+                        tool_name: String::new(),
+                        duration: String::new(),
+                    });
+                } else if parts.len() > 1 {
+                    let name = parts[1..].join("-");
+                    let t = theme::lookup(&name);
+                    let applied = t.name.to_string();
+                    let label = t.label.to_string();
+                    self.theme = t;
+                    let _ = crate::config::save_theme(&applied);
+                    self.output_lines.push(OutputLine {
+                        type_: "system".into(),
+                        content: format!("Theme set to: {label} ({applied})"),
+                        tool_name: String::new(),
+                        duration: String::new(),
+                    });
+                } else {
+                    self.open_theme_picker();
+                }
             }
             "/compact" => {
                 if !matches!(self.state, State::Idle) {
@@ -829,6 +913,19 @@ impl Tui {
         self.provider_picker_list = names;
         self.provider_picker_sel = 0;
         self.show_provider_picker = true;
+    }
+
+    fn open_theme_picker(&mut self) {
+        self.theme_before_picker = Some(self.theme.name.to_string());
+        self.theme_picker_list = theme::all_themes();
+        self.theme_picker_sel = self.theme_picker_list.iter()
+            .position(|t| t.name == self.theme.name)
+            .unwrap_or(0);
+        // Live-preview current selection immediately
+        if let Some(t) = self.theme_picker_list.get(self.theme_picker_sel) {
+            self.theme = t.clone();
+        }
+        self.show_theme_picker = true;
     }
 
     fn save_session(&mut self) {
@@ -979,14 +1076,15 @@ impl Tui {
 
     fn render(&self, f: &mut Frame) {
         let area = f.area();
-        let dim = Style::new().fg(Color::Indexed(245));
-        let bright = Style::new().fg(Color::Indexed(215)).add_modifier(Modifier::BOLD);
-        let bold_dim = Style::new().fg(Color::Indexed(240));
-        let orange = Style::new().fg(Color::Indexed(215)).add_modifier(Modifier::BOLD);
-        let white = Style::new().fg(Color::Indexed(252));
-        let red = Style::new().fg(Color::Indexed(196));
-        let green = Style::new().fg(Color::Indexed(78));
-        let orange_fg = Style::new().fg(Color::Indexed(215));
+        let dim = self.theme.muted;
+        let bright = self.theme.accent;
+        let bold_dim = self.theme.faintest;
+        let orange = self.theme.accent;
+        let white = self.theme.ink;
+        let red = self.theme.red;
+        let green = self.theme.green;
+        let orange_fg = self.theme.accent_fg;
+        let selected = self.theme.selected;
 
         let mut lines: Vec<Line> = Vec::new();
 
@@ -1091,7 +1189,6 @@ impl Tui {
         // Prompt or pickers
         let mut cursor_pos: Option<(u16, usize)> = None;
         if self.show_command_picker {
-            let bg_orange = Style::new().bg(Color::Indexed(215)).fg(Color::Indexed(230));
             let cursor = self.cursor.min(self.input_buf.len());
             let (before, after) = self.input_buf.split_at(cursor);
             lines.push(Line::from(vec![
@@ -1104,7 +1201,7 @@ impl Tui {
                 let is_sel = i == self.cmd_picker_sel;
                 let prefix = if is_sel { "▸ " } else { "  " };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{prefix}{cmd}"), if is_sel { bg_orange } else { dim }),
+                    Span::styled(format!("{prefix}{cmd}"), if is_sel { selected } else { dim }),
                 ]));
             }
         } else if let Some(name) = &self.confirm_remove_provider {
@@ -1132,10 +1229,8 @@ impl Tui {
                 Span::styled("(← → navigate  Enter confirm  Esc cancel)", dim),
             ]));
         } else if self.show_provider_picker {
-            let bg_orange = Style::new().bg(Color::Indexed(215)).fg(Color::Indexed(230));
-
             lines.push(Line::from(vec![
-                Span::styled("── Provider ", orange_fg.add_modifier(Modifier::BOLD)),
+                Span::styled("── Provider ", orange),
                 Span::styled("(↑↓ navigate  Enter select  Del remove key  Esc cancel) ──", bold_dim),
             ]));
             for (i, name) in self.provider_picker_list.iter().enumerate() {
@@ -1145,18 +1240,16 @@ impl Tui {
                 let key_mark = if self.provider_picker_keys.get(i).copied().unwrap_or(false) { "  [key saved]" } else { "" };
                 let prefix = if is_sel { "▸ " } else { "  " };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{prefix}{name}{key_mark}{cur_mark}"), if is_sel { bg_orange } else { dim }),
+                    Span::styled(format!("{prefix}{name}{key_mark}{cur_mark}"), if is_sel { selected } else { dim }),
                 ]));
             }
         } else if self.show_model_picker {
             let visible = self.picker_visible_height();
             let end = (self.picker_scrl + visible).min(self.picker_models.len());
             let num = self.picker_models.len();
-            let bg_orange = Style::new().bg(Color::Indexed(215)).fg(Color::Indexed(230));
-            let bold_dim = Style::new().fg(Color::Indexed(240));
 
             lines.push(Line::from(vec![
-                Span::styled("── Model ", orange_fg.add_modifier(Modifier::BOLD)),
+                Span::styled("── Model ", orange),
                 Span::styled("(↑↓ navigate  Enter select  Esc cancel) ──", bold_dim),
             ]));
             if num > visible {
@@ -1170,14 +1263,27 @@ impl Tui {
                 let check = if is_cur { "  ✓" } else { "" };
                 let prefix = if is_sel { "▸ " } else { "  " };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{prefix}{}  {}{ctx}{check}", m.name, m.id), if is_sel { bg_orange } else { dim }),
+                    Span::styled(format!("{prefix}{}  {}{ctx}{check}", m.name, m.id), if is_sel { selected } else { dim }),
+                ]));
+            }
+        } else if self.show_theme_picker {
+            lines.push(Line::from(vec![
+                Span::styled("── Theme ", orange),
+                Span::styled("(↑↓ live-preview  Enter apply  Esc cancel) ──", bold_dim),
+            ]));
+            for (i, t) in self.theme_picker_list.iter().enumerate() {
+                let is_sel = i == self.theme_picker_sel;
+                let is_cur = t.name == self.theme.name;
+                let cur_mark = if is_cur { "  ✓" } else { "" };
+                let prefix = if is_sel { "▸ " } else { "  " };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{prefix}{} ({}){cur_mark}", t.label, t.name), if is_sel { selected } else { dim }),
                 ]));
             }
         } else if self.show_session_picker {
             let visible = 10usize;
             let end = (self.picker_session_scrl + visible).min(self.picker_sessions.len());
             let num = self.picker_sessions.len();
-            let bg_orange = Style::new().bg(Color::Indexed(215)).fg(Color::Indexed(230));
 
             let title = if self.session_picker_delete {
                 "── Delete Session "
@@ -1190,7 +1296,7 @@ impl Tui {
                 "(↑↓ navigate  Enter select  Esc cancel) ──"
             };
             lines.push(Line::from(vec![
-                Span::styled(title, orange_fg.add_modifier(Modifier::BOLD)),
+                Span::styled(title, orange),
                 Span::styled(hint, bold_dim),
             ]));
             if num > visible {
@@ -1207,11 +1313,11 @@ impl Tui {
                 };
                 let time_str = format_timestamp(s.updated_at);
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{prefix}{}  {}  {} msgs  {time_str}", &s.id[..8], s.model, s.msg_count), if is_sel { bg_orange } else { dim }),
+                    Span::styled(format!("{prefix}{}  {}  {} msgs  {time_str}", &s.id[..8], s.model, s.msg_count), if is_sel { selected } else { dim }),
                 ]));
                 if !summary.is_empty() && is_sel {
                     lines.push(Line::from(vec![
-                        Span::styled(format!("   {summary}"), if is_sel { bg_orange } else { dim }),
+                        Span::styled(format!("   {summary}"), if is_sel { selected } else { dim }),
                     ]));
                 }
             }

@@ -12,6 +12,8 @@ pub struct Config {
     pub ask: Vec<String>,
     pub deny: Vec<String>,
     pub api_keys: HashMap<String, String>,
+    /// TUI color theme name (dark themes only). Default: "dark".
+    pub theme: String,
 }
 
 impl Default for Config {
@@ -26,6 +28,7 @@ impl Default for Config {
             ask: vec!["file_write".into(), "shell".into(), "file_edit".into()],
             deny: Vec::new(),
             api_keys: HashMap::new(),
+            theme: "dark".to_string(),
         }
     }
 }
@@ -188,6 +191,25 @@ pub fn save_config(provider: &str, model: &str, api_key: Option<&str>) -> Result
     std::fs::write(&path, &output).map_err(|e| e.to_string())
 }
 
+/// Persist only the TUI theme preference, leaving other config keys intact.
+pub fn save_theme(theme: &str) -> Result<(), String> {
+    use crate::json::JsonValue;
+    let path = config_path();
+    let mut obj: std::collections::HashMap<String, JsonValue> = if path.exists() {
+        let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        crate::json::parse(&content).map_err(|e| e.to_string())?.as_object().cloned().unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
+    obj.insert("theme".into(), JsonValue::String(theme.into()));
+    obj.remove("api_keys");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let output = crate::json::serialize(&JsonValue::Object(obj));
+    std::fs::write(&path, &output).map_err(|e| e.to_string())
+}
+
 pub fn save_full_config(cfg: &Config) -> Result<(), String> {
     use crate::json::JsonValue;
     let path = config_path();
@@ -200,6 +222,7 @@ pub fn save_full_config(cfg: &Config) -> Result<(), String> {
 
     obj.insert("default_provider".into(), JsonValue::String(cfg.default_provider.clone()));
     obj.insert("default_model".into(), JsonValue::String(cfg.default_model.clone()));
+    obj.insert("theme".into(), JsonValue::String(cfg.theme.clone()));
 
     let perms = JsonValue::Object(std::collections::HashMap::from([
         ("auto_allow".into(), JsonValue::Array(cfg.auto_allow.iter().map(|s| JsonValue::String(s.clone())).collect())),
@@ -251,6 +274,9 @@ fn parse_config(content: &str) -> Result<Config, String> {
     }
     if let Some(v) = obj.get("system_prompt_file").and_then(|v| v.as_str()) {
         cfg.system_prompt_file = v.to_string();
+    }
+    if let Some(v) = obj.get("theme").and_then(|v| v.as_str()) {
+        cfg.theme = v.to_string();
     }
 
     if let Some(perms) = obj.get("permissions").and_then(|v| v.as_object()) {

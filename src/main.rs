@@ -9,6 +9,7 @@ mod tools;
 mod tui;
 mod markdown;
 mod redact;
+mod theme;
 
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,6 +79,7 @@ fn main() {
 
     let p_model_for_agent = p_model.clone();
     let p_model_for_print = p_model.clone();
+    let theme_name = cfg.theme.clone();
 
     thread::spawn(move || {
         let mut agent = Agent::new(chosen_provider, p_model_for_agent, tool_registry, cfg);
@@ -132,6 +134,7 @@ fn main() {
     }
 
     let mut tui = tui::Tui::new(version, &p_model_for_print, &provider_name_str, &work_dir);
+    tui.set_theme_name(&theme_name);
     tui.set_agent_tx(cmd_tx.clone());
     tui.set_perm_tx(perm_tx);
     tui.set_cancel_flag(cancel);

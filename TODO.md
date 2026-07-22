@@ -21,7 +21,7 @@
 
 ## Priority: Low
 - [ ] Add plugin/extension system — custom tools via Lua or WASM
-- [ ] TUI theme customization — colors, styles, layout preferences
+- [x] TUI theme customization — dark themes from zero + fixed dark Dune; `/theme` picker
 - [ ] Add completions/suggestions for commands
 - [ ] Performance optimization — reduce memory allocations in hot paths
 - [ ] Add benchmark tests for streaming throughput
