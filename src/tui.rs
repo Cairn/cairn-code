@@ -693,12 +693,14 @@ impl Tui {
                 true
             }
             KeyCode::Tab => {
+                // Slash-command completion: apply selected (or sole) match and
+                // keep the picker open for the next argument when needed.
+                if self.input_buf.starts_with('/') {
+                    self.update_cmd_picker();
+                }
                 if self.show_command_picker && !self.cmd_picker_filtered.is_empty() {
-                    let cmd = &self.cmd_picker_filtered[self.cmd_picker_sel];
-                    self.input_buf = cmd.clone();
-                    self.cursor = cmd.len();
-                    self.show_command_picker = false;
-                    self.cmd_picker_filtered.clear();
+                    let cmd = self.cmd_picker_filtered[self.cmd_picker_sel].clone();
+                    self.apply_slash_completion(&cmd);
                 }
                 true
             }
@@ -978,12 +980,51 @@ impl Tui {
                 });
             }
             "/provider" => {
-                self.open_provider_picker();
+                if parts.len() > 1 {
+                    let name = parts[1].to_ascii_lowercase();
+                    let providers = crate::llm::default_providers();
+                    if let Some(p) = providers.get(&name) {
+                        self.provider = name.clone();
+                        self.model = p.default_model().to_string();
+                        let _ = crate::config::save_config(&self.provider, &self.model, None);
+                        if crate::config::needs_credential(&name) {
+                            self.pending_model_after_auth = true;
+                            if crate::oauth::supports_oauth(&name) {
+                                self.begin_oauth_login(&name, true);
+                            } else {
+                                self.begin_api_key_prompt(&name);
+                            }
+                        } else {
+                            self.output_lines.push(OutputLine {
+                                type_: "system".into(),
+                                content: format!(
+                                    "Provider set to: {}\nModel set to: {}",
+                                    self.provider, self.model
+                                ),
+                                tool_name: String::new(),
+                                duration: String::new(),
+                            });
+                            if let Some(tx) = &self.agent_tx {
+                                let _ = tx.send(format!("__switch__:{}:{}", self.provider, self.model));
+                            }
+                            self.open_model_picker();
+                        }
+                    } else {
+                        self.output_lines.push(OutputLine {
+                            type_: "system".into(),
+                            content: format!("Unknown provider '{name}'. Use /provider to pick from the list."),
+                            tool_name: String::new(),
+                            duration: String::new(),
+                        });
+                    }
+                } else {
+                    self.open_provider_picker();
+                }
             }
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /auth /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions /theme\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)\nScroll: mouse wheel · PgUp/PgDn · Ctrl+U/D (half page) · Ctrl+Home/End\n/provider xai — browser OAuth; /auth login xai; /auth key xai for API key".into(),
+                    content: "Commands: /auth /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions /theme\nTab completes slash commands (auth, model, theme, provider, session ids)\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)\nScroll: mouse wheel · PgUp/PgDn · Ctrl+U/D (half page) · Ctrl+Home/End\n/provider xai — browser OAuth; /auth login xai; /auth key xai for API key".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
             }
@@ -2198,20 +2239,277 @@ impl Tui {
     }
 
     fn update_cmd_picker(&mut self) {
-        if self.input_buf.starts_with('/') && !self.input_buf.is_empty() {
-            let filter = self.input_buf[1..].to_lowercase();
-            self.cmd_picker_filtered = self.cmd_picker_list.iter()
-                .filter(|c| c[1..].to_lowercase().starts_with(&filter))
-                .cloned()
-                .collect();
-            if self.cmd_picker_sel >= self.cmd_picker_filtered.len() {
-                self.cmd_picker_sel = self.cmd_picker_filtered.len().saturating_sub(1);
-            }
-            self.show_command_picker = !self.cmd_picker_filtered.is_empty();
-        } else {
+        if self.awaiting_api_key || !self.input_buf.starts_with('/') {
             self.show_command_picker = false;
             self.cmd_picker_filtered.clear();
+            return;
         }
+
+        let models: Vec<String> = {
+            let providers = crate::llm::default_providers();
+            providers
+                .get(&self.provider)
+                .map(|p| p.available_models().into_iter().map(|m| m.id).collect())
+                .unwrap_or_default()
+        };
+        let mut provider_names: Vec<String> = crate::llm::default_providers().into_keys().collect();
+        provider_names.sort();
+        let themes: Vec<String> = theme::theme_names().iter().map(|s| (*s).to_string()).collect();
+        let sessions: Vec<String> = session::list(&self.sessions_dir())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| {
+                if s.id.len() >= 8 {
+                    s.id[..8].to_string()
+                } else {
+                    s.id
+                }
+            })
+            .collect();
+
+        self.cmd_picker_filtered = slash_completions(
+            &self.input_buf,
+            &self.cmd_picker_list,
+            &models,
+            &provider_names,
+            &themes,
+            &sessions,
+        );
+        if self.cmd_picker_sel >= self.cmd_picker_filtered.len() {
+            self.cmd_picker_sel = self.cmd_picker_filtered.len().saturating_sub(1);
+        }
+        self.show_command_picker = !self.cmd_picker_filtered.is_empty();
+    }
+
+    /// Insert a completion into the composer. Adds a trailing space when more
+    /// arguments are expected so the next Tab level can open immediately.
+    fn apply_slash_completion(&mut self, completion: &str) {
+        let text = if completion_wants_trailing_space(completion) {
+            format!("{completion} ")
+        } else {
+            completion.to_string()
+        };
+        self.input_buf = text;
+        self.cursor = self.input_buf.len();
+        self.update_cmd_picker();
+    }
+}
+
+/// Commands that still need another argument after Tab.
+fn completion_wants_trailing_space(completion: &str) -> bool {
+    let c = completion.trim_end();
+    matches!(
+        c,
+        "/auth"
+            | "/auth login"
+            | "/auth logout"
+            | "/auth key"
+            | "/theme"
+            | "/model"
+            | "/provider"
+            | "/resume"
+            | "/delete"
+    )
+}
+
+/// Contextual slash-command completions for the composer.
+///
+/// Supports base commands, `/auth` subcommands + providers, `/theme` names,
+/// `/model` ids for the active provider, `/provider` names, and short session
+/// ids for `/resume` / `/delete`.
+pub(crate) fn slash_completions(
+    input: &str,
+    base_commands: &[String],
+    models: &[String],
+    providers: &[String],
+    themes: &[String],
+    session_ids: &[String],
+) -> Vec<String> {
+    if !input.starts_with('/') {
+        return Vec::new();
+    }
+    let ends_with_space = input.ends_with(' ') || input.ends_with('\t');
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    if parts.is_empty() {
+        return base_commands.to_vec();
+    }
+
+    let cmd = parts[0].to_ascii_lowercase();
+
+    // Still typing the root command: `/mo` → `/model`
+    if parts.len() == 1 && !ends_with_space {
+        return base_commands
+            .iter()
+            .filter(|c| c.to_ascii_lowercase().starts_with(&cmd))
+            .cloned()
+            .collect();
+    }
+
+    let prefix_match = |candidates: &[String], typed: &str, format: &dyn Fn(&str) -> String| {
+        let typed = typed.to_ascii_lowercase();
+        let mut out: Vec<String> = candidates
+            .iter()
+            .filter(|c| c.to_ascii_lowercase().starts_with(&typed))
+            .map(|c| format(c))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    };
+
+    match cmd.as_str() {
+        "/auth" => {
+            let subs = ["login", "logout", "status", "key"];
+            if parts.len() == 1 && ends_with_space {
+                return subs.iter().map(|s| format!("/auth {s}")).collect();
+            }
+            if parts.len() == 2 && !ends_with_space {
+                let p = parts[1].to_ascii_lowercase();
+                return subs
+                    .iter()
+                    .filter(|s| s.starts_with(&p))
+                    .map(|s| format!("/auth {s}"))
+                    .collect();
+            }
+            if parts.len() >= 2 {
+                let action = parts[1].to_ascii_lowercase();
+                if matches!(action.as_str(), "login" | "logout" | "key") {
+                    if parts.len() == 2 && ends_with_space {
+                        return providers
+                            .iter()
+                            .map(|p| format!("/auth {action} {p}"))
+                            .collect();
+                    }
+                    if parts.len() == 3 && !ends_with_space {
+                        return prefix_match(providers, parts[2], &|p| {
+                            format!("/auth {action} {p}")
+                        });
+                    }
+                }
+            }
+            Vec::new()
+        }
+        "/theme" => {
+            if parts.len() == 1 && ends_with_space {
+                let mut v: Vec<String> = themes.iter().map(|t| format!("/theme {t}")).collect();
+                v.insert(0, "/theme list".into());
+                return v;
+            }
+            if parts.len() == 2 && !ends_with_space {
+                let mut v = prefix_match(themes, parts[1], &|t| format!("/theme {t}"));
+                if "list".starts_with(&parts[1].to_ascii_lowercase()) {
+                    v.insert(0, "/theme list".into());
+                }
+                v.dedup();
+                return v;
+            }
+            Vec::new()
+        }
+        "/model" => {
+            if parts.len() == 1 && ends_with_space {
+                return models.iter().map(|m| format!("/model {m}")).collect();
+            }
+            if parts.len() >= 2 && !ends_with_space {
+                let typed = parts[1..].join(" ");
+                return prefix_match(models, &typed, &|m| format!("/model {m}"));
+            }
+            Vec::new()
+        }
+        "/provider" => {
+            if parts.len() == 1 && ends_with_space {
+                return providers.iter().map(|p| format!("/provider {p}")).collect();
+            }
+            if parts.len() == 2 && !ends_with_space {
+                return prefix_match(providers, parts[1], &|p| format!("/provider {p}"));
+            }
+            Vec::new()
+        }
+        "/resume" | "/delete" => {
+            if parts.len() == 1 && ends_with_space {
+                return session_ids
+                    .iter()
+                    .map(|id| format!("{cmd} {id}"))
+                    .collect();
+            }
+            if parts.len() == 2 && !ends_with_space {
+                return prefix_match(session_ids, parts[1], &|id| format!("{cmd} {id}"));
+            }
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    fn base() -> Vec<String> {
+        vec![
+            "/auth".into(),
+            "/clear".into(),
+            "/help".into(),
+            "/model".into(),
+            "/provider".into(),
+            "/resume".into(),
+            "/delete".into(),
+            "/theme".into(),
+        ]
+    }
+
+    #[test]
+    fn completes_root_command_prefix() {
+        let c = slash_completions("/mo", &base(), &[], &[], &[], &[]);
+        assert_eq!(c, vec!["/model".to_string()]);
+    }
+
+    #[test]
+    fn completes_auth_subcommands() {
+        let c = slash_completions("/auth ", &base(), &[], &[], &[], &[]);
+        assert!(c.iter().any(|x| x == "/auth login"));
+        assert!(c.iter().any(|x| x == "/auth status"));
+        let c = slash_completions("/auth lo", &base(), &[], &[], &[], &[]);
+        assert_eq!(c, vec!["/auth login".to_string(), "/auth logout".to_string()]);
+    }
+
+    #[test]
+    fn completes_auth_login_provider() {
+        let providers = vec!["anthropic".into(), "xai".into()];
+        let c = slash_completions("/auth login ", &base(), &[], &providers, &[], &[]);
+        assert!(c.iter().any(|x| x == "/auth login xai"));
+        let c = slash_completions("/auth login x", &base(), &[], &providers, &[], &[]);
+        assert_eq!(c, vec!["/auth login xai".to_string()]);
+    }
+
+    #[test]
+    fn completes_models_and_themes() {
+        let models = vec!["grok-4.5:high".into(), "grok-4.3".into()];
+        let c = slash_completions("/model grok-4.5", &base(), &models, &[], &[], &[]);
+        assert_eq!(c, vec!["/model grok-4.5:high".to_string()]);
+        let themes = vec!["dark".into(), "dune".into()];
+        let c = slash_completions("/theme d", &base(), &[], &[], &themes, &[]);
+        assert!(c.iter().any(|x| x == "/theme dark"));
+        assert!(c.iter().any(|x| x == "/theme dune"));
+    }
+
+    #[test]
+    fn completes_session_ids_for_resume() {
+        let sessions = vec!["abcdef12".into(), "abcdef99".into(), "deadbeef".into()];
+        let c = slash_completions("/resume abc", &base(), &[], &[], &[], &sessions);
+        assert_eq!(
+            c,
+            vec![
+                "/resume abcdef12".to_string(),
+                "/resume abcdef99".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn trailing_space_helpers() {
+        assert!(completion_wants_trailing_space("/auth login"));
+        assert!(!completion_wants_trailing_space("/auth login xai"));
+        assert!(!completion_wants_trailing_space("/help"));
     }
 }
 

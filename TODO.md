@@ -22,7 +22,7 @@
 ## Priority: Low
 - [ ] Add plugin/extension system — custom tools via Lua or WASM
 - [x] TUI theme customization — dark themes from zero + fixed dark Dune; `/theme` picker
-- [ ] Add completions/suggestions for commands
+- [x] Add completions/suggestions for commands — Tab slash completion (`slash_completions` in `tui.rs`)
 - [ ] Performance optimization — reduce memory allocations in hot paths
 - [ ] Add benchmark tests for streaming throughput
 
