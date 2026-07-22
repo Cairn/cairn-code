@@ -1,8 +1,9 @@
 # Cairn Code
 
 [![Rust](https://img.shields.io/badge/rust-1.96-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/license-private-lightgrey)](#)
-[![Providers](https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20OpenRouter%20%7C%20OpenGateway%20%7C%20Ollama-blue)](#)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/github/license/Cairn/cairn-code)](LICENSE)
+[![Providers](https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20OpenRouter%20%7C%20OpenGateway%20%7C%20xAI%20%7C%20Ollama-blue)](#)
 [![TUI](https://img.shields.io/badge/TUI-ratatui-yellow)](https://ratatui.rs/)
 [![Tools](https://img.shields.io/badge/tools-13-brightgreen)](#)
 
@@ -184,4 +185,4 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 
 ## License
 
-Proprietary -- (c) 2026 Cairn. All rights reserved. No license is granted. Do not reproduce, distribute, or use outside the Cairn organization without written permission.
+[MIT](LICENSE) © 2026 Cairn.
