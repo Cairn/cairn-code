@@ -1951,9 +1951,20 @@ impl Tui {
                         Span::styled("● ", color),
                         Span::styled(format!("{}{dur}", line.tool_name), dim),
                     ]));
-                    // Head+tail so long command output stays readable and keeps the footer.
-                    let display = truncate_display(&line.content, 80, 40);
+                    // Compact on-screen tool output. Agent still receives full results
+                    // via the tool channel; this only thins the transcript view.
+                    let display = match line.tool_name.as_str() {
+                        "file_read" => compact_file_read_display(&line.content),
+                        "glob" => truncate_display(&line.content, 18, 2),
+                        "grep" => truncate_display(&line.content, 12, 4),
+                        // Shell keeps more head+tail so test summaries / exit codes survive.
+                        "shell" => truncate_display(&line.content, 20, 12),
+                        _ => truncate_display(&line.content, 12, 6),
+                    };
                     for part in display.split('\n') {
+                        if part.is_empty() {
+                            continue;
+                        }
                         lines.push(Line::from(vec![
                             Span::styled(format!("  {part}"), dim),
                         ]));
@@ -3025,7 +3036,7 @@ fn truncate_display(s: &str, head_lines: usize, tail_lines: usize) -> String {
         out.push('\n');
     }
     let omitted = lines.len() - head_lines - tail_lines;
-    out.push_str(&format!("  … ({omitted} lines omitted) …\n"));
+    out.push_str(&format!("… ({omitted} lines omitted) …\n"));
     for line in &lines[lines.len() - tail_lines..] {
         out.push_str(line);
         out.push('\n');
@@ -3034,6 +3045,83 @@ fn truncate_display(s: &str, head_lines: usize, tail_lines: usize) -> String {
         out.pop();
     }
     out
+}
+
+/// Transcript view for `file_read`: prefer the tool's range footer, not the
+/// full body. The model still sees the complete numbered content.
+fn compact_file_read_display(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    // Tool appends: `path:N (showing lines A-B of T)`
+    if let Some(summary) = lines.iter().rev().find(|l| l.contains("(showing lines")) {
+        let body_n = lines.iter().filter(|l| !l.contains("(showing lines")).count();
+        if body_n == 0 {
+            return (*summary).to_string();
+        }
+        // Tiny reads: show all. Larger: short peek + range footer.
+        const PEEK: usize = 3;
+        if body_n <= PEEK {
+            let mut out = String::new();
+            for l in &lines {
+                if *l == *summary {
+                    continue;
+                }
+                out.push_str(l);
+                out.push('\n');
+            }
+            out.push_str(summary);
+            return out;
+        }
+        let body: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| !l.contains("(showing lines"))
+            .collect();
+        let mut out = String::new();
+        for l in body.iter().take(PEEK) {
+            out.push_str(l);
+            out.push('\n');
+        }
+        let omitted = body_n - PEEK;
+        out.push_str(&format!("… ({omitted} more lines) …\n"));
+        out.push_str(summary);
+        return out;
+    }
+    // Fallback when the footer is missing (errors, older sessions).
+    truncate_display(content, 4, 2)
+}
+
+#[cfg(test)]
+mod tool_display_tests {
+    use super::*;
+
+    #[test]
+    fn compact_file_read_uses_footer_not_full_body() {
+        let mut body = String::new();
+        for i in 151..=188 {
+            body.push_str(&format!("{i}:line {i}\n"));
+        }
+        body.push_str("\nREADME.md:151 (showing lines 151-188 of 188)");
+        let out = compact_file_read_display(&body);
+        assert!(out.contains("README.md:151 (showing lines 151-188 of 188)"), "{out}");
+        assert!(out.contains("151:line 151"), "{out}");
+        assert!(!out.contains("160:line 160"), "should not dump the middle: {out}");
+        assert!(out.contains("more lines"), "{out}");
+        // Far shorter than the raw tool payload.
+        assert!(out.lines().count() < 10, "got {} lines", out.lines().count());
+    }
+
+    #[test]
+    fn compact_file_read_keeps_short_bodies() {
+        let content = "1:a\n2:b\n\nfoo.txt:1 (showing lines 1-2 of 2)";
+        let out = compact_file_read_display(content);
+        assert!(out.contains("1:a"));
+        assert!(out.contains("2:b"));
+        assert!(out.contains("foo.txt:1"));
+        assert!(!out.contains("more lines"));
+    }
 }
 
 
