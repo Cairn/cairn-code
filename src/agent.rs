@@ -192,7 +192,10 @@ impl Agent {
                         });
                     }),
                     cancel,
-                ).map_err(|e| format!("LLM error: {e}"))?;
+                ).map_err(|e| {
+                    // Providers/http_client already produce actionable text; keep a stable prefix for the TUI.
+                    if e.starts_with("LLM error:") { e } else { format!("LLM error: {e}") }
+                })?;
 
                 if cancel.load(Ordering::Relaxed) {
                     return Ok(());
@@ -471,6 +474,122 @@ mod tests {
         assert!(t.contains("assistant: hi"));
         assert!(t.contains("assistant [tool call]: grep("));
         assert!(t.contains("tool result: matches"));
+    }
+
+    /// Live-exercises proactive compaction without a network call: first stream
+    /// reports a high input-token count, `complete` returns a summary, second
+    /// stream should see the compacted history.
+    struct SharedMock {
+        stream_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        complete_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        last_stream_message_count: std::sync::Arc<std::sync::Mutex<usize>>,
+    }
+
+    impl llm::Provider for SharedMock {
+        fn name(&self) -> &str { "mock" }
+        fn default_model(&self) -> &str { "mock-model" }
+        fn available_models(&self) -> Vec<llm::ModelInfo> {
+            vec![llm::ModelInfo { id: "mock-model".into(), name: "Mock".into(), max_ctx: 1000 }]
+        }
+        fn stream_complete(
+            &self,
+            messages: &[llm::Message],
+            _tools: &[llm::ToolDefinition],
+            _system: &str,
+            _model: &str,
+            _max_tokens: usize,
+            mut on_chunk: llm::StreamingCallback,
+            _cancel: &AtomicBool,
+        ) -> Result<(Vec<llm::Message>, Usage), String> {
+            let n = self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_stream_message_count.lock().unwrap() = messages.len();
+            on_chunk("ok", "text");
+            Ok((
+                vec![llm::Message {
+                    role: "assistant".into(),
+                    content: llm::Content::Text(format!("reply-{n}")),
+                }],
+                Usage {
+                    input_tokens: if n == 0 { 800 } else { 120 },
+                    output_tokens: 4,
+                    cache_read: 0,
+                    cache_create: 0,
+                },
+            ))
+        }
+        fn complete(
+            &self,
+            _messages: &[llm::Message],
+            _tools: &[llm::ToolDefinition],
+            system: &str,
+            _model: &str,
+            _max_tokens: usize,
+        ) -> Result<(Vec<llm::Message>, Usage), String> {
+            self.complete_calls.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                system.contains("compacting"),
+                "summarizer should use compaction system prompt, got: {system}"
+            );
+            Ok((
+                vec![llm::Message {
+                    role: "assistant".into(),
+                    content: llm::Content::Text("Prior work on foo.rs and bar.rs.".into()),
+                }],
+                Usage { input_tokens: 40, output_tokens: 12, cache_read: 0, cache_create: 0 },
+            ))
+        }
+    }
+
+    #[test]
+    fn proactive_compaction_runs_before_next_turn() {
+        let stream_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let complete_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let last_count = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+
+        let mut seed = Vec::new();
+        for i in 0..8 {
+            seed.push(text("user", &format!("user-{i}")));
+            seed.push(text("assistant", &format!("assistant-{i}")));
+        }
+
+        let mut agent = Agent::new(
+            Box::new(SharedMock {
+                stream_calls: stream_calls.clone(),
+                complete_calls: complete_calls.clone(),
+                last_stream_message_count: last_count.clone(),
+            }),
+            "mock-model".into(),
+            crate::tools::registry::Registry::new(),
+            crate::config::Config::default(),
+        );
+        agent.set_state(seed, Usage::default());
+
+        let (tx, rx) = mpsc::channel();
+        let (_perm_tx, perm_rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+
+        agent.run("first", tx.clone(), &cancel, &perm_rx).unwrap();
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(complete_calls.load(Ordering::SeqCst), 0, "no compact on first turn");
+
+        while rx.try_recv().is_ok() {}
+
+        agent.run("second", tx, &cancel, &perm_rx).unwrap();
+        assert_eq!(complete_calls.load(Ordering::SeqCst), 1, "summarizer should run before second stream");
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+
+        let events: Vec<_> = rx.try_iter().collect();
+        let compacted = events.iter().any(|e| matches!(e, AgentEvent::Compacted(_)));
+        assert!(compacted, "expected Compacted event among {} events", events.len());
+
+        let msgs = agent.messages();
+        assert!(
+            msgs.iter().any(|m| matches!(&m.content, llm::Content::Text(t) if t.contains("[Earlier conversation summary]"))),
+            "history should start with a summary message"
+        );
+        // Pre-compact peak is seed(16)+user+asst+user ≈ 19; compacted should be smaller.
+        let seen = *last_count.lock().unwrap();
+        assert!(seen < 20, "second stream should see a compacted history, got {seen} messages");
     }
 }
 

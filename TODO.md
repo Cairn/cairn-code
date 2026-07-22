@@ -6,8 +6,8 @@
 
 ## Priority: High
 - [x] Add OpenCode provider support — opencode.rs
-- [ ] Improve error messages — surface actionable errors when API calls fail (rate limits, auth errors, network issues)
-- [x] Add file edit tool safety — workspace-path confinement in `file_edit`/`file_write` (`tools/workspace.rs`), `Tool::needs_permission()` now actually gates execution, shell `timeout` enforced. Undo support still missing.
+- [x] Improve error messages — actionable auth/rate-limit/network/context errors in `http_client.rs` plus clearer missing-API-key messages
+- [x] Add file edit tool safety — workspace-path confinement in `file_edit`/`file_write` (`tools/workspace.rs`), `Tool::needs_permission()` gates execution, shell `timeout` enforced, in-process `file_undo` stack for edit/write
 
 ## Priority: Medium
 - [x] Add configuration file support (~/.config/cairn-code/config.json) — model selection, API keys, defaults

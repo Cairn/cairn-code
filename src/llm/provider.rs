@@ -90,6 +90,13 @@ pub trait Provider: Send {
     ) -> Result<(Vec<Message>, Usage), String>;
 }
 
+/// Actionable message when a provider requires an API key that is missing.
+pub fn missing_api_key(env_var: &str) -> String {
+    format!(
+        "{env_var} is not set. Export it in your shell, or save a key via the provider picker (/provider)."
+    )
+}
+
 pub fn default_providers() -> HashMap<String, Box<dyn Provider>> {
     let mut map: HashMap<String, Box<dyn Provider>> = HashMap::new();
     map.insert("anthropic".into(), Box::new(crate::llm::anthropic::AnthropicProvider::new()));

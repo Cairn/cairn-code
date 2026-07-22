@@ -45,7 +45,7 @@ impl Provider for OpenAIProvider {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(Vec<Message>, Usage), String> {
         let key = self.get_key();
-        if key.is_empty() { return Err("OPENAI_API_KEY not set".into()); }
+        if key.is_empty() { return Err(crate::llm::provider::missing_api_key("OPENAI_API_KEY")); }
         let body = openai_request_body(messages, tools, system, model, true)?;
         let req = http_client::HttpRequest {
             url: "https://api.openai.com/v1/chat/completions".into(),
@@ -89,7 +89,7 @@ impl Provider for OpenAIProvider {
         _max_tokens: usize,
     ) -> Result<(Vec<Message>, Usage), String> {
         let key = self.get_key();
-        if key.is_empty() { return Err("OPENAI_API_KEY not set".into()); }
+        if key.is_empty() { return Err(crate::llm::provider::missing_api_key("OPENAI_API_KEY")); }
         let body = openai_request_body(messages, tools, system, model, false)?;
         let req = http_client::HttpRequest {
             url: "https://api.openai.com/v1/chat/completions".into(),

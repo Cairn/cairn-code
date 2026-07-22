@@ -82,6 +82,7 @@ impl Tool for FileEditTool {
             1
         };
 
+        super::file_history::record_snapshot(resolved.clone(), file_path, content);
         fs::write(&resolved, &new_content).map_err(|e| format!("write error: {e}"))?;
         Ok(format!("Applied {count} edit(s) to {file_path}"))
     }

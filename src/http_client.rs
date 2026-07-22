@@ -32,10 +32,118 @@ enum RequestError {
 impl RequestError {
     fn into_string(self) -> String {
         match self {
-            RequestError::Status(status, body) => format!("HTTP {status}: {}", body.trim()),
-            RequestError::Transport(msg) => format!("curl: {msg}"),
+            RequestError::Status(status, body) => format_status_error(status, &body),
+            RequestError::Transport(msg) => format_transport_error(&msg),
         }
     }
+}
+
+/// Pull a short human-readable detail out of a provider error body (JSON or plain text).
+fn extract_error_detail(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Ok(val) = crate::json::parse(trimmed) {
+        if let Some(obj) = val.as_object() {
+            // OpenAI / OpenRouter: {"error":{"message":"..."}}
+            if let Some(err) = obj.get("error") {
+                if let Some(msg) = err.get("message").and_then(|v| v.as_str()) {
+                    return msg.trim().to_string();
+                }
+                if let Some(msg) = err.as_str() {
+                    return msg.trim().to_string();
+                }
+            }
+            // Anthropic-ish: {"type":"error","error":{"type":"...","message":"..."}}
+            // Already handled above. Also bare {"message":"..."}.
+            if let Some(msg) = obj.get("message").and_then(|v| v.as_str()) {
+                return msg.trim().to_string();
+            }
+        }
+    }
+    // Collapse whitespace and cap length so huge HTML error pages stay readable.
+    let flat: String = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > 280 {
+        let short: String = flat.chars().take(280).collect();
+        format!("{short}…")
+    } else {
+        flat
+    }
+}
+
+fn looks_like_context_limit(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    [
+        "context length",
+        "context window",
+        "context_length_exceeded",
+        "maximum context",
+        "context limit",
+        "prompt is too long",
+        "too many tokens",
+        "reduce the length of the messages",
+        "input is too long",
+        "max_tokens",
+    ]
+    .iter()
+    .any(|n| lower.contains(n))
+}
+
+fn format_status_error(status: u16, body: &str) -> String {
+    let detail = extract_error_detail(body);
+    let advice = if looks_like_context_limit(&detail) {
+        "Prompt exceeds the model context window. Start a new session (/clear) or continue so compaction can shrink history."
+    } else {
+        match status {
+            401 | 403 => "Authentication failed. Check your API key (env var or save one via /provider).",
+            404 => "Not found. Check the model id and that your provider supports it.",
+            402 => "Payment required or insufficient credits on this provider.",
+            429 => "Rate limited by the provider. Wait and retry, or switch model/provider.",
+            500 | 502 => "Provider server error. Retry shortly, or switch provider.",
+            503 | 529 => "Provider overloaded or unavailable. Retry shortly, or switch provider.",
+            _ => "",
+        }
+    };
+
+    if advice.is_empty() && detail.is_empty() {
+        format!("HTTP {status} from provider.")
+    } else if advice.is_empty() {
+        format!("HTTP {status}: {detail}")
+    } else if detail.is_empty() {
+        format!("HTTP {status}: {advice}")
+    } else {
+        format!("HTTP {status}: {advice} Provider said: {detail}")
+    }
+}
+
+fn format_transport_error(msg: &str) -> String {
+    let m = msg.trim();
+    if m.is_empty() {
+        return "Network error: could not reach the provider. Check connectivity and that curl is on PATH.".into();
+    }
+    let lower = m.to_ascii_lowercase();
+    if lower.contains("could not resolve host") || lower.contains("name or service not known") {
+        return format!("Network error: DNS lookup failed ({m}). Check connectivity.");
+    }
+    if lower.contains("connection refused") {
+        return format!("Network error: connection refused ({m}). Is the provider running and reachable?");
+    }
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return format!("Network error: connection timed out ({m}). Retry, or check network/firewall.");
+    }
+    if lower.contains("failed to connect") || lower.contains("couldn't connect") {
+        return format!("Network error: could not connect ({m}). Check connectivity and provider URL.");
+    }
+    // curl missing from PATH shows up as a spawn error.
+    if lower.contains("the system cannot find the file")
+        || lower.contains("no such file or directory")
+        || lower.contains("program not found")
+        || lower.contains("not found") && lower.contains("curl")
+    {
+        return format!("Network error: could not run curl ({m}). Install curl and ensure it is on PATH.");
+    }
+    format!("Network error: {m}")
 }
 
 fn is_retriable_status(status: u16) -> bool {
@@ -307,8 +415,15 @@ where
     loop {
         match request_streaming_attempt(req, &mut on_line, cancel) {
             Ok(()) => return Ok(()),
-            Err((StreamOutcome::Cancelled, _)) => return Err("cancelled".into()),
-            Err((StreamOutcome::IdleTimeout, _)) => return Err("stream idle timeout: no data received".into()),
+            Err((StreamOutcome::Cancelled, _)) => {
+                return Err("Request cancelled.".into());
+            }
+            Err((StreamOutcome::IdleTimeout, _)) => {
+                return Err(
+                    "Stream idle timeout: no data from the provider for 60s. Retry, or check network/provider status."
+                        .into(),
+                );
+            }
             Err((StreamOutcome::Other(RequestError::Status(status, _)), false))
                 if is_retriable_status(status) && attempt < MAX_RETRIES =>
             {
@@ -383,5 +498,38 @@ mod tests {
         let req = HttpRequest { url, headers: vec![], body: Some("{}".into()) };
         let err = request(&req).unwrap_err();
         assert!(err.contains("400"), "expected error to mention status 400, got: {err}");
+    }
+
+    #[test]
+    fn test_status_error_auth_is_actionable() {
+        let msg = format_status_error(
+            401,
+            r#"{"error":{"message":"Incorrect API key provided"}}"#,
+        );
+        assert!(msg.contains("401"), "{msg}");
+        assert!(msg.to_ascii_lowercase().contains("authentication") || msg.to_ascii_lowercase().contains("api key"), "{msg}");
+        assert!(msg.contains("Incorrect API key"), "{msg}");
+    }
+
+    #[test]
+    fn test_status_error_rate_limit_is_actionable() {
+        let msg = format_status_error(429, r#"{"error":{"message":"Rate limit exceeded"}}"#);
+        assert!(msg.contains("429"), "{msg}");
+        assert!(msg.to_ascii_lowercase().contains("rate"), "{msg}");
+    }
+
+    #[test]
+    fn test_status_error_context_limit_detected() {
+        let msg = format_status_error(
+            400,
+            r#"{"error":{"message":"This model's maximum context length is 128000 tokens"}}"#,
+        );
+        assert!(msg.to_ascii_lowercase().contains("context"), "{msg}");
+    }
+
+    #[test]
+    fn test_transport_error_dns() {
+        let msg = format_transport_error("Could not resolve host: api.example.com");
+        assert!(msg.to_ascii_lowercase().contains("dns") || msg.to_ascii_lowercase().contains("network"), "{msg}");
     }
 }

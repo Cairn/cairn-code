@@ -24,6 +24,7 @@ impl Tool for FileWriteTool {
             fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
         }
 
+        super::file_history::record_before_write(resolved.clone(), file_path)?;
         fs::write(&resolved, content).map_err(|e| format!("write error: {e}"))?;
         Ok(format!("Written {} bytes to {}", content.len(), file_path))
     }

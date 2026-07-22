@@ -3,7 +3,7 @@
   <img src="https://img.shields.io/badge/CLI-agentic%20loop-6e40c9?style=for-the-badge" alt="Agent Loop"><br>
   <img src="https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20OpenCode%20%7C%20OpenRouter%20%7C%20Ollama-f472b6?style=for-the-badge" alt="Multi-Provider"><br>
   <img src="https://img.shields.io/badge/TUI-ratatui-FF6F00?style=for-the-badge" alt="Ratatui"><br>
-  <img src="https://img.shields.io/badge/Tools-12-22c55e?style=for-the-badge" alt="12 Tools"><br>
+  <img src="https://img.shields.io/badge/Tools-13-22c55e?style=for-the-badge" alt="13 Tools"><br>
   <img src="https://img.shields.io/badge/Private-Cairn-1a1b26?style=for-the-badge" alt="Private">
 </p>
 
@@ -18,7 +18,7 @@
 
 - **Multi-provider LLM support** — Anthropic (Claude), OpenAI (GPT), OpenCode (free API), OpenRouter, Ollama
 - **Agentic tool loop** — The LLM autonomously reads files, writes code, runs commands, and searches your codebase until the task is done
-- **12 built-in tools** — FileRead, FileWrite, FileEdit, Shell, Go, Git, Glob, Grep, Memory, WebSearch, WebFetch, TodoWrite
+- **13 built-in tools** — FileRead, FileWrite, FileEdit, FileUndo, Shell, Go, Git, Glob, Grep, Memory, WebSearch, WebFetch, TodoWrite
 - **Real-time streaming** — Token-by-token output with live tool display and thinking blocks
 - **Ratatui TUI** — Terminal UI with input history, spinner, and provider/model pickers
 - **Cost tracking** — Per-session and per-tool-call token usage with cache-aware pricing
@@ -107,6 +107,8 @@ src/
     file_read.rs         Read files with line pagination
     file_write.rs        Create/overwrite files
     file_edit.rs         Find-and-replace editing
+    file_history.rs      In-process undo stack for edit/write
+    file_undo.rs         Undo last file_edit/file_write
     shell.rs             Shell command execution with timeout
     go_tool.rs           Go command execution (no shell injection)
     git_tool.rs          Git command execution (no shell injection)
@@ -137,6 +139,7 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | **file_read** | Read files with line numbers, offset/limit pagination | No |
 | **file_write** | Create or overwrite files | Yes |
 | **file_edit** | Find-and-replace editing | Yes |
+| **file_undo** | Undo last file_edit/file_write in this process | Yes |
 | **shell** | Execute shell commands with timeout | Yes |
 | **go** | Execute Go commands (avoids shell injection) | Yes |
 | **git** | Execute Git commands (avoids shell injection) | Yes |

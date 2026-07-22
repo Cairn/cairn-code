@@ -56,7 +56,7 @@ impl Provider for OpenRouterProvider {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(Vec<Message>, Usage), String> {
         let key = self.get_key();
-        if key.is_empty() { return Err("OPENROUTER_API_KEY not set".into()); }
+        if key.is_empty() { return Err(crate::llm::provider::missing_api_key("OPENROUTER_API_KEY")); }
 
         let mut mt = if max_tokens == 0 || max_tokens > 4096 {
             4096
@@ -91,7 +91,7 @@ impl Provider for OpenRouterProvider {
         max_tokens: usize,
     ) -> Result<(Vec<Message>, Usage), String> {
         let key = self.get_key();
-        if key.is_empty() { return Err("OPENROUTER_API_KEY not set".into()); }
+        if key.is_empty() { return Err(crate::llm::provider::missing_api_key("OPENROUTER_API_KEY")); }
 
         let mut mt = if max_tokens == 0 || max_tokens > 4096 {
             4096
@@ -247,7 +247,7 @@ mod tests {
                 assert_eq!(obj.get("model").and_then(|v| v.as_str()), Some("openai/gpt-4o"));
                 assert!(obj.get("messages").and_then(|v| v.as_array()).is_some());
                 let tools_arr = obj.get("tools").and_then(|v| v.as_array()).unwrap();
-                assert_eq!(tools_arr.len(), 12);
+                assert_eq!(tools_arr.len(), 13);
                 for (i, tool_val) in tools_arr.iter().enumerate() {
                     let tool_obj = tool_val.as_object().unwrap();
                     assert_eq!(tool_obj.get("type").and_then(|v| v.as_str()), Some("function"));

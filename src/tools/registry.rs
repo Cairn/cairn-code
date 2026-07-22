@@ -52,6 +52,7 @@ pub fn default_registry() -> Registry {
     r.register(Box::new(crate::tools::file_read::FileReadTool));
     r.register(Box::new(crate::tools::file_write::FileWriteTool));
     r.register(Box::new(crate::tools::file_edit::FileEditTool));
+    r.register(Box::new(crate::tools::file_undo::FileUndoTool));
     r.register(Box::new(crate::tools::shell::ShellTool));
     r.register(Box::new(crate::tools::go_tool::GoTool));
     r.register(Box::new(crate::tools::git_tool::GitTool));
