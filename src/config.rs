@@ -78,6 +78,7 @@ pub fn env_var_name(provider: &str) -> Option<&'static str> {
         "anthropic" => Some("ANTHROPIC_API_KEY"),
         "openai" => Some("OPENAI_API_KEY"),
         "openrouter" => Some("OPENROUTER_API_KEY"),
+        "opengateway" => Some("GITLAWB_OPENGATEWAY_API_KEY"),
         _ => None,
     }
 }
@@ -85,7 +86,18 @@ pub fn env_var_name(provider: &str) -> Option<&'static str> {
 /// Look up an API key from the environment for the given provider.
 /// Returns the env-var value (empty string if unset/filtered).
 pub fn env_key_for(provider: &str) -> Option<String> {
-    std::env::var(env_var_name(provider)?).ok().filter(|s| !s.is_empty())
+    if let Some(name) = env_var_name(provider) {
+        if let Ok(v) = std::env::var(name) {
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    // OpenGateway also accepts the shorter alias used by some setups.
+    if provider == "opengateway" {
+        return std::env::var("OPENGATEWAY_API_KEY").ok().filter(|s| !s.is_empty());
+    }
+    None
 }
 
 fn dirs_config_path() -> PathBuf {
@@ -359,7 +371,7 @@ mod tests {
         // env_key_for must return None when the env var is unset, for each known provider.
         // We can't easily unset env vars, so we just check the function returns a String
         // (or None) for the well-known names without panicking.
-        for p in ["anthropic", "openai", "openrouter"].iter() {
+        for p in ["anthropic", "openai", "openrouter", "opengateway"].iter() {
             let _ = env_key_for(p);
         }
         // Unknown provider => None

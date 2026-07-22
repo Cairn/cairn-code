@@ -39,7 +39,7 @@ standalone system, not a small port:
 - Model registry with live pricing/context-window/vision metadata
 - Three-way config layering (user/project/env), currently first-match-wins
 - [x] Output/log secret redaction — `redact.rs` on debug dumps, error text, sensitive headers
-- Provider catalog expansion beyond the current 4 (anthropic/openai/openrouter/ollama)
+- Provider catalog expansion beyond the current 5 (anthropic/openai/openrouter/opengateway/ollama)
 
 ## Standing Rules
 - Never force push

@@ -3,7 +3,7 @@ use super::provider::*;
 use crate::json;
 
 /// Shared parsing/serialization for OpenAI-compatible chat-completions APIs
-/// (openai, ollama, and openrouter all speak this dialect).
+/// (openai, ollama, openrouter, and opengateway all speak this dialect).
 
 pub fn escape_json_str(s: &str) -> String {
     s.replace('\\', "\\\\")

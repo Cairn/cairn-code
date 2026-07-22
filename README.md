@@ -2,7 +2,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.96-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-private-lightgrey)](#)
-[![Providers](https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20OpenRouter%20%7C%20Ollama-blue)](#)
+[![Providers](https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20OpenRouter%20%7C%20OpenGateway%20%7C%20Ollama-blue)](#)
 [![TUI](https://img.shields.io/badge/TUI-ratatui-yellow)](https://ratatui.rs/)
 [![Tools](https://img.shields.io/badge/tools-13-brightgreen)](#)
 
@@ -10,7 +10,7 @@ A Rust-based CLI LLM coding agent, inspired by Claude Code. Built by Cairn.
 
 ## Features
 
-- **Multi-provider LLM support** — Anthropic (Claude), OpenAI (GPT), OpenRouter, Ollama
+- **Multi-provider LLM support** — Anthropic (Claude), OpenAI (GPT), OpenRouter, OpenGateway (GitLawb smart router), Ollama
 - **Agentic tool loop** — The LLM autonomously reads files, writes code, runs commands, and searches your codebase until the task is done
 - **13 built-in tools** — FileRead, FileWrite, FileEdit, FileUndo, Shell, Go, Git, Glob, Grep, Memory, WebSearch, WebFetch, TodoWrite
 - **Real-time streaming** — Token-by-token output with live tool display and thinking blocks
@@ -43,9 +43,11 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 export OPENAI_API_KEY="sk-..."
 # or
 export OPENROUTER_API_KEY="sk-or-..."
+# or GitLawb OpenGateway (smart-routes by model id)
+export GITLAWB_OPENGATEWAY_API_KEY="ogw_live_..."
 ```
 
-Anthropic is the default provider. Ollama talks to a local server and needs no cloud API key.
+Anthropic is the default provider. OpenGateway is an OpenAI-compatible gateway (`https://opengateway.gitlawb.com/v1`) that routes by model id. Ollama talks to a local server and needs no cloud API key.
 
 Optionally create a config file:
 
@@ -94,6 +96,7 @@ src/
     anthropic.rs         Anthropic Messages API client (SSE streaming)
     openai.rs            OpenAI Chat Completions client (streaming)
     openrouter.rs        OpenRouter client (OpenAI-compatible, streaming)
+    opengateway.rs       GitLawb OpenGateway (OpenAI-compatible smart router)
     ollama.rs            Local Ollama client
   tools/
     registry.rs          Tool trait and registry
@@ -164,7 +167,7 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `default_provider` | string | `"anthropic"` | LLM provider (`anthropic`, `openai`, `openrouter`, `ollama`) |
+| `default_provider` | string | `"anthropic"` | LLM provider (`anthropic`, `openai`, `openrouter`, `opengateway`, `ollama`) |
 | `default_model` | string | `"claude-sonnet-4-20250514"` | Default model identifier |
 | `max_turns` | int | `100` | Maximum agent loop iterations |
 | `max_tokens` | int | `8192` | Max tokens per LLM response |
