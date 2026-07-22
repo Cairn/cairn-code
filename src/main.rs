@@ -127,11 +127,7 @@ fn main() {
         }
     });
 
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        if let Some(key) = config::config_get_api_key("openrouter") {
-            std::env::set_var("OPENROUTER_API_KEY", key);
-        }
-    }
+    config::hydrate_env_from_keyring();
 
     let mut tui = tui::Tui::new(version, &p_model_for_print, &provider_name_str, &work_dir);
     tui.set_theme_name(&theme_name);

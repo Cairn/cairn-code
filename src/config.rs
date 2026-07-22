@@ -248,6 +248,55 @@ pub fn config_has_api_key(provider: &str) -> bool {
     config_get_api_key(provider).is_some()
 }
 
+/// True when this provider needs a cloud API key (not local ollama).
+pub fn provider_requires_api_key(provider: &str) -> bool {
+    env_var_name(provider).is_some()
+}
+
+/// True when a usable key is available from the keyring or environment.
+pub fn has_usable_credential(provider: &str) -> bool {
+    config_has_api_key(provider) || env_key_for(provider).is_some()
+}
+
+/// Apply a key to the process environment for the given provider (so the
+/// current agent process can use it without restart).
+pub fn apply_key_to_env(provider: &str, key: &str) {
+    if let Some(var) = env_var_name(provider) {
+        std::env::set_var(var, key);
+    }
+    if provider == "opengateway" {
+        std::env::set_var("OPENGATEWAY_API_KEY", key);
+    }
+}
+
+/// Load any keyring-stored keys into the environment when the env var is unset.
+pub fn hydrate_env_from_keyring() {
+    for provider in ["anthropic", "openai", "openrouter", "opengateway"] {
+        if env_key_for(provider).is_some() {
+            continue;
+        }
+        if let Some(key) = config_get_api_key(provider) {
+            apply_key_to_env(provider, &key);
+        }
+    }
+}
+
+/// Mask a secret for on-screen input: bullets for all but the last `reveal`
+/// characters (still fully masked when shorter than `reveal`).
+pub fn mask_secret_display(value: &str, reveal: usize) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+    if chars.len() <= reveal {
+        return "•".repeat(chars.len());
+    }
+    let mask_n = chars.len() - reveal;
+    let mut out = "•".repeat(mask_n);
+    out.extend(chars[mask_n..].iter().copied());
+    out
+}
+
 /// Remove the saved API key for `provider` from the OS keyring.
 /// Returns Ok(true) if a key was removed, Ok(false) if none was stored.
 pub fn remove_api_key(provider: &str) -> Result<bool, String> {
@@ -402,6 +451,23 @@ mod tests {
         }
         // Unknown provider => None
         assert!(env_key_for("nonsense_provider_xyz").is_none());
+    }
+
+    #[test]
+    fn test_provider_requires_api_key() {
+        assert!(provider_requires_api_key("anthropic"));
+        assert!(provider_requires_api_key("openai"));
+        assert!(provider_requires_api_key("openrouter"));
+        assert!(provider_requires_api_key("opengateway"));
+        assert!(!provider_requires_api_key("ollama"));
+    }
+
+    #[test]
+    fn test_mask_secret_display_shows_last_four() {
+        assert_eq!(mask_secret_display("", 4), "");
+        assert_eq!(mask_secret_display("abcd", 4), "••••");
+        assert_eq!(mask_secret_display("abcdefghij", 4), "••••••ghij");
+        assert_eq!(mask_secret_display("sk-ant-secretvalue99", 4), "••••••••••••••••ue99");
     }
 
     #[test]

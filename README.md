@@ -155,7 +155,7 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | `/compact` | Summarize older history into a shorter context now |
 | `/model` | Show or change the current model |
 | `/cost` | Show token usage for the session |
-| `/provider` | Show or change the current provider |
+| `/provider` | Show or change the current provider (prompts for API key when missing; input is masked) |
 | `/theme` | Pick a dark TUI theme (live preview); `/theme list` or `/theme <name>` |
 | *(after LLM error)* | Prompt: switch model (`m`), switch provider (`p`), or dismiss (`d`/Esc) |
 | `/save` | Save the current session |

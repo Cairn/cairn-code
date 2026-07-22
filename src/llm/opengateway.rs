@@ -34,9 +34,13 @@ impl OpenGatewayProvider {
         if !self.api_key.is_empty() {
             return self.api_key.clone();
         }
-        std::env::var("GITLAWB_OPENGATEWAY_API_KEY")
-            .or_else(|_| std::env::var("OPENGATEWAY_API_KEY"))
-            .unwrap_or_default()
+        if let Ok(k) = std::env::var("GITLAWB_OPENGATEWAY_API_KEY") {
+            if !k.is_empty() { return k; }
+        }
+        if let Ok(k) = std::env::var("OPENGATEWAY_API_KEY") {
+            if !k.is_empty() { return k; }
+        }
+        crate::config::config_get_api_key("opengateway").unwrap_or_default()
     }
 }
 

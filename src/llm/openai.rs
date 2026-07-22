@@ -19,7 +19,10 @@ impl OpenAIProvider {
 
     fn get_key(&self) -> String {
         if !self.api_key.is_empty() { return self.api_key.clone(); }
-        std::env::var("OPENAI_API_KEY").unwrap_or_default()
+        if let Ok(k) = std::env::var("OPENAI_API_KEY") {
+            if !k.is_empty() { return k; }
+        }
+        crate::config::config_get_api_key("openai").unwrap_or_default()
     }
 }
 

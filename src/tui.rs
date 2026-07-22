@@ -58,8 +58,9 @@ pub struct Tui {
     confirm_remove_provider: Option<String>,
     confirm_remove_sel: usize,
     awaiting_api_key: bool,
-    pending_openrouter_setup: bool,
-    /// Provider name to capture an API key for (e.g. "openrouter", "openai").
+    /// After model selection, prompt for an API key for this provider if needed.
+    pending_key_after_model: bool,
+    /// Provider name to capture an API key for (e.g. "openrouter", "opengateway").
     /// When Some, the awaiting_api_key flow stores the key under this provider.
     api_key_target: Option<String>,
     show_command_picker: bool,
@@ -119,7 +120,7 @@ impl Tui {
             confirm_remove_provider: None,
             confirm_remove_sel: 0,
             awaiting_api_key: false,
-            pending_openrouter_setup: false,
+            pending_key_after_model: false,
             api_key_target: None,
             show_command_picker: false,
             cmd_picker_list: vec![
@@ -406,7 +407,7 @@ impl Tui {
                             tool_name: String::new(), duration: String::new(),
                         });
                         self.provider_picker_keys = self.provider_picker_list.iter()
-                            .map(|n| crate::config::config_has_api_key(n)).collect();
+                            .map(|n| crate::config::has_usable_credential(n)).collect();
                     }
                 }
                 _ => {}
@@ -505,9 +506,16 @@ impl Tui {
             KeyCode::Esc => {
                 if self.awaiting_api_key {
                     self.awaiting_api_key = false;
-                    self.pending_openrouter_setup = false;
+                    self.pending_key_after_model = false;
+                    self.api_key_target = None;
                     self.input_buf.clear();
                     self.cursor = 0;
+                    self.output_lines.push(OutputLine {
+                        type_: "system".into(),
+                        content: "API key entry cancelled.".into(),
+                        tool_name: String::new(),
+                        duration: String::new(),
+                    });
                 } else if self.show_command_picker { self.show_command_picker = false; }
                 else if self.show_provider_picker { self.show_provider_picker = false; }
                 else if self.show_model_picker { self.show_model_picker = false; }
@@ -552,61 +560,49 @@ impl Tui {
                             let default_model = p.default_model().to_string();
                             self.provider = name.clone();
                             self.picker_models = p.available_models();
-                            if name == "openrouter" {
-                                self.model = "gpt-5-mini".to_string();
-                                self.show_provider_picker = false;
-                                self.show_model_picker = true;
-                                self.picker_sel = self.picker_models.iter().position(|m| m.id == "gpt-5-mini").unwrap_or(0);
-                                self.picker_scrl = 0;
-                                self.pending_openrouter_setup = true;
+                            // Prefer a sensible default when switching providers.
+                            self.model = if name == "openrouter" {
+                                if self.picker_models.iter().any(|m| m.id == "gpt-5-mini") {
+                                    "gpt-5-mini".to_string()
+                                } else {
+                                    default_model
+                                }
                             } else {
-                                self.model = default_model;
-                                self.show_provider_picker = false;
-                        let _ = crate::config::save_config(&self.provider, &self.model, None);
-                        self.output_lines.push(OutputLine {
-                            type_: "system".into(), content: format!("Provider set to: {}", self.provider),
-                            tool_name: String::new(), duration: String::new(),
-                        });
-                        if let Some(tx) = &self.agent_tx {
-                            let _ = tx.send(format!("__switch__:{name}:{}", self.model));
+                                default_model
+                            };
+                            self.show_provider_picker = false;
+                            self.show_model_picker = true;
+                            self.picker_sel = self.picker_models.iter()
+                                .position(|m| m.id == self.model)
+                                .unwrap_or(0);
+                            self.picker_scrl = 0;
+                            self.pending_key_after_model =
+                                crate::config::provider_requires_api_key(&name)
+                                && !crate::config::has_usable_credential(&name);
+                        } else {
+                            self.show_provider_picker = false;
                         }
-                            }
-                        } else { self.show_provider_picker = false; }
-                    } else { self.show_provider_picker = false; }
+                    } else {
+                        self.show_provider_picker = false;
+                    }
                     return true;
                 }
                 if self.show_model_picker {
                     if self.picker_sel < self.picker_models.len() {
                         self.model = self.picker_models[self.picker_sel].id.clone();
                         self.show_model_picker = false;
-                        if self.pending_openrouter_setup {
-                            self.pending_openrouter_setup = false;
-                            if std::env::var("OPENROUTER_API_KEY").is_ok() || crate::config::config_has_api_key("openrouter") {
-                                let _ = crate::config::save_config(&self.provider, &self.model, None);
-                                self.output_lines.push(OutputLine {
-                                    type_: "system".into(), content: format!("Provider set to: {}\nModel set to: {}", self.provider, self.model),
-                                    tool_name: String::new(), duration: String::new(),
-                                });
-                                if let Some(tx) = &self.agent_tx {
-                                    let _ = tx.send(format!("__switch__:openrouter:{}", self.model));
-                                }
-                            } else {
-                                self.awaiting_api_key = true;
-                                self.input_buf.clear();
-                                self.cursor = 0;
-                                self.output_lines.push(OutputLine {
-                                    type_: "system".into(), content: "Enter your OpenRouter API key:".into(),
-                                    tool_name: String::new(), duration: String::new(),
-                                });
-                            }
+                        let needs_key = self.pending_key_after_model
+                            || (crate::config::provider_requires_api_key(&self.provider)
+                                && !crate::config::has_usable_credential(&self.provider));
+                        self.pending_key_after_model = false;
+                        if needs_key {
+                            self.begin_api_key_prompt(&self.provider.clone());
                         } else {
-                            let _ = crate::config::save_config(&self.provider, &self.model, None);
-                            self.output_lines.push(OutputLine {
-                                type_: "system".into(), content: format!("Model set to: {}", self.model),
-                                tool_name: String::new(), duration: String::new(),
-                            });
+                            self.finish_provider_model_selection(None);
                         }
-                    } else { self.show_model_picker = false; }
+                    } else {
+                        self.show_model_picker = false;
+                    }
                     return true;
                 }
 
@@ -648,18 +644,14 @@ impl Tui {
 
                 if self.awaiting_api_key {
                     let key = self.input_buf.trim().to_string();
-                    self.input_buf.clear(); self.cursor = 0;
-                    if key.is_empty() { return true; }
-                    self.awaiting_api_key = false;
-                    std::env::set_var("OPENROUTER_API_KEY", &key);
-                    let _ = crate::config::save_config(&self.provider, &self.model, Some(&key));
-                    self.output_lines.push(OutputLine {
-                        type_: "system".into(), content: "OpenRouter API key set.".into(),
-                        tool_name: String::new(), duration: String::new(),
-                    });
-                    if let Some(tx) = &self.agent_tx {
-                        let _ = tx.send(format!("__switch__:openrouter:{}", self.model));
+                    self.input_buf.clear();
+                    self.cursor = 0;
+                    if key.is_empty() {
+                        return true;
                     }
+                    self.awaiting_api_key = false;
+                    let target = self.api_key_target.take().unwrap_or_else(|| self.provider.clone());
+                    self.finish_provider_model_selection(Some((target, key)));
                     return true;
                 }
 
@@ -728,10 +720,19 @@ impl Tui {
                 true
             }
             KeyCode::Char(ch) => {
-                if !self.show_model_picker && !self.show_provider_picker && !self.awaiting_api_key {
+                // Allow typing into the API-key prompt and the normal input
+                // (but not while a list picker is focused).
+                if self.awaiting_api_key
+                    || (!self.show_model_picker
+                        && !self.show_provider_picker
+                        && !self.show_theme_picker
+                        && !self.show_session_picker)
+                {
                     self.input_buf.insert(self.cursor, ch);
                     self.cursor += ch.len_utf8();
-                    self.update_cmd_picker();
+                    if !self.awaiting_api_key {
+                        self.update_cmd_picker();
+                    }
                 }
                 true
             }
@@ -909,7 +910,7 @@ impl Tui {
         // selection index always points at the displayed row.
         names.sort_by_key(|n| usize::from(*n != self.provider));
         self.provider_picker_keys = names.iter()
-            .map(|n| crate::config::config_has_api_key(n)).collect();
+            .map(|n| crate::config::has_usable_credential(n)).collect();
         self.provider_picker_list = names;
         self.provider_picker_sel = 0;
         self.show_provider_picker = true;
@@ -926,6 +927,52 @@ impl Tui {
             self.theme = t.clone();
         }
         self.show_theme_picker = true;
+    }
+
+    fn begin_api_key_prompt(&mut self, provider: &str) {
+        self.awaiting_api_key = true;
+        self.api_key_target = Some(provider.to_string());
+        self.input_buf.clear();
+        self.cursor = 0;
+        let env = crate::config::env_var_name(provider).unwrap_or("API_KEY");
+        self.output_lines.push(OutputLine {
+            type_: "system".into(),
+            content: format!(
+                "Enter API key for {provider} (saved to OS keyring, env {env}). Input is masked."
+            ),
+            tool_name: String::new(),
+            duration: String::new(),
+        });
+    }
+
+    /// Finish provider/model selection, optionally saving a freshly entered key.
+    fn finish_provider_model_selection(&mut self, new_key: Option<(String, String)>) {
+        if let Some((provider, key)) = new_key {
+            crate::config::apply_key_to_env(&provider, &key);
+            let _ = crate::config::save_config(&provider, &self.model, Some(&key));
+            self.provider = provider;
+            let tail = crate::config::mask_secret_display(&key, 4);
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: format!(
+                    "API key saved for {} ({}). Provider set to: {}\nModel set to: {}",
+                    self.provider, tail, self.provider, self.model
+                ),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+        } else {
+            let _ = crate::config::save_config(&self.provider, &self.model, None);
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: format!("Provider set to: {}\nModel set to: {}", self.provider, self.model),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+        }
+        if let Some(tx) = &self.agent_tx {
+            let _ = tx.send(format!("__switch__:{}:{}", self.provider, self.model));
+        }
     }
 
     fn save_session(&mut self) {
@@ -1394,16 +1441,31 @@ impl Tui {
             ]));
             cursor_pos = Some((area.x + display_width("❯ ") as u16 + display_width(before) as u16, prompt_line_idx));
         } else if self.awaiting_api_key {
-            let cursor = self.cursor.min(self.input_buf.len());
-            let nchars = self.input_buf[..cursor].chars().count();
-            let ntotal = self.input_buf.chars().count();
-            let masked: Vec<char> = (0..ntotal).map(|_| '•').collect();
-            let before: String = masked.iter().take(nchars).collect();
-            let after: String = masked.iter().skip(nchars).collect();
+            let target = self.api_key_target.as_deref().unwrap_or(&self.provider);
+            let env_hint = crate::config::env_var_name(target).unwrap_or("API_KEY");
+            let label = format!("{target} API key ({env_hint}) > ");
+            let cursor_chars = self.input_buf[..self.cursor.min(self.input_buf.len())]
+                .chars()
+                .count();
+            let masked = crate::config::mask_secret_display(&self.input_buf, 4);
+            let masked_chars: Vec<char> = masked.chars().collect();
+            let before: String = masked_chars.iter().take(cursor_chars).collect();
+            let after: String = masked_chars.iter().skip(cursor_chars).collect();
             lines.push(Line::from(vec![
-                Span::styled(format!("OpenRouter API key: {before}{after}"), orange_fg),
+                Span::styled(format!("{label}{before}"), orange_fg),
+                Span::styled("▋", orange_fg),
+                Span::styled(after, orange_fg),
             ]));
-            cursor_pos = Some((area.x + display_width("OpenRouter API key: ") as u16 + display_width(&before) as u16, lines.len() - 1));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Hidden as you type (last 4 characters shown). Enter to save  ·  Esc to cancel",
+                    dim,
+                ),
+            ]));
+            cursor_pos = Some((
+                area.x + display_width(&label) as u16 + display_width(&before) as u16,
+                lines.len() - 2,
+            ));
         } else {
             let cursor = self.cursor.min(self.input_buf.len());
             let (before, after) = self.input_buf.split_at(cursor);

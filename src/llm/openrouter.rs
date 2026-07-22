@@ -19,7 +19,10 @@ impl OpenRouterProvider {
 
     fn get_key(&self) -> String {
         if !self.api_key.is_empty() { return self.api_key.clone(); }
-        std::env::var("OPENROUTER_API_KEY").unwrap_or_default()
+        if let Ok(k) = std::env::var("OPENROUTER_API_KEY") {
+            if !k.is_empty() { return k; }
+        }
+        crate::config::config_get_api_key("openrouter").unwrap_or_default()
     }
 }
 
