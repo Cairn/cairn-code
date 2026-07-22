@@ -1,18 +1,12 @@
-<p align="center">
-  <img src="https://img.shields.io/badge/Rust-1.96-F46623?style=for-the-badge&logo=rust&logoColor=white" alt="Rust"><br>
-  <img src="https://img.shields.io/badge/CLI-agentic%20loop-6e40c9?style=for-the-badge" alt="Agent Loop"><br>
-  <img src="https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20OpenRouter%20%7C%20Ollama-f472b6?style=for-the-badge" alt="Multi-Provider"><br>
-  <img src="https://img.shields.io/badge/TUI-ratatui-FF6F00?style=for-the-badge" alt="Ratatui"><br>
-  <img src="https://img.shields.io/badge/Tools-13-22c55e?style=for-the-badge" alt="13 Tools"><br>
-  <img src="https://img.shields.io/badge/Private-Cairn-1a1b26?style=for-the-badge" alt="Private">
-</p>
+# Cairn Code
 
-<h1 align="center">Cairn Code</h1>
+[![Rust](https://img.shields.io/badge/rust-1.96-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/license-private-lightgrey)](#)
+[![Providers](https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20OpenRouter%20%7C%20Ollama-blue)](#)
+[![TUI](https://img.shields.io/badge/TUI-ratatui-yellow)](https://ratatui.rs/)
+[![Tools](https://img.shields.io/badge/tools-13-brightgreen)](#)
 
-<p align="center">
-  <strong>A Rust-based CLI LLM coding agent, inspired by Claude Code.</strong><br>
-  <i>Built by Cairn</i>
-</p>
+A Rust-based CLI LLM coding agent, inspired by Claude Code. Built by Cairn.
 
 ## Features
 
