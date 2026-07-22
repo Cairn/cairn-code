@@ -101,11 +101,6 @@ pub fn default_providers() -> HashMap<String, Box<dyn Provider>> {
     let mut map: HashMap<String, Box<dyn Provider>> = HashMap::new();
     map.insert("anthropic".into(), Box::new(crate::llm::anthropic::AnthropicProvider::new()));
     map.insert("openai".into(), Box::new(crate::llm::openai::OpenAIProvider::new()));
-    let opencode = match crate::config::config_get_api_key("opencode") {
-        Some(key) => crate::llm::opencode::OpenCodeProvider::new().with_api_key(&key),
-        None => crate::llm::opencode::OpenCodeProvider::new(),
-    };
-    map.insert("opencode".into(), Box::new(opencode));
     let openrouter = match crate::config::config_get_api_key("openrouter") {
         Some(key) => crate::llm::openrouter::OpenRouterProvider::new().with_api_key(&key),
         None => crate::llm::openrouter::OpenRouterProvider::new(),

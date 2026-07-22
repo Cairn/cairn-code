@@ -5,7 +5,7 @@
 - [x] Add comprehensive test suite — currently only 14 tests, need coverage for: UI spinner lifecycle, session replay, streaming drain, tool execution, error recovery, all tool implementations
 
 ## Priority: High
-- [x] Add OpenCode provider support — opencode.rs
+- [x] ~~Add OpenCode provider support~~ — removed (OpenCode Zen free API is not acceptable to use)
 - [x] Improve error messages — actionable auth/rate-limit/network/context errors in `http_client.rs` plus clearer missing-API-key messages
 - [x] Add file edit tool safety — workspace-path confinement in `file_edit`/`file_write` (`tools/workspace.rs`), `Tool::needs_permission()` gates execution, shell `timeout` enforced, in-process `file_undo` stack for edit/write
 
@@ -39,7 +39,7 @@ standalone system, not a small port:
 - Model registry with live pricing/context-window/vision metadata
 - Three-way config layering (user/project/env), currently first-match-wins
 - Output/log secret redaction
-- Provider catalog expansion beyond the current 5 (anthropic/openai/opencode/openrouter/ollama)
+- Provider catalog expansion beyond the current 4 (anthropic/openai/openrouter/ollama)
 
 ## Standing Rules
 - Never force push

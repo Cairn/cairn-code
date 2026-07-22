@@ -78,7 +78,6 @@ pub fn env_var_name(provider: &str) -> Option<&'static str> {
         "anthropic" => Some("ANTHROPIC_API_KEY"),
         "openai" => Some("OPENAI_API_KEY"),
         "openrouter" => Some("OPENROUTER_API_KEY"),
-        "opencode" => Some("OPENCODE_API_KEY"),
         _ => None,
     }
 }
@@ -360,7 +359,7 @@ mod tests {
         // env_key_for must return None when the env var is unset, for each known provider.
         // We can't easily unset env vars, so we just check the function returns a String
         // (or None) for the well-known names without panicking.
-        for p in ["anthropic", "openai", "openrouter", "opencode"].iter() {
+        for p in ["anthropic", "openai", "openrouter"].iter() {
             let _ = env_key_for(p);
         }
         // Unknown provider => None

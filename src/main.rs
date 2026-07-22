@@ -54,7 +54,7 @@ fn main() {
         let model = if model_name.is_empty() { p.default_model().to_string() } else { model_name };
         (provider_name, model)
     } else {
-        ("opencode".to_string(), "deepseek-v4-flash-free".to_string())
+        ("anthropic".to_string(), "claude-sonnet-4-20250514".to_string())
     };
 
     let chosen_provider = providers.remove(&p_name).unwrap_or_else(|| {

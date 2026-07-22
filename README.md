@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-1.96-F46623?style=for-the-badge&logo=rust&logoColor=white" alt="Rust"><br>
   <img src="https://img.shields.io/badge/CLI-agentic%20loop-6e40c9?style=for-the-badge" alt="Agent Loop"><br>
-  <img src="https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20OpenCode%20%7C%20OpenRouter%20%7C%20Ollama-f472b6?style=for-the-badge" alt="Multi-Provider"><br>
+  <img src="https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20OpenRouter%20%7C%20Ollama-f472b6?style=for-the-badge" alt="Multi-Provider"><br>
   <img src="https://img.shields.io/badge/TUI-ratatui-FF6F00?style=for-the-badge" alt="Ratatui"><br>
   <img src="https://img.shields.io/badge/Tools-13-22c55e?style=for-the-badge" alt="13 Tools"><br>
   <img src="https://img.shields.io/badge/Private-Cairn-1a1b26?style=for-the-badge" alt="Private">
@@ -16,7 +16,7 @@
 
 ## Features
 
-- **Multi-provider LLM support** — Anthropic (Claude), OpenAI (GPT), OpenCode (free API), OpenRouter, Ollama
+- **Multi-provider LLM support** — Anthropic (Claude), OpenAI (GPT), OpenRouter, Ollama
 - **Agentic tool loop** — The LLM autonomously reads files, writes code, runs commands, and searches your codebase until the task is done
 - **13 built-in tools** — FileRead, FileWrite, FileEdit, FileUndo, Shell, Go, Git, Glob, Grep, Memory, WebSearch, WebFetch, TodoWrite
 - **Real-time streaming** — Token-by-token output with live tool display and thinking blocks
@@ -51,7 +51,7 @@ export OPENAI_API_KEY="sk-..."
 export OPENROUTER_API_KEY="sk-or-..."
 ```
 
-Anthropic is the default provider. The OpenCode provider requires no API key; Ollama talks to a local server.
+Anthropic is the default provider. Ollama talks to a local server and needs no cloud API key.
 
 Optionally create a config file:
 
@@ -99,7 +99,6 @@ src/
     provider.rs          Shared types (Message, Content, ToolDefinition, Provider trait)
     anthropic.rs         Anthropic Messages API client (SSE streaming)
     openai.rs            OpenAI Chat Completions client (streaming)
-    opencode.rs          OpenCode free API client (OpenAI-compatible, streaming)
     openrouter.rs        OpenRouter client (OpenAI-compatible, streaming)
     ollama.rs            Local Ollama client
   tools/
@@ -169,7 +168,7 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `default_provider` | string | `"anthropic"` | LLM provider (`anthropic`, `openai`, `opencode`, `openrouter`, `ollama`) |
+| `default_provider` | string | `"anthropic"` | LLM provider (`anthropic`, `openai`, `openrouter`, `ollama`) |
 | `default_model` | string | `"claude-sonnet-4-20250514"` | Default model identifier |
 | `max_turns` | int | `100` | Maximum agent loop iterations |
 | `max_tokens` | int | `8192` | Max tokens per LLM response |

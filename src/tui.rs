@@ -58,7 +58,7 @@ pub struct Tui {
     confirm_remove_sel: usize,
     awaiting_api_key: bool,
     pending_openrouter_setup: bool,
-    /// Provider name to capture an API key for (e.g. "openrouter", "opencode", "openai").
+    /// Provider name to capture an API key for (e.g. "openrouter", "openai").
     /// When Some, the awaiting_api_key flow stores the key under this provider.
     api_key_target: Option<String>,
     show_command_picker: bool,
