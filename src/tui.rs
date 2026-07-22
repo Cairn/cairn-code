@@ -140,8 +140,9 @@ pub struct Tui {
     show_thinking: bool,
     /// When true, show grayed idle ready-to-send prompts. Default off.
     show_suggestions: bool,
-    /// When true, terminal mouse capture is on (wheel scrolls transcript, but
-    /// native drag-select is blocked). Default off so LLM text is selectable.
+    /// When true, terminal mouse capture is on so the wheel scrolls the
+    /// transcript. Shift+drag still selects text in modern hosts (Windows
+    /// Terminal, iTerm, etc.). Default on.
     mouse_capture: bool,
     /// Leave the TUI and print plain text so the terminal can select/copy freely.
     pending_select: Option<SelectDump>,
@@ -221,7 +222,7 @@ impl Tui {
             idle_suggestion: None,
             show_thinking: false,
             show_suggestions: false,
-            mouse_capture: false,
+            mouse_capture: true,
             pending_select: None,
             thinking_started: None,
         }
@@ -283,7 +284,7 @@ impl Tui {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
                     content: format!(
-                        "Copied last assistant message ({n} chars via {how}). For drag-select use /select (Ctrl+O)."
+                        "Copied last assistant message ({n} chars via {how}). Tip: Shift+drag selects in the TUI; /select (Ctrl+O) for plain-text view."
                     ),
                     tool_name: String::new(),
                     duration: String::new(),
@@ -292,7 +293,9 @@ impl Tui {
             Err(e) => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: format!("Copy failed: {e}. Use /select (Ctrl+O) to drag-select instead."),
+                    content: format!(
+                        "Copy failed: {e}. Try Shift+drag to select, or /select (Ctrl+O)."
+                    ),
                     tool_name: String::new(),
                     duration: String::new(),
                 });
@@ -392,11 +395,11 @@ impl Tui {
     pub fn run(&mut self, rx: mpsc::Receiver<AgentEvent>) -> Result<(), String> {
         let mut terminal = ratatui::init();
         terminal.clear().map_err(|e| e.to_string())?;
-        // Force mouse tracking off. On Windows Terminal, VT mouse mode (or leftover
-        // ENABLE_MOUSE_INPUT) blocks drag-select even if we never call EnableMouseCapture.
-        let _ = execute!(stdout(), DisableMouseCapture);
-        // Keyboard scroll: PgUp/PgDn, Ctrl+U/D, Ctrl+Home/End.
-        // Drag-select in the alt-screen is unreliable on WT; use /select (Ctrl+O).
+        // Wheel scroll for transcript history. Shift+drag is handled by the
+        // terminal host (selects text without sending events to the app).
+        // Plain drag without Shift is for the app; use /select if needed.
+        let _ = execute!(stdout(), EnableMouseCapture);
+        self.mouse_capture = true;
 
         let mut result = Ok(());
         let mut last_spinner_update = std::time::Instant::now();
@@ -1338,9 +1341,9 @@ impl Tui {
                 self.set_mouse_capture(next);
                 let state = if self.mouse_capture { "on" } else { "off" };
                 let detail = if self.mouse_capture {
-                    "Wheel scrolls the transcript. Drag-select is blocked; use Shift+drag in some terminals, or /mouse off."
+                    "Wheel scrolls the transcript. Shift+drag to select and copy (terminal-native)."
                 } else {
-                    "Drag-select and copy LLM text with the mouse (default). Scroll with PgUp/PgDn or Ctrl+U/D."
+                    "Mouse capture off. Select with a normal drag if the host allows it; scroll with PgUp/PgDn or Ctrl+U/D."
                 };
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
@@ -1439,7 +1442,7 @@ impl Tui {
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /auth /clear /compact /copy /cost /delete /exit /help /model /mouse /provider /resume /save /select /sessions /suggestions /theme /thinking\n/select [last|all] or Ctrl+O — plain-text view for drag-select/copy (best on Windows Terminal)\n/copy or Ctrl+Y — copy last assistant message to clipboard\n/mouse [on|off] — wheel scroll (on) vs no mouse capture (off, default)\n/thinking [on|off] · /suggestions [on|off]\nTab completes slash commands\nSounds: CAIRN_SOUND=0 to mute · Scroll: PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End\n/provider xai — browser OAuth; /auth login xai; /auth key xai for API key".into(),
+                    content: "Commands: /auth /clear /compact /copy /cost /delete /exit /help /model /mouse /provider /resume /save /select /sessions /suggestions /theme /thinking\nMouse: wheel scrolls · Shift+drag selects (terminal-native) · /mouse off disables capture\n/select [last|all] or Ctrl+O — plain-text view if you need a full select dump\n/copy or Ctrl+Y — copy last assistant message to clipboard\n/thinking [on|off] · /suggestions [on|off]\nTab completes slash commands · Scroll: PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End\nSounds: CAIRN_SOUND=0 to mute · /provider xai — OAuth; /auth login xai".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
             }
