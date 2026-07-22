@@ -79,6 +79,9 @@ pub struct Tui {
     perm_tool_name: String,
     perm_tool_input: String,
     perm_selection: usize,
+    /// After an LLM/provider failure: offer Switch model / Switch provider / Dismiss.
+    show_recovery_prompt: bool,
+    recovery_selection: usize,
 }
 
 impl Tui {
@@ -132,6 +135,8 @@ impl Tui {
             perm_tool_name: String::new(),
             perm_tool_input: String::new(),
             perm_selection: 0,
+            show_recovery_prompt: false,
+            recovery_selection: 0,
         }
     }
 
@@ -182,6 +187,11 @@ impl Tui {
                             self.output_lines.push(OutputLine {
                                 type_: "error".into(), content: e, tool_name: String::new(), duration: String::new(),
                             });
+                            // AgentEvent::Error is only emitted for LLM/provider failures
+                            // (tool failures become tool results). Offer a manual switch,
+                            // never silent fallback to another provider.
+                            self.show_recovery_prompt = true;
+                            self.recovery_selection = 0;
                         }
                         AgentEvent::PermissionRequest(name, input) => {
                             self.flush_streaming();
@@ -300,6 +310,41 @@ impl Tui {
                     self.show_permission_prompt = false;
                     if let Some(tx) = &self.perm_tx {
                         let _ = tx.send("deny".to_string());
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+
+        if self.show_recovery_prompt {
+            match key.code {
+                KeyCode::Left => {
+                    self.recovery_selection = self.recovery_selection.saturating_sub(1);
+                }
+                KeyCode::Right => {
+                    if self.recovery_selection < 2 {
+                        self.recovery_selection += 1;
+                    }
+                }
+                KeyCode::Char('m') | KeyCode::Char('M') => {
+                    self.show_recovery_prompt = false;
+                    self.open_model_picker();
+                }
+                KeyCode::Char('p') | KeyCode::Char('P') => {
+                    self.show_recovery_prompt = false;
+                    self.open_provider_picker();
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Esc => {
+                    self.show_recovery_prompt = false;
+                }
+                KeyCode::Enter => {
+                    let sel = self.recovery_selection;
+                    self.show_recovery_prompt = false;
+                    match sel {
+                        0 => self.open_model_picker(),
+                        1 => self.open_provider_picker(),
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -565,6 +610,7 @@ impl Tui {
 
                 self.history.push(input.clone());
                 self.hist_idx = self.history.len();
+                self.show_recovery_prompt = false;
                 self.output_lines.push(OutputLine {
                     type_: "user".into(), content: input.clone(),
                     tool_name: String::new(), duration: String::new(),
@@ -649,9 +695,7 @@ impl Tui {
                         tool_name: String::new(), duration: String::new(),
                     });
                 } else {
-                    self.show_model_picker = true;
-                    self.picker_sel = 0;
-                    self.picker_scrl = 0;
+                    self.open_model_picker();
                 }
             }
             "/cost" => {
@@ -667,22 +711,12 @@ impl Tui {
                 });
             }
             "/provider" => {
-                let providers = crate::llm::default_providers();
-                let mut names: Vec<String> = providers.into_keys().collect();
-                names.sort();
-                // Current provider first, matching render order so the
-                // selection index always points at the displayed row.
-                names.sort_by_key(|n| usize::from(*n != self.provider));
-                self.provider_picker_keys = names.iter()
-                    .map(|n| crate::config::config_has_api_key(n)).collect();
-                self.provider_picker_list = names;
-                self.provider_picker_sel = 0;
-                self.show_provider_picker = true;
+                self.open_provider_picker();
             }
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /clear /cost /delete /exit /help /model /provider /resume /save /sessions".into(),
+                    content: "Commands: /clear /cost /delete /exit /help /model /provider /resume /save /sessions\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
             }
@@ -753,6 +787,31 @@ impl Tui {
 
     fn sessions_dir(&self) -> String {
         crate::config::sessions_dir()
+    }
+
+    fn open_model_picker(&mut self) {
+        let providers = crate::llm::default_providers();
+        if let Some(p) = providers.get(&self.provider) {
+            self.picker_models = p.available_models();
+        }
+        self.show_model_picker = true;
+        self.picker_sel = self.picker_models.iter().position(|m| m.id == self.model).unwrap_or(0);
+        let vh = self.picker_visible_height();
+        self.picker_scrl = self.picker_sel.saturating_sub(vh.saturating_sub(1));
+    }
+
+    fn open_provider_picker(&mut self) {
+        let providers = crate::llm::default_providers();
+        let mut names: Vec<String> = providers.into_keys().collect();
+        names.sort();
+        // Current provider first, matching render order so the
+        // selection index always points at the displayed row.
+        names.sort_by_key(|n| usize::from(*n != self.provider));
+        self.provider_picker_keys = names.iter()
+            .map(|n| crate::config::config_has_api_key(n)).collect();
+        self.provider_picker_list = names;
+        self.provider_picker_sel = 0;
+        self.show_provider_picker = true;
     }
 
     fn save_session(&mut self) {
@@ -1174,6 +1233,41 @@ impl Tui {
             lines.push(Line::from(option_spans));
             lines.push(Line::from(vec![
                 Span::styled("(← → navigate  Enter confirm  Esc deny)", dim),
+            ]));
+            cursor_pos = Some((area.x + display_width("❯ ") as u16 + display_width(before) as u16, prompt_line_idx));
+        } else if self.show_recovery_prompt {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("LLM failed ({}/{}). Switch and retry your request:", self.provider, self.model),
+                    white,
+                ),
+            ]));
+            lines.push(Line::from(""));
+            let options = ["Switch model (m)", "Switch provider (p)", "Dismiss (d)"];
+            let mut option_spans = Vec::new();
+            for (i, opt) in options.iter().enumerate() {
+                if i > 0 { option_spans.push(Span::raw("  ")); }
+                let is_sel = i == self.recovery_selection;
+                let open = if is_sel { "[" } else { " " };
+                let close = if is_sel { "]" } else { " " };
+                option_spans.push(Span::styled(
+                    format!("{open}{opt}{close}"),
+                    if is_sel { orange_fg.add_modifier(Modifier::BOLD) } else { dim },
+                ));
+            }
+            lines.push(Line::from(option_spans));
+            lines.push(Line::from(vec![
+                Span::styled("(← → navigate  Enter confirm  Esc dismiss)", dim),
+            ]));
+            let cursor = self.cursor.min(self.input_buf.len());
+            let (before, after) = self.input_buf.split_at(cursor);
+            let prompt_line_idx = lines.len();
+            lines.push(Line::from(vec![
+                Span::styled("❯ ", orange_fg),
+                Span::raw(before),
+                Span::styled("▋", orange_fg),
+                Span::raw(after),
             ]));
             cursor_pos = Some((area.x + display_width("❯ ") as u16 + display_width(before) as u16, prompt_line_idx));
         } else if self.awaiting_api_key {

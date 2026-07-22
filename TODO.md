@@ -14,7 +14,7 @@
 - [x] Store API keys in the OS keyring instead of plaintext in config.json (with one-time migration of existing plaintext keys)
 - [x] Improve session management — listing/save/resume/delete (`/sessions`, `/save`, `/resume`, `/delete [id]`)
 - [x] Add syntax highlighting for code blocks in output — syntect (`default-fancy`) in `markdown.rs`
-- [ ] Support multiple AI providers simultaneously — fallback between providers
+- [x] Recovery switch after LLM failure — TUI offers Switch model / Switch provider / Dismiss (no silent multi-provider fallback)
 - [x] Add cost tracking per session — token usage, estimated cost (`cost.rs`, `/cost`)
 - [x] Add HTTP retry-with-backoff (429/503/529) and a stream idle-timeout watchdog (`http_client.rs`)
 - [x] Thread cancellation through the streaming path and tool-execution loop (`agent.rs`, `Provider::stream_complete`), not just once per turn

@@ -158,6 +158,7 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | `/model` | Show or change the current model |
 | `/cost` | Show token usage for the session |
 | `/provider` | Show or change the current provider |
+| *(after LLM error)* | Prompt: switch model (`m`), switch provider (`p`), or dismiss (`d`/Esc) |
 | `/save` | Save the current session |
 | `/sessions` | List saved sessions |
 | `/resume` | Resume a saved session (picker) |
