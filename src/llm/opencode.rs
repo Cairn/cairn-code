@@ -99,7 +99,7 @@ impl Provider for OpenCodeProvider {
             body: Some(body),
         };
         let resp = http_client::request(&req)?;
-        parse_opencode_response(&resp.body)
+        parse_opencode_complete_response(&resp.body)
     }
 }
 
@@ -191,6 +191,44 @@ fn parse_opencode_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
     Ok((messages, usage))
 }
 
+fn parse_opencode_complete_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
+    let mut messages = Vec::new();
+    let mut usage = Usage::default();
+
+    let val = json::parse(raw).map_err(|e| format!("Failed to parse response: {e}"))?;
+
+    if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
+        if let Some(choice) = choices.first() {
+            if let Some(msg) = choice.get("message") {
+                let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("assistant").to_string();
+                let content = if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
+                    Content::Text(text.to_string())
+                } else if let Some(tc_arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                    let mut calls: Vec<_> = tc_arr.iter().enumerate().collect();
+                    calls.sort_by_key(|(i, _)| *i);
+                    let tu = calls.into_iter().next().map(|(_, tc)| {
+                        let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let name = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let args = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}").to_string();
+                        super::provider::ToolUse { id, name, input: args }
+                    }).unwrap_or(super::provider::ToolUse {
+                        id: String::new(), name: String::new(), input: "{}".into(),
+                    });
+                    Content::ToolUse(tu)
+                } else {
+                    Content::Text(String::new())
+                };
+                messages.push(Message { role, content });
+            }
+        }
+    }
+    if let Some(u) = val.get("usage") {
+        usage.input_tokens = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        usage.output_tokens = u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    }
+    Ok((messages, usage))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +303,33 @@ mod tests {
         assert!(msgs.is_empty());
         assert_eq!(usage.input_tokens, 0);
         assert_eq!(usage.output_tokens, 0);
+    }
+
+    #[test]
+    fn test_parse_complete_response_collects_text() {
+        // stream:false returns a flat chat.completion object, not SSE lines.
+        let raw = r#"{"id":"x","object":"chat.completion","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"pong"}}],"usage":{"prompt_tokens":89,"completion_tokens":1}}"#;
+        let (msgs, usage) = parse_opencode_complete_response(raw).unwrap();
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0].content {
+            Content::Text(t) => assert_eq!(t, "pong"),
+            _ => panic!("expected Text content"),
+        }
+        assert_eq!(usage.input_tokens, 89);
+        assert_eq!(usage.output_tokens, 1);
+    }
+
+    #[test]
+    fn test_parse_complete_response_tool_call() {
+        let raw = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","function":{"name":"glob","arguments":"{\"pattern\":\"*.rs\"}"}}]}}]}"#;
+        let (msgs, _usage) = parse_opencode_complete_response(raw).unwrap();
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0].content {
+            Content::ToolUse(tu) => {
+                assert_eq!(tu.id, "call_1");
+                assert_eq!(tu.name, "glob");
+            }
+            _ => panic!("expected ToolUse content"),
+        }
     }
 }
