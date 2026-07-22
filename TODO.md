@@ -12,8 +12,8 @@
 ## Priority: Medium
 - [x] Add configuration file support (~/.config/cairn-code/config.json) — model selection, API keys, defaults
 - [x] Store API keys in the OS keyring instead of plaintext in config.json (with one-time migration of existing plaintext keys)
-- [ ] Improve session management — listing/save/resume exist (`/sessions`, `/save`, `/resume`); still missing deletion from CLI
-- [ ] Add syntax highlighting for code blocks in output
+- [x] Improve session management — listing/save/resume/delete (`/sessions`, `/save`, `/resume`, `/delete [id]`)
+- [x] Add syntax highlighting for code blocks in output — syntect (`default-fancy`) in `markdown.rs`
 - [ ] Support multiple AI providers simultaneously — fallback between providers
 - [x] Add cost tracking per session — token usage, estimated cost (`cost.rs`, `/cost`)
 - [x] Add HTTP retry-with-backoff (429/503/529) and a stream idle-timeout watchdog (`http_client.rs`)

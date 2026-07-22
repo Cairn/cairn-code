@@ -66,6 +66,8 @@ pub struct Tui {
     cmd_picker_filtered: Vec<String>,
     cmd_picker_sel: usize,
     show_session_picker: bool,
+    /// When true, Enter on the session picker deletes instead of resuming.
+    session_picker_delete: bool,
     picker_sessions: Vec<session::SessionSummary>,
     picker_session_sel: usize,
     picker_session_scrl: usize,
@@ -110,10 +112,15 @@ impl Tui {
             pending_openrouter_setup: false,
             api_key_target: None,
             show_command_picker: false,
-            cmd_picker_list: vec!["/clear".into(), "/cost".into(), "/exit".into(), "/help".into(), "/model".into(), "/provider".into(), "/quit".into(), "/q".into(), "/resume".into(), "/save".into(), "/sessions".into()],
+            cmd_picker_list: vec![
+                "/clear".into(), "/cost".into(), "/delete".into(), "/exit".into(), "/help".into(),
+                "/model".into(), "/provider".into(), "/quit".into(), "/q".into(),
+                "/resume".into(), "/save".into(), "/sessions".into(),
+            ],
             cmd_picker_filtered: Vec::new(),
             cmd_picker_sel: 0,
             show_session_picker: false,
+            session_picker_delete: false,
             picker_sessions: Vec::new(),
             picker_session_sel: 0,
             picker_session_scrl: 0,
@@ -420,7 +427,10 @@ impl Tui {
                 } else if self.show_command_picker { self.show_command_picker = false; }
                 else if self.show_provider_picker { self.show_provider_picker = false; }
                 else if self.show_model_picker { self.show_model_picker = false; }
-                else if self.show_session_picker { self.show_session_picker = false; }
+                else if self.show_session_picker {
+                    self.show_session_picker = false;
+                    self.session_picker_delete = false;
+                }
                 else if matches!(self.state, State::Running) {
                     if let Some(flag) = &self.cancel_flag {
                         flag.store(true, Ordering::Relaxed);
@@ -513,10 +523,17 @@ impl Tui {
                 if self.show_session_picker {
                     if self.picker_session_sel < self.picker_sessions.len() {
                         let id = self.picker_sessions[self.picker_session_sel].id.clone();
+                        let deleting = self.session_picker_delete;
                         self.show_session_picker = false;
-                        self.resume_session(&id);
+                        self.session_picker_delete = false;
+                        if deleting {
+                            self.delete_session(&id);
+                        } else {
+                            self.resume_session(&id);
+                        }
                     } else {
                         self.show_session_picker = false;
+                        self.session_picker_delete = false;
                     }
                     return true;
                 }
@@ -665,7 +682,7 @@ impl Tui {
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /clear /cost /exit /help /model /provider /resume /save /sessions".into(),
+                    content: "Commands: /clear /cost /delete /exit /help /model /provider /resume /save /sessions".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
             }
@@ -674,6 +691,36 @@ impl Tui {
             }
             "/sessions" => {
                 self.list_sessions();
+            }
+            "/delete" => {
+                if parts.len() > 1 {
+                    let query = parts[1..].join(" ");
+                    match session::resolve_id(&self.sessions_dir(), &query) {
+                        Ok(id) => self.delete_session(&id),
+                        Err(e) => {
+                            self.output_lines.push(OutputLine {
+                                type_: "error".into(),
+                                content: e,
+                                tool_name: String::new(), duration: String::new(),
+                            });
+                        }
+                    }
+                } else {
+                    let sessions = session::list(&self.sessions_dir()).unwrap_or_default();
+                    if sessions.is_empty() {
+                        self.output_lines.push(OutputLine {
+                            type_: "system".into(),
+                            content: "No saved sessions to delete.".into(),
+                            tool_name: String::new(), duration: String::new(),
+                        });
+                    } else {
+                        self.show_session_picker = true;
+                        self.session_picker_delete = true;
+                        self.picker_sessions = sessions;
+                        self.picker_session_sel = 0;
+                        self.picker_session_scrl = 0;
+                    }
+                }
             }
             "/resume" => {
                 let sessions = session::list(&self.sessions_dir()).unwrap_or_default();
@@ -685,6 +732,7 @@ impl Tui {
                     });
                 } else {
                     self.show_session_picker = true;
+                    self.session_picker_delete = false;
                     self.picker_sessions = sessions;
                     self.picker_session_sel = 0;
                     self.picker_session_scrl = 0;
@@ -785,6 +833,26 @@ impl Tui {
             content: msg.trim_end().to_string(),
             tool_name: String::new(), duration: String::new(),
         });
+    }
+
+    fn delete_session(&mut self, id: &str) {
+        let short = if id.len() >= 8 { &id[..8] } else { id };
+        match session::delete(&self.sessions_dir(), id) {
+            Ok(()) => {
+                self.output_lines.push(OutputLine {
+                    type_: "system".into(),
+                    content: format!("Deleted session {short}."),
+                    tool_name: String::new(), duration: String::new(),
+                });
+            }
+            Err(e) => {
+                self.output_lines.push(OutputLine {
+                    type_: "error".into(),
+                    content: format!("Failed to delete session: {e}"),
+                    tool_name: String::new(), duration: String::new(),
+                });
+            }
+        }
     }
 
     fn resume_session(&mut self, id: &str) {
@@ -1035,9 +1103,19 @@ impl Tui {
             let num = self.picker_sessions.len();
             let bg_orange = Style::new().bg(Color::Indexed(215)).fg(Color::Indexed(230));
 
+            let title = if self.session_picker_delete {
+                "── Delete Session "
+            } else {
+                "── Resume Session "
+            };
+            let hint = if self.session_picker_delete {
+                "(↑↓ navigate  Enter delete  Esc cancel) ──"
+            } else {
+                "(↑↓ navigate  Enter select  Esc cancel) ──"
+            };
             lines.push(Line::from(vec![
-                Span::styled("── Resume Session ", orange_fg.add_modifier(Modifier::BOLD)),
-                Span::styled("(↑↓ navigate  Enter select  Esc cancel) ──", bold_dim),
+                Span::styled(title, orange_fg.add_modifier(Modifier::BOLD)),
+                Span::styled(hint, bold_dim),
             ]));
             if num > visible {
                 lines.push(Line::from(vec![Span::styled(format!("  … {}/{}  ↑↓ scroll", self.picker_session_sel + 1, num), dim)]));

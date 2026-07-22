@@ -41,6 +41,47 @@ pub fn load(sessions_dir: &str, id: &str) -> Result<Session, String> {
     session_from_json(&content)
 }
 
+/// Deletes a saved session file. `id` must be an exact session id (no path
+/// separators). Use [`resolve_id`] first when the user only typed a prefix.
+pub fn delete(sessions_dir: &str, id: &str) -> Result<(), String> {
+    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+        return Err("invalid session id".into());
+    }
+    let path = PathBuf::from(sessions_dir).join(id);
+    if !path.is_file() {
+        return Err(format!("session not found: {id}"));
+    }
+    fs::remove_file(&path).map_err(|e| format!("delete: {e}"))
+}
+
+/// Resolve a full session id from an exact id or unique prefix (as shown in
+/// `/sessions`, which displays the first 8 hex characters).
+pub fn resolve_id(sessions_dir: &str, query: &str) -> Result<String, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Err("session id required".into());
+    }
+    if q.contains('/') || q.contains('\\') || q.contains("..") {
+        return Err("invalid session id".into());
+    }
+    let sessions = list(sessions_dir)?;
+    let matches: Vec<&SessionSummary> = sessions.iter()
+        .filter(|s| s.id == q || s.id.starts_with(q))
+        .collect();
+    match matches.as_slice() {
+        [] => Err(format!("session not found: {q}")),
+        [one] => Ok(one.id.clone()),
+        many => {
+            let ids: Vec<&str> = many.iter().map(|s| &s.id[..s.id.len().min(8)]).collect();
+            Err(format!(
+                "ambiguous session id '{q}' matches {}: {}",
+                many.len(),
+                ids.join(", ")
+            ))
+        }
+    }
+}
+
 pub fn list(sessions_dir: &str) -> Result<Vec<SessionSummary>, String> {
     let dir = PathBuf::from(sessions_dir);
     if !dir.exists() {
@@ -231,5 +272,47 @@ mod tests {
     fn test_load_nonexistent() {
         let result = load("/nonexistent/path/xyz123", "nonexistent");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_delete_removes_session_and_resolve_prefix() {
+        let test_id = format!("test-{}", new_id());
+        let dir = std::env::temp_dir().join(format!("cairn-test-session-del-{}", new_id()));
+        let dir_str = dir.to_string_lossy().to_string();
+        fs::create_dir_all(&dir).unwrap();
+
+        let session = Session {
+            id: test_id.clone(),
+            messages: vec![
+                Message { role: "user".into(), content: crate::llm::Content::Text("hello".into()) },
+            ],
+            model: "mock".into(),
+            provider: "mock".into(),
+            tokens_in: 1,
+            tokens_out: 1,
+            created_at: 0,
+            updated_at: 0,
+        };
+        save(&dir_str, &session).unwrap();
+        assert!(dir.join(&test_id).is_file());
+
+        let prefix = &test_id[..8];
+        let resolved = resolve_id(&dir_str, prefix).unwrap();
+        assert_eq!(resolved, test_id);
+
+        delete(&dir_str, &resolved).unwrap();
+        assert!(!dir.join(&test_id).is_file());
+        assert!(load(&dir_str, &test_id).is_err());
+        assert!(delete(&dir_str, &test_id).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_delete_rejects_path_traversal() {
+        let err = delete(".", "../Cargo.toml").unwrap_err();
+        assert!(err.contains("invalid"), "got: {err}");
+        let err = resolve_id(".", "..\\foo").unwrap_err();
+        assert!(err.contains("invalid"), "got: {err}");
     }
 }

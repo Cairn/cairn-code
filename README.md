@@ -20,11 +20,11 @@
 - **Agentic tool loop** — The LLM autonomously reads files, writes code, runs commands, and searches your codebase until the task is done
 - **13 built-in tools** — FileRead, FileWrite, FileEdit, FileUndo, Shell, Go, Git, Glob, Grep, Memory, WebSearch, WebFetch, TodoWrite
 - **Real-time streaming** — Token-by-token output with live tool display and thinking blocks
-- **Ratatui TUI** — Terminal UI with input history, spinner, and provider/model pickers
+- **Ratatui TUI** — Terminal UI with input history, spinner, provider/model pickers, and syntect-highlighted fenced code blocks
 - **Cost tracking** — Per-session and per-tool-call token usage with cache-aware pricing
 - **Permission system** — Per-tool auto_allow/ask/deny configuration
 - **Print mode** — Non-interactive execution for scripting and pipelines
-- **Minimal deps** — Just `ratatui` and `ureq`; LLM calls go through `ureq`, JSON is a hand-written recursive descent parser, and the web tools shell out to `curl`
+- **Minimal deps** — `ratatui`, `keyring`, and `syntect` for code fences; JSON is a hand-written recursive descent parser; LLM HTTP and web tools shell out to `curl`
 
 ## Quick Start
 
@@ -92,7 +92,7 @@ src/
   cost.rs                Model pricing tables and cost estimation
   http_client.rs         HTTP client via ureq (blocking + streaming)
   json.rs                Hand-written recursive descent JSON parser
-  markdown.rs            Markdown rendering for TUI output
+  markdown.rs            Markdown rendering + syntect code-block highlighting
   session.rs             Session persistence (save/load/list)
   tui.rs                 Ratatui terminal UI
   llm/
@@ -161,7 +161,8 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | `/provider` | Show or change the current provider |
 | `/save` | Save the current session |
 | `/sessions` | List saved sessions |
-| `/resume` | Resume a saved session |
+| `/resume` | Resume a saved session (picker) |
+| `/delete` | Delete a saved session (picker, or `/delete <id-prefix>`) |
 | `/quit`, `/exit`, `/q` | Exit Cairn Code |
 
 ## Configuration Reference
