@@ -101,6 +101,14 @@ mod tests {
     }
 
     #[test]
+    fn test_workspace_escape_after_nonexistent_prefix_is_rejected() {
+        let tool = FileEditTool;
+        let input = r#"{"file_path":"target/cairn_missing_edit_prefix/../../../outside_cairn_edit_test.txt","old_string":"a","new_string":"b"}"#;
+        let err = tool.execute(input).unwrap_err();
+        assert!(err.contains("outside the workspace"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn test_exact_match_replaces_content() {
         let path = "target/cairn_file_edit_test_exact.txt";
         fs::write(path, "hello world").unwrap();

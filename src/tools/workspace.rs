@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 /// Resolves `path` against the current working directory and refuses any
 /// path that would end up outside it (`..` escapes, absolute paths
@@ -10,6 +10,11 @@ pub fn resolve_in_workspace(path: &str) -> Result<PathBuf, String> {
     let cwd = cwd.canonicalize().unwrap_or(cwd);
 
     let candidate = std::path::Path::new(path);
+    if candidate.components().any(|part| matches!(part, Component::ParentDir)) {
+        return Err(format!(
+            "refusing to access '{path}': outside the workspace (parent-directory traversal is not allowed)"
+        ));
+    }
     let absolute = if candidate.is_absolute() { candidate.to_path_buf() } else { cwd.join(candidate) };
 
     // Walk up to the deepest ancestor that actually exists so it can be
@@ -40,6 +45,25 @@ mod tests {
     #[test]
     fn test_rejects_path_escaping_workspace() {
         let err = resolve_in_workspace("../../outside.txt").unwrap_err();
+        assert!(err.contains("outside the workspace"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_rejects_traversal_after_nonexistent_prefix() {
+        let err = resolve_in_workspace(
+            "target/cairn_workspace_missing_prefix/../../../outside.txt",
+        )
+        .unwrap_err();
+        assert!(err.contains("outside the workspace"), "unexpected error: {err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_rejects_windows_traversal_after_nonexistent_prefix() {
+        let err = resolve_in_workspace(
+            r"target\cairn_workspace_missing_prefix\..\..\..\outside.txt",
+        )
+        .unwrap_err();
         assert!(err.contains("outside the workspace"), "unexpected error: {err}");
     }
 

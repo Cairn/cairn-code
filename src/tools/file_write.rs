@@ -43,6 +43,14 @@ mod tests {
     }
 
     #[test]
+    fn test_workspace_escape_after_nonexistent_prefix_is_rejected() {
+        let tool = FileWriteTool;
+        let input = r#"{"file_path":"target/cairn_missing_write_prefix/../../../outside_cairn_write_test.txt","content":"x"}"#;
+        let err = tool.execute(input).unwrap_err();
+        assert!(err.contains("outside the workspace"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn test_write_creates_file_with_content() {
         let path = "target/cairn_file_write_test.txt";
         let tool = FileWriteTool;
