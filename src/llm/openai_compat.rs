@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use super::provider::*;
 use crate::json;
@@ -5,12 +6,40 @@ use crate::json;
 /// Shared parsing/serialization for OpenAI-compatible chat-completions APIs
 /// (openai, ollama, openrouter, and opengateway all speak this dialect).
 
-pub fn escape_json_str(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+/// Escape a string for embedding in a JSON string value.
+///
+/// Single-pass scan: strings with no special characters are returned as
+/// `Cow::Borrowed` (zero allocation). Otherwise builds one `String` with the
+/// escapes applied. Replaces the old five-chained `.replace()` path.
+pub fn escape_json_str(s: &str) -> Cow<'_, str> {
+    let bytes = s.as_bytes();
+    let mut first_escape = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        // Specials are all ASCII, so this index is always a char boundary.
+        if b == b'\\' || b == b'"' || b == b'\n' || b == b'\r' || b == b'\t' {
+            first_escape = Some(i);
+            break;
+        }
+    }
+
+    let first_idx = match first_escape {
+        Some(idx) => idx,
+        None => return Cow::Borrowed(s),
+    };
+
+    let mut out = String::with_capacity(s.len() + s.len() / 4);
+    out.push_str(&s[..first_idx]);
+    for c in s[first_idx..].chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    Cow::Owned(out)
 }
 
 pub fn build_messages_json(messages: &[Message], system: &str) -> String {
@@ -271,5 +300,19 @@ mod tests {
     fn test_escape_handles_newlines() {
         let escaped = escape_json_str("line1\nline2\ttabbed\r");
         assert_eq!(escaped, "line1\\nline2\\ttabbed\\r");
+        assert!(matches!(escaped, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn test_escape_plain_string_is_borrowed() {
+        let s = "hello world no specials";
+        let escaped = escape_json_str(s);
+        assert_eq!(escaped, s);
+        assert!(matches!(escaped, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_escape_quotes_and_backslash() {
+        assert_eq!(escape_json_str(r#"say "hi" \ ok"#), r#"say \"hi\" \\ ok"#);
     }
 }
