@@ -1,5 +1,30 @@
+use std::sync::OnceLock;
+
 use ratatui::style::{Style, Modifier, Color};
 use ratatui::text::{Line, Span};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Style as SynStyle, Theme, ThemeSet};
+use syntect::parsing::SyntaxSet;
+use syntect::util::LinesWithEndings;
+
+static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+static THEME: OnceLock<Theme> = OnceLock::new();
+
+fn syntax_set() -> &'static SyntaxSet {
+    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+
+fn theme() -> &'static Theme {
+    THEME.get_or_init(|| {
+        let themes = ThemeSet::load_defaults();
+        themes
+            .themes
+            .get("base16-ocean.dark")
+            .or_else(|| themes.themes.get("Solarized (dark)"))
+            .cloned()
+            .unwrap_or_else(|| themes.themes.values().next().cloned().expect("syntect ships at least one theme"))
+    })
+}
 
 pub fn render(text: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -10,7 +35,7 @@ pub fn render(text: &str) -> Vec<Line<'static>> {
     for raw_line in text.split('\n') {
         if raw_line.starts_with("```") {
             if in_code_block {
-                lines.push(render_code_block(&code_block_lines, &code_lang));
+                lines.extend(render_code_block(&code_block_lines, &code_lang));
                 code_block_lines.clear();
                 code_lang.clear();
                 in_code_block = false;
@@ -50,7 +75,7 @@ pub fn render(text: &str) -> Vec<Line<'static>> {
     }
 
     if in_code_block {
-        lines.push(render_code_block(&code_block_lines, &code_lang));
+        lines.extend(render_code_block(&code_block_lines, &code_lang));
     }
 
     lines
@@ -113,19 +138,73 @@ fn render_list_item(line: &str) -> Option<Line<'static>> {
     None
 }
 
-fn render_code_block(lines: &[String], _lang: &str) -> Line<'static> {
-    let mut spans = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("\n"));
-        }
-        let escaped = line
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;");
-        spans.push(Span::styled(escaped, Style::new().fg(Color::Indexed(82))));
+/// One ratatui `Line` per source line. Uses syntect when a language is known
+/// (or guessable); falls back to monochrome green on highlight failure.
+fn render_code_block(lines: &[String], lang: &str) -> Vec<Line<'static>> {
+    if lines.is_empty() {
+        return vec![Line::from("")];
     }
-    Line::from(spans)
+
+    let mono = Style::new().fg(Color::Indexed(82));
+    let code = lines.join("\n");
+    let ss = syntax_set();
+    let syntax = if lang.is_empty() {
+        ss.find_syntax_plain_text()
+    } else {
+        ss.find_syntax_by_token(lang)
+            .or_else(|| ss.find_syntax_by_extension(lang))
+            .or_else(|| ss.find_syntax_by_name(lang))
+            .unwrap_or_else(|| ss.find_syntax_plain_text())
+    };
+
+    let mut highlighter = HighlightLines::new(syntax, theme());
+    let mut out = Vec::new();
+
+    for line in LinesWithEndings::from(&code) {
+        match highlighter.highlight_line(line, ss) {
+            Ok(ranges) => {
+                let mut spans = Vec::new();
+                for (style, text) in ranges {
+                    let text = text.trim_end_matches(['\r', '\n']);
+                    if text.is_empty() {
+                        continue;
+                    }
+                    spans.push(Span::styled(text.to_string(), syntect_style_to_ratatui(style)));
+                }
+                if spans.is_empty() {
+                    out.push(Line::from(""));
+                } else {
+                    out.push(Line::from(spans));
+                }
+            }
+            Err(_) => {
+                out.push(Line::from(Span::styled(
+                    line.trim_end_matches(['\r', '\n']).to_string(),
+                    mono,
+                )));
+            }
+        }
+    }
+
+    if out.is_empty() {
+        out.push(Line::from(""));
+    }
+    out
+}
+
+fn syntect_style_to_ratatui(style: SynStyle) -> Style {
+    let fg = style.foreground;
+    let mut s = Style::new().fg(Color::Rgb(fg.r, fg.g, fg.b));
+    if style.font_style.contains(syntect::highlighting::FontStyle::BOLD) {
+        s = s.add_modifier(Modifier::BOLD);
+    }
+    if style.font_style.contains(syntect::highlighting::FontStyle::ITALIC) {
+        s = s.add_modifier(Modifier::ITALIC);
+    }
+    if style.font_style.contains(syntect::highlighting::FontStyle::UNDERLINE) {
+        s = s.add_modifier(Modifier::UNDERLINED);
+    }
+    s
 }
 
 fn render_inline(text: &str, base: Style) -> Line<'static> {
@@ -301,12 +380,29 @@ mod tests {
     fn test_code_block() {
         let lines = render("```\nlet x = 42;\n```");
         assert_eq!(lines.len(), 1);
+        assert!(lines[0].to_string().contains("let x = 42"));
     }
 
     #[test]
     fn test_code_block_with_lang() {
-        let lines = render("```rust\nfn main() {}\n```");
+        let lines = render("```rust\nfn main() {\n    let x = 1;\n}\n```");
+        assert_eq!(lines.len(), 3, "one Line per source line, got {lines:?}");
+        let joined: String = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("fn main"), "got: {joined}");
+        assert!(joined.contains("let x"), "got: {joined}");
+        // At least one span should use a non-default RGB color from the theme
+        // (syntect highlight for Rust keywords/identifiers).
+        let has_rgb = lines.iter().any(|line| {
+            line.spans.iter().any(|sp| matches!(sp.style.fg, Some(Color::Rgb(_, _, _))))
+        });
+        assert!(has_rgb, "expected syntect RGB colors on rust fence");
+    }
+
+    #[test]
+    fn test_code_block_unknown_lang_still_renders() {
+        let lines = render("```not-a-real-lang\nfoo bar\n```");
         assert_eq!(lines.len(), 1);
+        assert!(lines[0].to_string().contains("foo bar"));
     }
 
     #[test]
