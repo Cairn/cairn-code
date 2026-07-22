@@ -165,6 +165,7 @@ fn parse_opencode_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
     let mut messages = Vec::new();
     let mut usage = Usage::default();
     let mut collected = String::new();
+    let mut tool_calls: std::collections::HashMap<u64, (String, String, String)> = std::collections::HashMap::new();
     for line in raw.lines() {
         if let Some(data) = line.strip_prefix("data: ") {
             if data == "[DONE]" { continue; }
@@ -174,6 +175,23 @@ fn parse_opencode_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
                         if let Some(delta) = choice.get("delta") {
                             if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
                                 collected.push_str(text);
+                            }
+                            if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                for tc in tc_arr {
+                                    let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let entry = tool_calls.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
+                                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                        if !id.is_empty() { entry.0 = id.to_string(); }
+                                    }
+                                    if let Some(func) = tc.get("function") {
+                                        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                            if !name.is_empty() { entry.1 = name.to_string(); }
+                                        }
+                                        if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                            entry.2.push_str(args);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -185,8 +203,20 @@ fn parse_opencode_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
             }
         }
     }
-    if !collected.is_empty() {
-        messages.push(Message { role: "assistant".into(), content: Content::Text(collected) });
+    if !collected.is_empty() || !tool_calls.is_empty() {
+        let content = if !collected.is_empty() {
+            Content::Text(collected)
+        } else {
+            let mut calls: Vec<_> = tool_calls.into_iter().collect();
+            calls.sort_by_key(|(idx, _)| *idx);
+            let tu = calls.into_iter().next().map(|(_, (id, name, args))| {
+                super::provider::ToolUse { id, name, input: args }
+            }).unwrap_or(super::provider::ToolUse {
+                id: String::new(), name: String::new(), input: "{}".into(),
+            });
+            Content::ToolUse(tu)
+        };
+        messages.push(Message { role: "assistant".into(), content });
     }
     Ok((messages, usage))
 }
@@ -328,6 +358,28 @@ mod tests {
             Content::ToolUse(tu) => {
                 assert_eq!(tu.id, "call_1");
                 assert_eq!(tu.name, "glob");
+            }
+            _ => panic!("expected ToolUse content"),
+        }
+    }
+
+    #[test]
+    fn test_parse_response_streaming_tool_call() {
+        // A tool call streamed as fragmented SSE deltas, id/name in the first
+        // chunk and arguments accumulated across the following chunks.
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"glob\",\"arguments\":\"\"}}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"pattern\\\":\"}}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"*.rs\\\"}\"}}]}}]}\n",
+            "data: [DONE]\n",
+        );
+        let (msgs, _usage) = parse_opencode_response(raw).unwrap();
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0].content {
+            Content::ToolUse(tu) => {
+                assert_eq!(tu.id, "call_1");
+                assert_eq!(tu.name, "glob");
+                assert_eq!(tu.input, r#"{"pattern":"*.rs"}"#);
             }
             _ => panic!("expected ToolUse content"),
         }
