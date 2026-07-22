@@ -182,22 +182,84 @@ const TOKYO_NIGHT: Palette = Palette {
     on_accent: "#000000",
 };
 
-const CATPPUCCIN: Palette = Palette {
+// Catppuccin: all four official flavors (https://github.com/catppuccin/catppuccin).
+// Mapped to cairn tokens: base->panel, mantle->prompt_bg, surface0/1->line/line2,
+// text->ink, subtext0->muted, overlay2/1->faint/faintest, mauve->accent.
+
+/// Catppuccin Mocha (darkest).
+const CATPPUCCIN_MOCHA: Palette = Palette {
     panel: "#1e1e2e",
-    prompt_bg: "#34364b",
+    prompt_bg: "#181825",
     line: "#313244",
     line2: "#45475a",
     ink: "#cdd6f4",
     muted: "#a6adc8",
     faint: "#9399b2",
-    faintest: "#83889f",
+    faintest: "#7f849c",
     accent: "#cba6f7",
     green: "#a6e3a1",
     red: "#f38ba8",
     amber: "#f9e2af",
     blue: "#89b4fa",
-    sel_bg: "#322e46",
-    on_accent: "#000000",
+    sel_bg: "#45475a",
+    on_accent: "#11111b",
+};
+
+/// Catppuccin Macchiato.
+const CATPPUCCIN_MACCHIATO: Palette = Palette {
+    panel: "#24273a",
+    prompt_bg: "#1e2030",
+    line: "#363a4f",
+    line2: "#494d64",
+    ink: "#cad3f5",
+    muted: "#a5adcb",
+    faint: "#939ab7",
+    faintest: "#8087a2",
+    accent: "#c6a0f6",
+    green: "#a6da95",
+    red: "#ed8796",
+    amber: "#eed49f",
+    blue: "#8aadf4",
+    sel_bg: "#494d64",
+    on_accent: "#181926",
+};
+
+/// Catppuccin Frappé.
+const CATPPUCCIN_FRAPPE: Palette = Palette {
+    panel: "#303446",
+    prompt_bg: "#292c3c",
+    line: "#414559",
+    line2: "#51576d",
+    ink: "#c6d0f5",
+    muted: "#a5adce",
+    faint: "#949cbb",
+    faintest: "#838ba7",
+    accent: "#ca9ee6",
+    green: "#a6d189",
+    red: "#e78284",
+    amber: "#e5c890",
+    blue: "#8caaee",
+    sel_bg: "#51576d",
+    on_accent: "#232634",
+};
+
+/// Catppuccin Latte (light).
+const CATPPUCCIN_LATTE: Palette = Palette {
+    panel: "#eff1f5",
+    prompt_bg: "#e6e9ef",
+    line: "#ccd0da",
+    line2: "#bcc0cc",
+    ink: "#4c4f69",
+    muted: "#6c6f85",
+    faint: "#7c7f93",
+    faintest: "#8c8fa1",
+    accent: "#8839ef",
+    green: "#40a02b",
+    red: "#d20f39",
+    amber: "#df8e1d",
+    blue: "#1e66f5",
+    sel_bg: "#ccd0da",
+    on_accent: "#eff1f5",
 };
 
 const ONE_DARK: Palette = Palette {
@@ -310,7 +372,8 @@ const DUNE: Palette = Palette {
     on_accent: "#000000",
 };
 
-/// All dark themes in picker order (matches zero's dark group + fixed Dune).
+/// All selectable themes. Dark first, then Catppuccin Latte (the only light
+/// flavor we ship, since the user asked for the full Catppuccin set of 4).
 pub fn all_themes() -> Vec<Theme> {
     // Touch surface tokens so palette fields stay intentional parity with zero.
     let _ = _surface_tokens(&DARK);
@@ -320,7 +383,10 @@ pub fn all_themes() -> Vec<Theme> {
         build("nord", "Nord", &NORD),
         build("gruvbox", "Gruvbox", &GRUVBOX),
         build("tokyo-night", "Tokyo Night", &TOKYO_NIGHT),
-        build("catppuccin", "Catppuccin", &CATPPUCCIN),
+        build("catppuccin-mocha", "Catppuccin Mocha", &CATPPUCCIN_MOCHA),
+        build("catppuccin-macchiato", "Catppuccin Macchiato", &CATPPUCCIN_MACCHIATO),
+        build("catppuccin-frappe", "Catppuccin Frappé", &CATPPUCCIN_FRAPPE),
+        build("catppuccin-latte", "Catppuccin Latte", &CATPPUCCIN_LATTE),
         build("one-dark", "One Dark", &ONE_DARK),
         build("solarized-dark", "Solarized Dark", &SOLARIZED_DARK),
         build("rose-pine", "Rosé Pine", &ROSE_PINE),
@@ -335,8 +401,16 @@ pub fn default_theme() -> Theme {
 }
 
 /// Resolve a theme name (case/space-insensitive). Falls back to dark.
+/// `catppuccin` alone aliases Mocha for backward compatibility.
 pub fn lookup(name: &str) -> Theme {
-    let key = name.trim().to_ascii_lowercase().replace(' ', "-");
+    let mut key = name.trim().to_ascii_lowercase().replace(' ', "-");
+    // ASCII fold: treat "frappé" typed without accent as frappe
+    if key == "catppuccin-frappé" || key == "catppuccin-frappè" {
+        key = "catppuccin-frappe".into();
+    }
+    if key == "catppuccin" {
+        key = "catppuccin-mocha".into();
+    }
     all_themes()
         .into_iter()
         .find(|t| t.name == key)
@@ -359,7 +433,10 @@ mod tests {
         assert!(names.contains(&"nord"));
         assert!(names.contains(&"gruvbox"));
         assert!(names.contains(&"tokyo-night"));
-        assert!(names.contains(&"catppuccin"));
+        assert!(names.contains(&"catppuccin-mocha"));
+        assert!(names.contains(&"catppuccin-macchiato"));
+        assert!(names.contains(&"catppuccin-frappe"));
+        assert!(names.contains(&"catppuccin-latte"));
         assert!(names.contains(&"one-dark"));
         assert!(names.contains(&"solarized-dark"));
         assert!(names.contains(&"rose-pine"));
@@ -375,6 +452,19 @@ mod tests {
         assert_eq!(lookup("Tokyo Night").name, "tokyo-night");
         assert_eq!(lookup("DUNE").name, "dune");
         assert_eq!(lookup("nope").name, "dark");
+    }
+
+    #[test]
+    fn catppuccin_alias_and_all_four_flavors() {
+        assert_eq!(lookup("catppuccin").name, "catppuccin-mocha");
+        assert_eq!(lookup("Catppuccin Mocha").name, "catppuccin-mocha");
+        assert_eq!(lookup("catppuccin-macchiato").name, "catppuccin-macchiato");
+        assert_eq!(lookup("catppuccin-frappe").name, "catppuccin-frappe");
+        assert_eq!(lookup("catppuccin-latte").name, "catppuccin-latte");
+        // Latte is light: ink should be dark purple-gray, not near-white
+        assert!(matches!(lookup("catppuccin-latte").ink.fg, Some(Color::Rgb(0x4c, 0x4f, 0x69))));
+        // Mocha mauve accent
+        assert!(matches!(lookup("catppuccin-mocha").accent_fg.fg, Some(Color::Rgb(0xcb, 0xa6, 0xf7))));
     }
 
     #[test]
