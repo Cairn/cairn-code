@@ -1,13 +1,29 @@
-use std::fs;
-use std::path::Path;
 use super::registry::Tool;
+use super::workspace::Workspace;
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 
-pub struct GrepTool;
+pub struct GrepTool {
+    workspace: Workspace,
+}
+
+impl GrepTool {
+    pub fn new(workspace: Workspace) -> Self {
+        Self { workspace }
+    }
+}
 
 impl Tool for GrepTool {
-    fn name(&self) -> &str { "grep" }
-    fn description(&self) -> &str { "Search file contents using regex" }
-    fn needs_permission(&self) -> bool { false }
+    fn name(&self) -> &str {
+        "grep"
+    }
+    fn description(&self) -> &str {
+        "Search file contents using regex"
+    }
+    fn needs_permission(&self) -> bool {
+        false
+    }
 
     fn input_schema(&self) -> String {
         r#"{"type":"object","properties":{"pattern":{"type":"string"},"include":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}"#.into()
@@ -16,7 +32,10 @@ impl Tool for GrepTool {
     fn execute(&self, input: &str) -> Result<String, String> {
         let val = crate::json::parse(input).map_err(|e| format!("invalid input: {e}"))?;
         let obj = val.as_object().ok_or("expected object")?;
-        let pattern = obj.get("pattern").and_then(|v| v.as_str()).ok_or("pattern required")?;
+        let pattern = obj
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .ok_or("pattern required")?;
         let include = obj.get("include").and_then(|v| v.as_str());
         let search_path = obj.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
@@ -31,8 +50,18 @@ impl Tool for GrepTool {
         ))
         .map_err(|e| format!("invalid pattern: {e}"))?;
 
+        let search_path = self.workspace.resolve_existing(search_path)?;
+        let mut visited = HashSet::from([search_path.clone()]);
         let mut results = Vec::new();
-        search_dir(Path::new(search_path), &re, include, "", &mut results)?;
+        search_dir(
+            &search_path,
+            &self.workspace,
+            &mut visited,
+            &re,
+            include,
+            "",
+            &mut results,
+        )?;
 
         if results.is_empty() {
             return Ok("No matches found.".into());
@@ -65,16 +94,23 @@ mod tests {
     #[test]
     fn finds_literal_in_file() {
         let dir = temp_dir();
-        fs::write(dir.join("a.rs"), "fn main() {\n    println!(\"hello unique_token_xyz\");\n}\n").unwrap();
+        fs::write(
+            dir.join("a.rs"),
+            "fn main() {\n    println!(\"hello unique_token_xyz\");\n}\n",
+        )
+        .unwrap();
         fs::write(dir.join("b.txt"), "nope\n").unwrap();
-        let tool = GrepTool;
+        let tool = GrepTool::new(Workspace::new(&dir).unwrap());
         let input = format!(
             r#"{{"pattern":"unique_token_xyz","path":"{}"}}"#,
             dir.to_string_lossy().replace('\\', "\\\\")
         );
         let out = tool.execute(&input).unwrap();
         assert!(out.contains("unique_token_xyz"), "{out}");
-        assert!(out.contains("1 result") || out.contains("result(s)"), "{out}");
+        assert!(
+            out.contains("1 result") || out.contains("result(s)"),
+            "{out}"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -82,7 +118,7 @@ mod tests {
     fn wildcard_star_matches() {
         let dir = temp_dir();
         fs::write(dir.join("x.txt"), "alpha-beta-gamma\n").unwrap();
-        let tool = GrepTool;
+        let tool = GrepTool::new(Workspace::new(&dir).unwrap());
         let input = format!(
             r#"{{"pattern":"alpha*gamma","path":"{}"}}"#,
             dir.to_string_lossy().replace('\\', "\\\\")
@@ -96,7 +132,7 @@ mod tests {
     fn no_matches() {
         let dir = temp_dir();
         fs::write(dir.join("x.txt"), "nothing here\n").unwrap();
-        let tool = GrepTool;
+        let tool = GrepTool::new(Workspace::new(&dir).unwrap());
         let input = format!(
             r#"{{"pattern":"definitely_not_present_zzz","path":"{}"}}"#,
             dir.to_string_lossy().replace('\\', "\\\\")
@@ -108,12 +144,109 @@ mod tests {
 
     #[test]
     fn requires_pattern() {
-        assert!(GrepTool.execute(r#"{}"#).is_err());
+        let tool = GrepTool::new(Workspace::current().unwrap());
+        assert!(tool.execute(r#"{}"#).is_err());
+    }
+
+    #[test]
+    fn rejects_absolute_and_parent_search_paths() {
+        let workspace = temp_dir();
+        let outside = workspace.parent().unwrap().join(format!(
+            "cairn-grep-outside-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "escaped secret").unwrap();
+        let tool = GrepTool::new(Workspace::new(&workspace).unwrap());
+
+        let absolute = format!(
+            r#"{{"pattern":"escaped secret","path":"{}"}}"#,
+            outside.to_string_lossy().replace('\\', "\\\\")
+        );
+        assert!(tool
+            .execute(&absolute)
+            .unwrap_err()
+            .contains("outside the workspace"));
+        let parent = format!(
+            r#"{{"pattern":"escaped secret","path":"../{}"}}"#,
+            outside.file_name().unwrap().to_string_lossy()
+        );
+        assert!(tool
+            .execute(&parent)
+            .unwrap_err()
+            .contains("outside the workspace"));
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn recursive_search_skips_directory_link_escape() {
+        let workspace = temp_dir();
+        let outside = workspace.parent().unwrap().join(format!(
+            "cairn-grep-link-outside-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "escaped secret").unwrap();
+        let link = workspace.join("escape");
+
+        assert!(
+            create_dir_link(&outside, &link),
+            "failed to create test link"
+        );
+
+        let tool = GrepTool::new(Workspace::new(&workspace).unwrap());
+        let out = tool.execute(r#"{"pattern":"escaped secret"}"#).unwrap();
+        assert_eq!(out, "No matches found.");
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn recursive_search_does_not_follow_link_cycles() {
+        let workspace = temp_dir();
+        fs::write(workspace.join("token.txt"), "cycle token").unwrap();
+        assert!(
+            create_dir_link(&workspace, &workspace.join("loop")),
+            "failed to create test link"
+        );
+
+        let tool = GrepTool::new(Workspace::new(&workspace).unwrap());
+        let out = tool.execute(r#"{"pattern":"cycle token"}"#).unwrap();
+        assert_eq!(out.matches("cycle token").count(), 1, "{out}");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(unix)]
+    fn create_dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn create_dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
 }
 
 fn search_dir(
     dir: &Path,
+    workspace: &Workspace,
+    visited: &mut HashSet<PathBuf>,
     re: &SimpleRe,
     include: Option<&str>,
     relative: &str,
@@ -121,7 +254,9 @@ fn search_dir(
 ) -> Result<(), String> {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
-            let path = entry.path();
+            let Ok(path) = workspace.resolve_existing(entry.path()) else {
+                continue;
+            };
             let name = entry.file_name().to_string_lossy().to_string();
 
             // Skip .git, node_modules etc.
@@ -129,14 +264,24 @@ fn search_dir(
                 continue;
             }
 
-            let rel = if relative.is_empty() { name.clone() } else { format!("{relative}/{name}") };
+            let rel = if relative.is_empty() {
+                name.clone()
+            } else {
+                format!("{relative}/{name}")
+            };
 
             if path.is_dir() {
-                search_dir(&path, re, include, &rel, results)?;
+                if visited.insert(path.clone()) {
+                    search_dir(&path, workspace, visited, re, include, &rel, results)?;
+                }
             } else if path.is_file() {
                 // Check include filter
                 if let Some(inc) = include {
-                    if !path.extension().map(|e| e.to_string_lossy().as_ref() == inc.trim_start_matches('.')).unwrap_or(false) {
+                    if !path
+                        .extension()
+                        .map(|e| e.to_string_lossy().as_ref() == inc.trim_start_matches('.'))
+                        .unwrap_or(false)
+                    {
                         if !rel.contains(inc) {
                             continue;
                         }
