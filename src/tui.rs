@@ -1,3 +1,4 @@
+use std::io::stdout;
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -5,10 +6,17 @@ use std::time::Duration;
 
 use ratatui::{
     Frame,
+    crossterm::{
+        event::{
+            DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+            MouseEventKind,
+        },
+        execute,
+    },
     layout::{Constraint, Direction, Layout, Position},
-    widgets::{Paragraph, Wrap},
     style::Modifier,
-    text::{Span, Line, Text},
+    text::{Line, Span, Text},
+    widgets::{Paragraph, Wrap},
 };
 
 use crate::llm;
@@ -94,6 +102,18 @@ pub struct Tui {
     /// Claude Code-style exit: first Ctrl+C on empty idle prompt arms this;
     /// second Ctrl+C exits. Disarmed by any other key or action.
     ctrl_c_exit_armed: bool,
+    /// Transcript vertical offset (videre-style `rowoff`): first visible wrapped
+    /// line of the body. When `transcript_follow` is true, view sticks to bottom.
+    transcript_rowoff: usize,
+    /// When true, keep the transcript pinned to the latest content (auto-scroll).
+    transcript_follow: bool,
+    /// Last body pane height / content height from render (for page sizes).
+    last_body_h: usize,
+    last_body_wrapped: usize,
+    /// Active session id for autosave / resume (None until first save or resume).
+    current_session_id: Option<String>,
+    /// created_at for the active session (preserved across autosaves).
+    session_created_at: u64,
 }
 
 impl Tui {
@@ -155,6 +175,12 @@ impl Tui {
             theme_picker_sel: 0,
             theme_before_picker: None,
             ctrl_c_exit_armed: false,
+            transcript_rowoff: 0,
+            transcript_follow: true,
+            last_body_h: 0,
+            last_body_wrapped: 0,
+            current_session_id: None,
+            session_created_at: 0,
         }
     }
 
@@ -181,6 +207,9 @@ impl Tui {
     pub fn run(&mut self, rx: mpsc::Receiver<AgentEvent>) -> Result<(), String> {
         let mut terminal = ratatui::init();
         terminal.clear().map_err(|e| e.to_string())?;
+        // Mouse wheel scroll works on Windows / macOS / Linux terminals that
+        // support it (same idea as videre's cross-platform input layer).
+        let _ = execute!(stdout(), EnableMouseCapture);
 
         let mut result = Ok(());
         let mut last_spinner_update = std::time::Instant::now();
@@ -247,6 +276,8 @@ impl Tui {
                         AgentEvent::Done => {
                             self.flush_streaming();
                             self.state = State::Idle;
+                            // Autosave after each finished turn (not only manual /save).
+                            self.autosave_session(false);
                             if self.pending_model_after_auth {
                                 if crate::config::has_usable_credential(&self.provider) {
                                     // Signed in — now pick a model (live catalog available).
@@ -283,14 +314,18 @@ impl Tui {
 
             if matches!(self.state, State::Idle) {
                 match ratatui::crossterm::event::read() {
-                    Ok(ratatui::crossterm::event::Event::Key(key)) => {
+                    Ok(Event::Key(key)) => {
                         if !self.handle_key(key) {
                             break 'outer;
                         } else {
                             self.dirty = true;
                         }
                     }
-                    Ok(ratatui::crossterm::event::Event::Resize(_, _)) => {
+                    Ok(Event::Mouse(m)) => {
+                        self.handle_mouse(m.kind);
+                        self.dirty = true;
+                    }
+                    Ok(Event::Resize(_, _)) => {
                         needs_rebuild = true;
                         self.dirty = true;
                     }
@@ -303,11 +338,22 @@ impl Tui {
             } else {
                 let event_avail = ratatui::crossterm::event::poll(Duration::from_millis(1)).unwrap_or(false);
                 if event_avail {
-                    if let Ok(ratatui::crossterm::event::Event::Key(key)) = ratatui::crossterm::event::read() {
-                        if key.kind == ratatui::crossterm::event::KeyEventKind::Press {
-                            self.handle_key(key);
+                    match ratatui::crossterm::event::read() {
+                        Ok(Event::Key(key)) => {
+                            if key.kind == KeyEventKind::Press {
+                                self.handle_key(key);
+                                self.dirty = true;
+                            }
+                        }
+                        Ok(Event::Mouse(m)) => {
+                            self.handle_mouse(m.kind);
                             self.dirty = true;
                         }
+                        Ok(Event::Resize(_, _)) => {
+                            needs_rebuild = true;
+                            self.dirty = true;
+                        }
+                        _ => {}
                     }
                 }
                 if last_spinner_update.elapsed() >= Duration::from_millis(80) {
@@ -335,13 +381,67 @@ impl Tui {
             }
         }
 
+        // Persist conversation on clean exit so the last session is not lost.
+        self.autosave_session(false);
+        let _ = execute!(stdout(), DisableMouseCapture);
         ratatui::restore();
         result
     }
 
-    fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) -> bool {
-        use ratatui::crossterm::event::{KeyCode, KeyModifiers, KeyEventKind};
+    fn handle_mouse(&mut self, kind: MouseEventKind) {
+        // Ignore mouse while pickers own the chrome (wheel should not fight them).
+        if self.show_model_picker
+            || self.show_provider_picker
+            || self.show_theme_picker
+            || self.show_session_picker
+            || self.show_command_picker
+        {
+            return;
+        }
+        match kind {
+            MouseEventKind::ScrollUp => self.scroll_transcript(-3),
+            MouseEventKind::ScrollDown => self.scroll_transcript(3),
+            _ => {}
+        }
+    }
 
+    /// Scroll the transcript by `delta` wrapped lines (negative = up / older).
+    /// Mirrors videre's rowoff model: free scroll until the bottom, then re-follow.
+    fn scroll_transcript(&mut self, delta: isize) {
+        let max_off = self
+            .last_body_wrapped
+            .saturating_sub(self.last_body_h.max(1));
+        if max_off == 0 {
+            self.transcript_rowoff = 0;
+            self.transcript_follow = true;
+            return;
+        }
+        let cur = if self.transcript_follow {
+            max_off
+        } else {
+            self.transcript_rowoff.min(max_off)
+        };
+        let next = if delta < 0 {
+            cur.saturating_sub((-delta) as usize)
+        } else {
+            cur.saturating_add(delta as usize).min(max_off)
+        };
+        self.transcript_rowoff = next;
+        self.transcript_follow = next >= max_off;
+    }
+
+    fn scroll_page(&mut self, down: bool) {
+        let page = self.last_body_h.max(1).saturating_sub(1);
+        self.scroll_transcript(if down { page as isize } else { -(page as isize) });
+    }
+
+    fn scroll_half_page(&mut self, down: bool) {
+        // videre: half = screen_rows / 2
+        let half = (self.last_body_h.max(1) / 2).max(1);
+        self.scroll_transcript(if down { half as isize } else { -(half as isize) });
+    }
+
+    fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press {
             return true;
         }
@@ -354,6 +454,58 @@ impl Tui {
         }
         if is_ctrl_c {
             return self.handle_ctrl_c();
+        }
+
+        // Transcript scroll (videre-style Page / Ctrl-U/D + arrows with Ctrl).
+        // Skip when a picker owns navigation keys.
+        let picker_nav = self.show_model_picker
+            || self.show_provider_picker
+            || self.show_theme_picker
+            || self.show_session_picker
+            || self.show_command_picker
+            || self.show_permission_prompt
+            || self.confirm_remove_provider.is_some();
+        if !picker_nav {
+            match key.code {
+                KeyCode::PageUp => {
+                    self.scroll_page(false);
+                    return true;
+                }
+                KeyCode::PageDown => {
+                    self.scroll_page(true);
+                    return true;
+                }
+                KeyCode::Char('u') | KeyCode::Char('U')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.scroll_half_page(false);
+                    return true;
+                }
+                KeyCode::Char('d') | KeyCode::Char('D')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.scroll_half_page(true);
+                    return true;
+                }
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_transcript(-1);
+                    return true;
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_transcript(1);
+                    return true;
+                }
+                KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.transcript_follow = false;
+                    self.transcript_rowoff = 0;
+                    return true;
+                }
+                KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.transcript_follow = true;
+                    return true;
+                }
+                _ => {}
+            }
         }
 
         if self.show_permission_prompt {
@@ -716,6 +868,8 @@ impl Tui {
                 self.history.push(input.clone());
                 self.hist_idx = self.history.len();
                 self.show_recovery_prompt = false;
+                // New turn: pin transcript to bottom (follow latest output).
+                self.transcript_follow = true;
                 self.output_lines.push(OutputLine {
                     type_: "user".into(), content: input.clone(),
                     tool_name: String::new(), duration: String::new(),
@@ -783,9 +937,14 @@ impl Tui {
 
         match parts[0] {
             "/clear" => {
+                // Finish the previous session file first, then open a fresh id.
+                self.autosave_session(false);
                 self.output_lines.clear();
                 self.streaming_text.clear();
                 self.stream_thinking.clear();
+                self.current_session_id = None;
+                self.session_created_at = 0;
+                self.total_usage = llm::Usage::default();
             }
             "/model" => {
                 if parts.len() > 1 {
@@ -817,7 +976,7 @@ impl Tui {
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /auth /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions /theme\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)\n/provider xai — opens browser OAuth (device code); /auth login xai to re-login; paste XAI_API_KEY only if you prefer a key".into(),
+                    content: "Commands: /auth /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions /theme\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)\nScroll: mouse wheel · PgUp/PgDn · Ctrl+U/D (half page) · Ctrl+Home/End\n/provider xai — browser OAuth; /auth login xai; /auth key xai for API key".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
             }
@@ -1209,54 +1368,99 @@ impl Tui {
         }
     }
 
-    fn save_session(&mut self) {
-        let messages = self.output_lines.iter().filter_map(|l| {
-            if l.type_ == "user" {
-                Some(llm::Message { role: "user".into(), content: llm::Content::Text(l.content.clone()) })
-            } else if l.type_ == "text" {
-                Some(llm::Message { role: "assistant".into(), content: llm::Content::Text(l.content.clone()) })
-            } else {
-                None
-            }
-        }).collect::<Vec<_>>();
+    /// Build the message list that belongs in a session file (user + assistant text).
+    fn session_messages(&self) -> Vec<llm::Message> {
+        self.output_lines
+            .iter()
+            .filter_map(|l| {
+                if l.type_ == "user" {
+                    Some(llm::Message {
+                        role: "user".into(),
+                        content: llm::Content::Text(l.content.clone()),
+                    })
+                } else if l.type_ == "text" {
+                    Some(llm::Message {
+                        role: "assistant".into(),
+                        content: llm::Content::Text(l.content.clone()),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 
+    /// Save (or update) the current session. When `announce` is true, print a
+    /// system line (manual `/save`). Autosave stays quiet unless it fails.
+    fn autosave_session(&mut self, announce: bool) {
+        let messages = self.session_messages();
         if messages.is_empty() {
-            self.output_lines.push(OutputLine {
-                type_: "system".into(),
-                content: "Nothing to save — no conversation yet.".into(),
-                tool_name: String::new(), duration: String::new(),
-            });
+            if announce {
+                self.output_lines.push(OutputLine {
+                    type_: "system".into(),
+                    content: "Nothing to save — no conversation yet.".into(),
+                    tool_name: String::new(),
+                    duration: String::new(),
+                });
+            }
             return;
         }
 
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let id = self
+            .current_session_id
+            .clone()
+            .unwrap_or_else(session::new_id);
+        let created_at = if self.session_created_at > 0 {
+            self.session_created_at
+        } else {
+            now
+        };
+        let msg_count = messages.len();
         let sess = session::Session {
-            id: session::new_id(),
+            id: id.clone(),
             model: self.model.clone(),
             provider: self.provider.clone(),
             messages,
             tokens_in: self.total_usage.input_tokens,
             tokens_out: self.total_usage.output_tokens,
-            created_at: now,
+            created_at,
             updated_at: now,
         };
         match session::save(&self.sessions_dir(), &sess) {
             Ok(()) => {
-                self.output_lines.push(OutputLine {
-                    type_: "system".into(),
-                    content: format!("Session saved: {} ({} msgs)", &sess.id[..8], self.output_lines.len()),
-                    tool_name: String::new(), duration: String::new(),
-                });
+                self.current_session_id = Some(id.clone());
+                self.session_created_at = created_at;
+                if announce {
+                    let short = if id.len() >= 8 { &id[..8] } else { id.as_str() };
+                    self.output_lines.push(OutputLine {
+                        type_: "system".into(),
+                        content: format!(
+                            "Session saved: {short} ({msg_count} msgs) → {}",
+                            self.sessions_dir()
+                        ),
+                        tool_name: String::new(),
+                        duration: String::new(),
+                    });
+                }
             }
             Err(e) => {
+                // Always surface write failures (including silent autosave).
                 self.output_lines.push(OutputLine {
                     type_: "error".into(),
                     content: format!("Failed to save session: {e}"),
-                    tool_name: String::new(), duration: String::new(),
+                    tool_name: String::new(),
+                    duration: String::new(),
                 });
             }
         }
+    }
+
+    fn save_session(&mut self) {
+        self.autosave_session(true);
     }
 
     fn list_sessions(&mut self) {
@@ -1334,15 +1538,31 @@ impl Tui {
                 };
                 self.model = sess.model.clone();
                 self.provider = sess.provider.clone();
+                self.current_session_id = Some(sess.id.clone());
+                self.session_created_at = if sess.created_at > 0 {
+                    sess.created_at
+                } else {
+                    sess.updated_at
+                };
 
                 if let Some(tx) = &self.agent_tx {
                     let _ = tx.send(format!("__switch__:{}:{}", sess.provider, sess.model));
                     let _ = tx.send(format!("__load_session__:{}", sess.id));
                 }
+                let short = if sess.id.len() >= 8 {
+                    &sess.id[..8]
+                } else {
+                    sess.id.as_str()
+                };
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: format!("Resumed session {} (model: {}, messages: {})", &sess.id[..8], sess.model, sess.messages.len()),
-                    tool_name: String::new(), duration: String::new(),
+                    content: format!(
+                        "Resumed session {short} (model: {}, messages: {})",
+                        sess.model,
+                        sess.messages.len()
+                    ),
+                    tool_name: String::new(),
+                    duration: String::new(),
                 });
             }
             Err(e) => {
@@ -1355,7 +1575,7 @@ impl Tui {
         }
     }
 
-    fn render(&self, f: &mut Frame) {
+    fn render(&mut self, f: &mut Frame) {
         let area = f.area();
         let dim = self.theme.muted;
         let bright = self.theme.accent;
@@ -1811,10 +2031,23 @@ impl Tui {
             (chunks[0], chunks[1])
         };
 
+        // videre-style rowoff: free scroll when not following; pin to bottom when following.
+        let body_h = body_area.height as usize;
+        let max_off = body_wrapped.saturating_sub(body_h.max(1));
+        self.last_body_h = body_h;
+        self.last_body_wrapped = body_wrapped;
         let body_scroll = if fits {
             0
+        } else if self.transcript_follow {
+            self.transcript_rowoff = max_off;
+            max_off
         } else {
-            body_wrapped.saturating_sub(body_area.height as usize)
+            let off = self.transcript_rowoff.min(max_off);
+            self.transcript_rowoff = off;
+            if off >= max_off {
+                self.transcript_follow = true;
+            }
+            off
         };
 
         f.render_widget(
@@ -1829,6 +2062,30 @@ impl Tui {
                 .scroll((chrome_scroll as u16, 0)),
             chrome_area,
         );
+
+        // Scroll position hint when not pinned to bottom (videre shows %).
+        if !fits && !self.transcript_follow && max_off > 0 {
+            let pct = (body_scroll * 100) / max_off;
+            let hint = format!(" ↑ {pct}% · PgUp/PgDn · wheel · Ctrl+U/D ");
+            let hx = body_area
+                .x
+                .saturating_add(body_area.width.saturating_sub(hint.len() as u16 + 1));
+            let hy = body_area.y;
+            if body_area.width > 8 {
+                f.render_widget(
+                    Paragraph::new(Span::styled(hint, dim)),
+                    ratatui::layout::Rect {
+                        x: hx,
+                        y: hy,
+                        width: body_area
+                            .width
+                            .saturating_sub(hx.saturating_sub(body_area.x))
+                            .min(40),
+                        height: 1,
+                    },
+                );
+            }
+        }
 
         if let Some((x_off, line_idx)) = cursor_pos {
             let line_idx = line_idx.min(chrome.len().saturating_sub(1));
@@ -1924,7 +2181,12 @@ fn terminal_height() -> Option<usize> {
 }
 
 fn format_timestamp(ts: u64) -> String {
-    let secs = ts as i64;
+    // `ts` is absolute unix seconds; show relative age.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let secs = now.saturating_sub(ts);
     let days = secs / 86400;
     let hours = (secs % 86400) / 3600;
     let mins = (secs % 3600) / 60;
@@ -1932,8 +2194,10 @@ fn format_timestamp(ts: u64) -> String {
         format!("{days}d {hours}h ago")
     } else if hours > 0 {
         format!("{hours}h {mins}m ago")
-    } else {
+    } else if mins > 0 {
         format!("{mins}m ago")
+    } else {
+        "just now".into()
     }
 }
 

@@ -120,14 +120,39 @@ pub struct SessionSummary {
     pub summary: String,
 }
 
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn session_to_json(s: &Session) -> String {
     let mut json = String::new();
-    json.push_str(&format!("{{\"id\":\"{}\",\"model\":\"{}\",\"provider\":\"{}\",", s.id, s.model, s.provider));
+    json.push_str(&format!(
+        "{{\"id\":\"{}\",\"model\":\"{}\",\"provider\":\"{}\",",
+        json_escape(&s.id),
+        json_escape(&s.model),
+        json_escape(&s.provider)
+    ));
     json.push_str(&format!("\"tokens_in\":{},\"tokens_out\":{},", s.tokens_in, s.tokens_out));
     json.push_str(&format!("\"created_at\":{},\"updated_at\":{},", s.created_at, s.updated_at));
     json.push_str("\"messages\":[");
     for (i, msg) in s.messages.iter().enumerate() {
-        if i > 0 { json.push(','); }
+        if i > 0 {
+            json.push(',');
+        }
         json.push_str(&message_to_json(msg));
     }
     json.push_str("]}");
@@ -136,19 +161,39 @@ fn session_to_json(s: &Session) -> String {
 
 fn message_to_json(msg: &Message) -> String {
     let content = match &msg.content {
-        crate::llm::Content::Text(t) => format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\"")),
+        crate::llm::Content::Text(t) => format!("\"{}\"", json_escape(t)),
         crate::llm::Content::ToolUse(tu) => {
-            format!("{{\"type\":\"tool_use\",\"name\":\"{}\",\"input\":{}}}", tu.name, tu.input)
+            // tu.input is already JSON; keep as raw object. Name/id need escaping.
+            format!(
+                "{{\"type\":\"tool_use\",\"id\":\"{}\",\"name\":\"{}\",\"input\":{}}}",
+                json_escape(&tu.id),
+                json_escape(&tu.name),
+                if tu.input.trim().is_empty() {
+                    "{}"
+                } else {
+                    tu.input.as_str()
+                }
+            )
         }
         crate::llm::Content::ToolResult(tr) => {
-            format!("{{\"type\":\"tool_result\",\"tool_use_id\":\"{}\",\"content\":\"{}\"}}",
-                tr.tool_use_id, tr.content.replace('\\', "\\\\").replace('"', "\\\""))
+            format!(
+                "{{\"type\":\"tool_result\",\"tool_use_id\":\"{}\",\"content\":\"{}\"}}",
+                json_escape(&tr.tool_use_id),
+                json_escape(&tr.content)
+            )
         }
         crate::llm::Content::Thinking(t) => {
-            format!("{{\"type\":\"thinking\",\"thinking\":\"{}\"}}", t.replace('\\', "\\\\").replace('"', "\\\""))
+            format!(
+                "{{\"type\":\"thinking\",\"thinking\":\"{}\"}}",
+                json_escape(t)
+            )
         }
     };
-    format!("{{\"role\":\"{}\",\"content\":{}}}", msg.role, content)
+    format!(
+        "{{\"role\":\"{}\",\"content\":{}}}",
+        json_escape(&msg.role),
+        content
+    )
 }
 
 fn session_from_json(json_str: &str) -> Result<Session, String> {
@@ -184,8 +229,12 @@ fn message_from_json(val: &crate::json::JsonValue) -> Option<Message> {
         match type_str {
             "tool_use" => {
                 let name = o.get("name")?.as_str()?.to_string();
-                let input = crate::json::serialize(o.get("input")?);
-                crate::llm::Content::ToolUse(crate::llm::ToolUse { name, input, id: String::new() })
+                let id = o.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let input = o
+                    .get("input")
+                    .map(|v| crate::json::serialize(v))
+                    .unwrap_or_else(|| "{}".into());
+                crate::llm::Content::ToolUse(crate::llm::ToolUse { name, input, id })
             }
             "tool_result" => {
                 let tool_use_id = o.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -314,5 +363,49 @@ mod tests {
         assert!(err.contains("invalid"), "got: {err}");
         let err = resolve_id(".", "..\\foo").unwrap_err();
         assert!(err.contains("invalid"), "got: {err}");
+    }
+
+    #[test]
+    fn test_roundtrip_multiline_and_quotes() {
+        let test_id = format!("test-{}", new_id());
+        let dir = std::env::temp_dir().join(format!("cairn-test-session-ml-{}", new_id()));
+        let dir_str = dir.to_string_lossy().to_string();
+        fs::create_dir_all(&dir).unwrap();
+
+        let body = "line1\nline2\twith\ttabs\nand \"quotes\" and \\slashes";
+        let session = Session {
+            id: test_id.clone(),
+            messages: vec![
+                Message {
+                    role: "user".into(),
+                    content: crate::llm::Content::Text(body.into()),
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: crate::llm::Content::Text("ok\nnext".into()),
+                },
+            ],
+            model: "m".into(),
+            provider: "p".into(),
+            tokens_in: 1,
+            tokens_out: 2,
+            created_at: 10,
+            updated_at: 20,
+        };
+        save(&dir_str, &session).unwrap();
+        let loaded = load(&dir_str, &test_id).unwrap();
+        assert_eq!(loaded.messages.len(), 2);
+        match &loaded.messages[0].content {
+            crate::llm::Content::Text(t) => assert_eq!(t, body),
+            _ => panic!("expected text"),
+        }
+        match &loaded.messages[1].content {
+            crate::llm::Content::Text(t) => assert_eq!(t, "ok\nnext"),
+            _ => panic!("expected text"),
+        }
+        // list must surface the file (corrupt JSON used to drop sessions silently)
+        let listed = list(&dir_str).unwrap();
+        assert!(listed.iter().any(|s| s.id == test_id));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
