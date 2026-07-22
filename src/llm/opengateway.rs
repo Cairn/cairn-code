@@ -12,7 +12,6 @@ use super::provider::*;
 use crate::http_client;
 use crate::llm::openai_compat;
 
-const BASE_URL: &str = "https://opengateway.gitlawb.com/v1";
 const CHAT_URL: &str = "https://opengateway.gitlawb.com/v1/chat/completions";
 const DEFAULT_MODEL: &str = "mimo-v2.5-pro";
 
@@ -179,8 +178,11 @@ mod tests {
     fn curated_models_nonempty() {
         let p = OpenGatewayProvider::new();
         assert!(p.available_models().len() >= 5);
-        assert_eq!(BASE_URL, "https://opengateway.gitlawb.com/v1");
-        assert!(CHAT_URL.ends_with("/chat/completions"));
+        assert!(
+            CHAT_URL.starts_with("https://opengateway.gitlawb.com/v1/")
+                && CHAT_URL.ends_with("/chat/completions"),
+            "unexpected chat URL: {CHAT_URL}"
+        );
     }
 
     #[test]

@@ -46,6 +46,7 @@ impl Registry {
         self.tools.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }

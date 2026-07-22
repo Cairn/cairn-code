@@ -20,7 +20,7 @@
 - [x] Thread cancellation through the streaming path and tool-execution loop (`agent.rs`, `Provider::stream_complete`), not just once per turn
 
 ## Priority: Low
-- [ ] Add plugin/extension system — custom tools via Lua or WASM
+- [ ] Add plugin/extension system — custom tools via Python (spawn/script or MCP-style; not Lua/WASM guest runtimes)
 - [x] TUI theme customization — dark themes from zero + fixed dark Dune; `/theme` picker
 - [x] Add completions/suggestions for commands — Tab slash completion (`slash_completions` in `tui.rs`)
 - [x] Notification sounds on turn done / permission / recovery (`notify.rs`; mute with `CAIRN_SOUND=0`)

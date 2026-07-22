@@ -101,7 +101,11 @@ pub fn missing_api_key(env_var: &str) -> String {
 pub fn default_providers() -> HashMap<String, Box<dyn Provider>> {
     let mut map: HashMap<String, Box<dyn Provider>> = HashMap::new();
     map.insert("anthropic".into(), Box::new(crate::llm::anthropic::AnthropicProvider::new()));
-    map.insert("openai".into(), Box::new(crate::llm::openai::OpenAIProvider::new()));
+    let openai = match crate::config::config_get_api_key("openai") {
+        Some(key) => crate::llm::openai::OpenAIProvider::new().with_api_key(&key),
+        None => crate::llm::openai::OpenAIProvider::new(),
+    };
+    map.insert("openai".into(), Box::new(openai));
     let openrouter = match crate::config::config_get_api_key("openrouter") {
         Some(key) => crate::llm::openrouter::OpenRouterProvider::new().with_api_key(&key),
         None => crate::llm::openrouter::OpenRouterProvider::new(),

@@ -124,7 +124,7 @@ pub struct Tui {
     live_mirror: Option<session::LiveMirror>,
     /// When true, the next `Done` event is a finished agent turn (play sound + refresh hint).
     expect_turn_notify: bool,
-    /// Claude Code-style grayed-out next-task hint shown when the composer is empty.
+    /// Grayed-out ready-to-send prompt shown when the composer is empty (Tab/→ accepts).
     idle_suggestion: Option<String>,
     /// When true, stream + keep full thinking blocks. When false (default), only
     /// a short "Thought for …" marker is kept after each think phase.
@@ -780,7 +780,7 @@ impl Tui {
                 true
             }
             KeyCode::Tab => {
-                // Empty composer: accept grayed-out next-task suggestion (Claude Code-style).
+                // Empty composer: accept grayed ready-to-send prompt.
                 if self.input_buf.is_empty()
                     && !self.awaiting_api_key
                     && !self.show_model_picker
@@ -1164,7 +1164,7 @@ impl Tui {
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /auth /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions /theme /thinking\n/thinking [on|off] — show full thinking (on) or short Thought-for lines only (off, default)\nTab completes slash commands; Tab/→ accepts grayed next-task hint when empty\nSounds: done/attention beeps (CAIRN_SOUND=0 to mute)\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)\nScroll: mouse wheel · PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End\n/provider xai — browser OAuth; /auth login xai; /auth key xai for API key".into(),
+                    content: "Commands: /auth /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions /theme /thinking\n/thinking [on|off] — show full thinking (on) or short Thought-for lines only (off, default)\nTab completes slash commands; Tab/→ accepts the grayed ready-to-send prompt when empty\nSounds: done/attention beeps (CAIRN_SOUND=0 to mute)\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)\nScroll: mouse wheel · PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End\n/provider xai — browser OAuth; /auth login xai; /auth key xai for API key".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
             }
@@ -2257,10 +2257,11 @@ impl Tui {
         } else {
             let cursor = self.cursor.min(self.input_buf.len());
             let (before, after) = self.input_buf.split_at(cursor);
-            // Claude Code-style grayed next-task hint when the composer is empty.
+            // Grayed ready-to-send prompt when the composer is empty.
             if self.input_buf.is_empty()
                 && matches!(self.state, State::Idle)
                 && !self.show_permission_prompt
+                && !self.show_recovery_prompt
                 && !self.awaiting_api_key
             {
                 if let Some(hint) = &self.idle_suggestion {
@@ -2502,16 +2503,17 @@ impl Tui {
         self.cmd_picker_filtered.get(self.cmd_picker_sel).map(|s| s.as_str())
     }
 
-    /// Refresh the grayed-out next-task hint in the empty composer.
+    /// Refresh the grayed ready-to-send prompt in the empty composer.
     fn refresh_idle_suggestion(&mut self) {
         if !self.input_buf.is_empty() || !matches!(self.state, State::Idle) {
             return;
         }
-        self.idle_suggestion = Some(compute_idle_suggestion(
-            self.show_permission_prompt,
-            self.show_recovery_prompt,
-            &self.output_lines,
-        ));
+        // Permission/recovery own the chrome; no ghost prompt until they clear.
+        if self.show_permission_prompt || self.show_recovery_prompt {
+            self.idle_suggestion = None;
+            return;
+        }
+        self.idle_suggestion = Some(compute_idle_suggestion(&self.output_lines));
     }
 
     /// Insert a completion into the composer. Adds a trailing space when more
@@ -2570,22 +2572,13 @@ pub(crate) fn slash_ghost_suffix(input: &str, completion: &str) -> Option<String
 }
 
 fn default_empty_suggestion() -> &'static str {
-    "Ask about this codebase or describe a task"
+    "Give me an overview of this codebase and how it is organized"
 }
 
-/// Pick a short grayed-out next-step hint from recent UI state (Claude Code-style).
-pub(crate) fn compute_idle_suggestion(
-    permission: bool,
-    recovery: bool,
-    lines: &[OutputLine],
-) -> String {
-    if permission {
-        return "Approve or deny the tool request above".into();
-    }
-    if recovery {
-        return "Switch model (m) · provider (p) · or dismiss (d)".into();
-    }
-    // Walk recent transcript for a contextual nudge.
+/// Pick a short ready-to-send prompt from recent transcript context.
+/// Tab/→ inserts it into the composer as a real user message.
+pub(crate) fn compute_idle_suggestion(lines: &[OutputLine]) -> String {
+    // Walk recent transcript for a contextual ready prompt.
     let mut last_user: Option<&str> = None;
     let mut last_assistant: Option<&str> = None;
     let mut last_tool: Option<&str> = None;
@@ -2600,28 +2593,34 @@ pub(crate) fn compute_idle_suggestion(
         }
     }
     if saw_error {
-        return "Try again, or /provider /model to switch".into();
+        return "Retry the last step and fix any errors you hit".into();
     }
     if let Some(tool) = last_tool {
         if tool == "shell" {
-            return "Inspect the command output or continue".into();
+            return "Summarize the command output and what we should do next".into();
         }
-        return format!("Review {tool} results or continue");
+        if tool == "file_read" || tool == "grep" || tool == "glob" {
+            return format!("Based on the {tool} results, explain what you found and recommend next steps");
+        }
+        return format!("Summarize the {tool} results and continue with the next step");
     }
     if let Some(u) = last_user {
         let lower = u.to_ascii_lowercase();
         if lower.contains("test") {
-            return "Run the tests or fix failures".into();
+            return "Run the tests, fix any failures, and report the final result".into();
         }
         if lower.contains("commit") || lower.contains("push") {
-            return "Review the diff, then commit & push".into();
+            return "Review the git status and diff, then commit and push if the changes look good".into();
         }
         if lower.contains("fix") || lower.contains("bug") {
-            return "Verify the fix still works".into();
+            return "Verify the fix works end-to-end and check for related regressions".into();
+        }
+        if lower.contains("refactor") {
+            return "Continue the refactor and keep behavior covered by tests".into();
         }
     }
     if last_assistant.is_some() {
-        return "Continue, or ask a follow-up".into();
+        return "Continue with the next step from your previous plan".into();
     }
     default_empty_suggestion().into()
 }
@@ -2801,26 +2800,39 @@ mod suggestion_tests {
     }
 
     #[test]
-    fn suggestion_permission_and_recovery() {
-        assert!(compute_idle_suggestion(true, false, &[]).contains("Approve"));
-        assert!(compute_idle_suggestion(false, true, &[]).contains("Switch model"));
-    }
-
-    #[test]
     fn suggestion_from_recent_user_and_tools() {
         let lines = vec![
             line("user", "please run the tests", ""),
             line("tool_use", r#"{"command":"cargo test"}"#, "shell"),
             line("tool_result", "ok", "shell"),
         ];
-        let s = compute_idle_suggestion(false, false, &lines);
-        assert!(s.to_ascii_lowercase().contains("command") || s.to_ascii_lowercase().contains("continue"));
+        let s = compute_idle_suggestion(&lines);
+        assert!(
+            s.to_ascii_lowercase().contains("command output"),
+            "expected ready prompt about shell output, got {s}"
+        );
+        // Ready prompt, not a meta instruction to the user.
+        assert!(!s.to_ascii_lowercase().starts_with("inspect"));
+        assert!(!s.to_ascii_lowercase().starts_with("review"));
+        assert!(!s.to_ascii_lowercase().starts_with("try again"));
     }
 
     #[test]
     fn suggestion_default_when_empty() {
-        let s = compute_idle_suggestion(false, false, &[]);
+        let s = compute_idle_suggestion(&[]);
         assert_eq!(s, default_empty_suggestion());
+        assert!(
+            s.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false),
+            "ready prompts should read as imperative agent requests"
+        );
+    }
+
+    #[test]
+    fn suggestion_after_error_is_sendable_retry() {
+        let lines = vec![line("error", "LLM error: boom", "")];
+        let s = compute_idle_suggestion(&lines);
+        assert!(s.to_ascii_lowercase().contains("retry"));
+        assert!(!s.contains("/provider"));
     }
 }
 
