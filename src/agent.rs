@@ -293,44 +293,7 @@ impl Agent {
 
                     let _ = tx.send(AgentEvent::ToolUse(tu.name.clone(), tu.input.clone()));
 
-                    let tool = self.tools.get(&tu.name);
-                    let wants_permission = tool.map(|t| t.needs_permission()).unwrap_or(false);
-                    let needs_ask = wants_permission || self.config.ask.iter().any(|t| t == &tu.name);
-                    let always_allowed = self.config.auto_allow.iter().any(|t| t == &tu.name);
-                    let denied = self.config.is_tool_denied(&tu.name);
-
-                    let result = if denied {
-                        Err(format!("Tool '{}' is denied by config", tu.name))
-                    } else if needs_ask && !always_allowed {
-                        let _ = tx.send(AgentEvent::PermissionRequest(tu.name.clone(), tu.input.clone()));
-                        let response = loop {
-                            match perm_rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                                Ok(resp) => break resp,
-                                Err(mpsc::RecvTimeoutError::Timeout) => {
-                                    if cancel.load(Ordering::Relaxed) {
-                                        break "deny".to_string();
-                                    }
-                                }
-                                Err(mpsc::RecvTimeoutError::Disconnected) => break "deny".to_string(),
-                            }
-                        };
-                        match response.as_str() {
-                            "always_allow" => {
-                                self.config.auto_allow.push(tu.name.clone());
-                                let _ = crate::config::save_full_config(&self.config);
-                                self.tools.get(&tu.name).map(|t| t.execute(&tu.input)).unwrap_or(Err(format!("Unknown tool: {}", tu.name)))
-                            }
-                            "allow" => {
-                                self.tools.get(&tu.name).map(|t| t.execute(&tu.input)).unwrap_or(Err(format!("Unknown tool: {}", tu.name)))
-                            }
-                            _ => Err(format!("Permission denied by user for tool '{}'", tu.name)),
-                        }
-                    } else {
-                        match self.tools.get(&tu.name) {
-                            Some(tool) => tool.execute(&tu.input),
-                            None => Err(format!("Unknown tool: {}", tu.name)),
-                        }
-                    };
+                    let result = self.execute_tool_with_policy(tu, Some((&tx, cancel, perm_rx)));
 
                     let result_str = match &result {
                         Ok(s) => s.clone(),
@@ -361,6 +324,74 @@ impl Agent {
         self.sync_live_mirror();
         let _ = tx.send(AgentEvent::Done);
         result
+    }
+
+    /// Applies the deny/ask/auto_allow policy to a tool call and, if
+    /// permitted, executes it. This is the single authorization path shared
+    /// by the interactive TUI loop and print (`--print`) mode, so a tool
+    /// cannot bypass deny lists or `needs_permission()` by going through one
+    /// path instead of the other.
+    ///
+    /// `interactive` carries the channels needed to prompt a human for
+    /// approval (`tx` to emit `PermissionRequest`, `cancel` to abort the
+    /// wait, `perm_rx` to receive the answer). When `None` (non-interactive
+    /// callers like `--print`, which have no user to ask) any tool that
+    /// would otherwise require approval fails closed instead of running
+    /// unattended; the only way to permit it is an explicit `auto_allow`
+    /// entry in config.
+    fn execute_tool_with_policy(
+        &mut self,
+        tu: &llm::ToolUse,
+        interactive: Option<(&mpsc::Sender<AgentEvent>, &AtomicBool, &mpsc::Receiver<String>)>,
+    ) -> Result<String, String> {
+        let tool = self.tools.get(&tu.name);
+        let wants_permission = tool.map(|t| t.needs_permission()).unwrap_or(false);
+        let needs_ask = wants_permission || self.config.ask.iter().any(|t| t == &tu.name);
+        let always_allowed = self.config.auto_allow.iter().any(|t| t == &tu.name);
+        let denied = self.config.is_tool_denied(&tu.name);
+
+        if denied {
+            return Err(format!("Tool '{}' is denied by config", tu.name));
+        }
+
+        if !needs_ask || always_allowed {
+            return match self.tools.get(&tu.name) {
+                Some(tool) => tool.execute(&tu.input),
+                None => Err(format!("Unknown tool: {}", tu.name)),
+            };
+        }
+
+        let Some((tx, cancel, perm_rx)) = interactive else {
+            return Err(format!(
+                "Tool '{}' requires approval and there is no user to prompt in this mode. \
+                 Add it to auto_allow in the config to permit it non-interactively.",
+                tu.name
+            ));
+        };
+
+        let _ = tx.send(AgentEvent::PermissionRequest(tu.name.clone(), tu.input.clone()));
+        let response = loop {
+            match perm_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(resp) => break resp,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        break "deny".to_string();
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break "deny".to_string(),
+            }
+        };
+        match response.as_str() {
+            "always_allow" => {
+                self.config.auto_allow.push(tu.name.clone());
+                let _ = crate::config::save_full_config(&self.config);
+                self.tools.get(&tu.name).map(|t| t.execute(&tu.input)).unwrap_or(Err(format!("Unknown tool: {}", tu.name)))
+            }
+            "allow" => {
+                self.tools.get(&tu.name).map(|t| t.execute(&tu.input)).unwrap_or(Err(format!("Unknown tool: {}", tu.name)))
+            }
+            _ => Err(format!("Permission denied by user for tool '{}'", tu.name)),
+        }
     }
 
     pub fn run_simple(&mut self, input: &str) -> Result<String, String> {
@@ -410,10 +441,13 @@ impl Agent {
             match &msg.content {
                 llm::Content::Text(t) => output.push_str(t),
                 llm::Content::ToolUse(tu) => {
-                    let result = match self.tools.get(&tu.name) {
-                        Some(tool) => tool.execute(&tu.input).unwrap_or_else(|e| format!("Error: {e}")),
-                        None => format!("Error: unknown tool {}", tu.name),
-                    };
+                    // No interactive channel is available in non-interactive
+                    // (`--print`) mode, so this enforces the same deny/ask/
+                    // auto_allow policy as the TUI loop and fails closed for
+                    // any tool that would otherwise require user approval.
+                    let result = self
+                        .execute_tool_with_policy(tu, None)
+                        .unwrap_or_else(|e| format!("Error: {e}"));
                     output.push_str(&format!("\n[{}({})]: {}", tu.name, tu.input, result));
                 }
                 _ => {}
@@ -776,6 +810,124 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let err = agent.compact_now(&tx).unwrap_err();
         assert!(err.to_ascii_lowercase().contains("could not compact"), "{err}");
+    }
+
+    /// Always returns a single assistant `ToolUse` message for the configured
+    /// tool, so a test can drive `run_simple`'s tool-authorization path
+    /// without a network call.
+    struct ToolCallMock {
+        tool_name: String,
+        tool_input: String,
+    }
+
+    impl llm::Provider for ToolCallMock {
+        fn name(&self) -> &str { "mock" }
+        fn default_model(&self) -> &str { "mock-model" }
+        fn available_models(&self) -> Vec<llm::ModelInfo> {
+            vec![llm::ModelInfo { id: "mock-model".into(), name: "Mock".into(), max_ctx: 1000 }]
+        }
+        fn stream_complete(
+            &self,
+            _messages: &[llm::Message],
+            _tools: &[llm::ToolDefinition],
+            _system: &str,
+            _model: &str,
+            _max_tokens: usize,
+            _on_chunk: llm::StreamingCallback,
+            _cancel: &AtomicBool,
+        ) -> Result<(Vec<llm::Message>, Usage), String> {
+            unimplemented!("run_simple does not stream")
+        }
+        fn complete(
+            &self,
+            _messages: &[llm::Message],
+            _tools: &[llm::ToolDefinition],
+            _system: &str,
+            _model: &str,
+            _max_tokens: usize,
+        ) -> Result<(Vec<llm::Message>, Usage), String> {
+            Ok((
+                vec![llm::Message {
+                    role: "assistant".into(),
+                    content: llm::Content::ToolUse(llm::ToolUse {
+                        id: "1".into(),
+                        name: self.tool_name.clone(),
+                        input: self.tool_input.clone(),
+                    }),
+                }],
+                Usage::default(),
+            ))
+        }
+    }
+
+    fn agent_with_tool_call(tool_name: &str, tool_input: &str, config: Config) -> Agent {
+        let mut registry = crate::tools::registry::Registry::new();
+        registry.register(Box::new(crate::tools::shell::ShellTool));
+        registry.register(Box::new(crate::tools::file_read::FileReadTool));
+        Agent::new(
+            Box::new(ToolCallMock { tool_name: tool_name.into(), tool_input: tool_input.into() }),
+            "mock-model".into(),
+            registry,
+            config,
+        )
+    }
+
+    /// C-01 regression: print mode (`run_simple`) must not execute a tool
+    /// that requires approval just because there is no user to ask. It has
+    /// to fail closed exactly like a denied tool would, not silently run.
+    #[test]
+    fn run_simple_denies_approval_required_tool_by_default() {
+        let mut agent = agent_with_tool_call(
+            "shell",
+            r#"{"command":"rm -rf /"}"#,
+            Config::default(),
+        );
+        let output = agent.run_simple("do something").unwrap();
+        assert!(
+            output.to_ascii_lowercase().contains("error") && output.contains("approval"),
+            "expected run_simple to fail closed on an approval-required tool, got: {output}"
+        );
+    }
+
+    /// The explicit `auto_allow` opt-in the issue calls for should still let
+    /// a would-be-approval-required tool run in non-interactive mode.
+    #[test]
+    fn run_simple_runs_tool_explicitly_auto_allowed() {
+        let mut config = Config::default();
+        config.auto_allow.push("shell".into());
+        let mut agent = agent_with_tool_call("shell", r#"{"command":"echo hi"}"#, config);
+        let output = agent.run_simple("do something").unwrap();
+        assert!(!output.to_ascii_lowercase().contains("requires approval"), "{output}");
+    }
+
+    /// Denied tools must stay denied in print mode too, matching the
+    /// interactive loop's policy.
+    #[test]
+    fn run_simple_respects_deny_list() {
+        let mut config = Config::default();
+        config.deny.push("shell".into());
+        let mut agent = agent_with_tool_call("shell", r#"{"command":"echo hi"}"#, config);
+        let output = agent.run_simple("do something").unwrap();
+        assert!(output.contains("denied by config"), "{output}");
+    }
+
+    /// Tools that don't need permission should keep working unattended.
+    #[test]
+    fn run_simple_runs_tool_that_does_not_need_permission() {
+        let dir = std::env::temp_dir().join(format!("cairn-run-simple-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("hello.txt");
+        std::fs::write(&file_path, "hello from test").unwrap();
+
+        let mut agent = agent_with_tool_call(
+            "file_read",
+            &format!(r#"{{"file_path":"{}"}}"#, file_path.to_string_lossy().replace('\\', "\\\\")),
+            Config::default(),
+        );
+        let output = agent.run_simple("do something").unwrap();
+        assert!(output.contains("hello from test"), "{output}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
