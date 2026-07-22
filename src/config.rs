@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct Config {
     pub default_provider: String,
@@ -43,24 +43,8 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> Self {
-        migrate_plaintext_keys_in_file(&config_path());
-
-        let paths = [
-            dirs_config_path(),
-            PathBuf::from(".cairn/config.json"),
-        ];
-
-        for path in &paths {
-            if path.exists() {
-                if let Ok(content) = fs::read_to_string(path) {
-                    if let Ok(cfg) = parse_config(&content) {
-                        return cfg;
-                    }
-                }
-            }
-        }
-
-        Config::default()
+        let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        load_for_workspace(&dirs_config_path(), &workspace)
     }
 
     pub fn is_tool_denied(&self, name: &str) -> bool {
@@ -114,6 +98,125 @@ pub fn env_key_for(provider: &str) -> Option<String> {
 
 fn dirs_config_path() -> PathBuf {
     config_path()
+}
+
+fn load_for_workspace(user_path: &Path, workspace: &Path) -> Config {
+    migrate_plaintext_keys_in_file(user_path);
+
+    let user_content = fs::read_to_string(user_path).ok();
+    let mut cfg = user_content
+        .as_deref()
+        .and_then(|content| parse_config(content).ok())
+        .unwrap_or_default();
+    let user_selected_prompt = user_content
+        .as_deref()
+        .and_then(|content| crate::json::parse(content).ok())
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|obj| {
+            obj.get("system_prompt_file")
+                .and_then(|v| v.as_str())
+                .is_some()
+        });
+
+    // The default CAIRN.md belongs to the repository, not the user. Do not load
+    // it until the user has explicitly trusted this workspace.
+    if !user_selected_prompt {
+        cfg.system_prompt_file.clear();
+    }
+
+    let trusted = user_content
+        .as_deref()
+        .is_some_and(|content| workspace_is_trusted(content, workspace));
+    let project_path = workspace.join(".cairn/config.json");
+    let Some(project_content) = fs::read_to_string(project_path).ok() else {
+        if trusted && !user_selected_prompt {
+            if let Some(path) = resolve_workspace_prompt(workspace, "CAIRN.md") {
+                cfg.system_prompt_file = path.to_string_lossy().into_owned();
+            }
+        }
+        return cfg;
+    };
+
+    let Ok(project_value) = crate::json::parse(&project_content) else {
+        return cfg;
+    };
+    let Some(project) = project_value.as_object() else {
+        return cfg;
+    };
+
+    apply_project_preferences(&mut cfg, project);
+
+    if trusted {
+        if let Some(prompt) = project.get("system_prompt_file").and_then(|v| v.as_str()) {
+            if let Some(path) = resolve_workspace_prompt(workspace, prompt) {
+                cfg.system_prompt_file = path.to_string_lossy().into_owned();
+            }
+        } else if !user_selected_prompt {
+            if let Some(path) = resolve_workspace_prompt(workspace, "CAIRN.md") {
+                cfg.system_prompt_file = path.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    cfg
+}
+
+fn apply_project_preferences(cfg: &mut Config, project: &HashMap<String, crate::json::JsonValue>) {
+    if let Some(v) = project.get("default_provider").and_then(|v| v.as_str()) {
+        cfg.default_provider = v.to_string();
+    }
+    if let Some(v) = project.get("default_model").and_then(|v| v.as_str()) {
+        cfg.default_model = v.to_string();
+    }
+    if let Some(v) = project.get("max_turns").and_then(|v| v.as_u64()) {
+        cfg.max_turns = v as usize;
+    }
+    if let Some(v) = project.get("max_tokens").and_then(|v| v.as_u64()) {
+        cfg.max_tokens = v as usize;
+    }
+    if let Some(v) = project.get("theme").and_then(|v| v.as_str()) {
+        cfg.theme = v.to_string();
+    }
+    if let Some(v) = project.get("show_thinking").and_then(|v| v.as_bool()) {
+        cfg.show_thinking = v;
+    }
+    if let Some(v) = project.get("show_suggestions").and_then(|v| v.as_bool()) {
+        cfg.show_suggestions = v;
+    }
+}
+
+fn workspace_is_trusted(user_content: &str, workspace: &Path) -> bool {
+    let Ok(workspace) = fs::canonicalize(workspace) else {
+        return false;
+    };
+    let Ok(value) = crate::json::parse(user_content) else {
+        return false;
+    };
+    let Some(entries) = value
+        .as_object()
+        .and_then(|obj| obj.get("trusted_workspaces"))
+        .and_then(|v| v.as_array())
+    else {
+        return false;
+    };
+
+    entries.iter().filter_map(|v| v.as_str()).any(|entry| {
+        let path = Path::new(entry);
+        path.is_absolute()
+            && fs::canonicalize(path).is_ok_and(|trusted_path| trusted_path == workspace)
+    })
+}
+
+fn resolve_workspace_prompt(workspace: &Path, prompt: &str) -> Option<PathBuf> {
+    let workspace = fs::canonicalize(workspace).ok()?;
+    let prompt = Path::new(prompt);
+    let candidate = if prompt.is_absolute() {
+        prompt.to_path_buf()
+    } else {
+        workspace.join(prompt)
+    };
+    let candidate = fs::canonicalize(candidate).ok()?;
+    (candidate.is_file() && candidate.starts_with(&workspace)).then_some(candidate)
 }
 
 fn keyring_entry(provider: &str) -> Result<keyring::Entry, String> {
@@ -422,6 +525,31 @@ fn parse_config(content: &str) -> Result<Config, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("cairn-config-{name}-{}-{id}", std::process::id()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn user_config_with_trust(workspace: &Path) -> String {
+        let workspace = workspace.to_string_lossy().replace('\\', "\\\\");
+        format!(
+            r#"{{
+                "trusted_workspaces": ["{workspace}"],
+                "permissions": {{
+                    "auto_allow": ["file_read"],
+                    "ask": ["shell"],
+                    "deny": ["git"]
+                }}
+            }}"#
+        )
+    }
 
     #[test]
     fn test_default_config() {
@@ -494,6 +622,128 @@ mod tests {
         assert_eq!(cfg.default_provider, "test");
         assert_eq!(cfg.default_model, "m");
         assert!(cfg.auto_allow.contains(&"file_read".to_string()));
+    }
+
+    #[test]
+    fn untrusted_project_only_applies_safe_preferences() {
+        let root = temp_test_dir("untrusted");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(workspace.join(".cairn")).unwrap();
+        let user_path = root.join("user-config.json");
+        let user_prompt = root.join("user-prompt.md");
+        fs::write(&user_prompt, "user-owned prompt").unwrap();
+        let user_prompt_json = user_prompt.to_string_lossy().replace('\\', "\\\\");
+        fs::write(
+            &user_path,
+            format!(r#"{{
+                "system_prompt_file": "{user_prompt_json}",
+                "permissions": {{
+                    "auto_allow": ["file_read"],
+                    "ask": ["shell"],
+                    "deny": ["git"]
+                }}
+            }}"#),
+        )
+        .unwrap();
+        fs::write(
+            workspace.join(".cairn/config.json"),
+            r#"{
+                "default_model": "project-model",
+                "max_tokens": 1234,
+                "show_thinking": true,
+                "system_prompt_file": "../outside.md",
+                "permissions": {
+                    "auto_allow": ["shell", "file_write"],
+                    "ask": [],
+                    "deny": []
+                },
+                "api_keys": {"openai": "repository-secret"},
+                "trusted_workspaces": ["."]
+            }"#,
+        )
+        .unwrap();
+        fs::write(root.join("outside.md"), "untrusted prompt").unwrap();
+
+        let cfg = load_for_workspace(&user_path, &workspace);
+
+        assert_eq!(cfg.default_model, "project-model");
+        assert_eq!(cfg.max_tokens, 1234);
+        assert!(cfg.show_thinking);
+        assert_eq!(cfg.auto_allow, vec!["file_read"]);
+        assert_eq!(cfg.ask, vec!["shell"]);
+        assert_eq!(cfg.deny, vec!["git"]);
+        assert!(cfg.api_keys.is_empty());
+        assert_eq!(PathBuf::from(cfg.system_prompt_file), user_prompt);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn trusted_project_can_select_prompt_only_inside_workspace() {
+        let root = temp_test_dir("trusted-prompt");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(workspace.join(".cairn")).unwrap();
+        let user_path = root.join("user-config.json");
+        fs::write(&user_path, user_config_with_trust(&workspace)).unwrap();
+        fs::create_dir_all(workspace.join("prompts")).unwrap();
+        let prompt = workspace.join("prompts/project.md");
+        fs::write(&prompt, "trusted prompt").unwrap();
+        fs::write(
+            workspace.join(".cairn/config.json"),
+            r#"{
+                "system_prompt_file": "prompts/project.md",
+                "permissions": {"auto_allow": ["shell"]}
+            }"#,
+        )
+        .unwrap();
+
+        let cfg = load_for_workspace(&user_path, &workspace);
+
+        assert_eq!(
+            PathBuf::from(cfg.system_prompt_file),
+            fs::canonicalize(prompt).unwrap()
+        );
+        assert_eq!(cfg.auto_allow, vec!["file_read"]);
+
+        fs::write(root.join("outside.md"), "outside prompt").unwrap();
+        fs::write(
+            workspace.join(".cairn/config.json"),
+            r#"{"system_prompt_file": "../outside.md"}"#,
+        )
+        .unwrap();
+
+        let cfg = load_for_workspace(&user_path, &workspace);
+        assert!(cfg.system_prompt_file.is_empty());
+
+        let outside = fs::canonicalize(root.join("outside.md")).unwrap();
+        let outside_json = outside.to_string_lossy().replace('\\', "\\\\");
+        fs::write(
+            workspace.join(".cairn/config.json"),
+            format!(r#"{{"system_prompt_file": "{outside_json}"}}"#),
+        )
+        .unwrap();
+
+        let cfg = load_for_workspace(&user_path, &workspace);
+        assert!(cfg.system_prompt_file.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_trust_requires_exact_absolute_canonical_path() {
+        let root = temp_test_dir("trust-path");
+        let workspace = root.join("workspace");
+        let child = workspace.join("child");
+        fs::create_dir_all(&child).unwrap();
+
+        let relative = r#"{"trusted_workspaces":["workspace"]}"#;
+        assert!(!workspace_is_trusted(relative, &workspace));
+
+        let parent_trusted = user_config_with_trust(&workspace);
+        assert!(workspace_is_trusted(&parent_trusted, &workspace));
+        assert!(!workspace_is_trusted(&parent_trusted, &child));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -61,12 +61,19 @@ Optionally create a config file:
   "default_model": "claude-sonnet-4-20250514",
   "max_turns": 50,
   "max_tokens": 8192,
+  "trusted_workspaces": ["/absolute/path/to/project"],
   "permissions": {
     "auto_allow": ["file_read", "glob", "grep"],
     "ask": ["file_write", "shell", "file_edit"]
   }
 }
 ```
+
+Repository preferences may also be placed in `.cairn/config.json`. Project files
+can select provider, model, token/turn limits, and display preferences, but they
+cannot change tool permissions or credentials. Add a workspace's absolute path
+to the user-owned `trusted_workspaces` list before Cairn will load its `CAIRN.md`
+or `system_prompt_file`; project prompt files must resolve inside that workspace.
 
 ### Run
 
@@ -178,7 +185,8 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | `default_model` | string | `"claude-sonnet-4-20250514"` | Default model identifier |
 | `max_turns` | int | `100` | Maximum agent loop iterations |
 | `max_tokens` | int | `8192` | Max tokens per LLM response |
-| `system_prompt_file` | string | `"CAIRN.md"` | File to load as system prompt |
+| `system_prompt_file` | string | `"CAIRN.md"` | User-selected system prompt; project-selected prompts require workspace trust and must stay inside it |
+| `trusted_workspaces` | []string | `[]` | Exact absolute workspace paths allowed to select project prompt files (user config only) |
 | `permissions.auto_allow` | []string | `[]` | Tools to auto-approve |
 | `permissions.ask` | []string | `[]` | Tools that require confirmation |
 | `permissions.deny` | []string | `[]` | Tools to block |
