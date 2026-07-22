@@ -157,6 +157,7 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | `/cost` | Show token usage for the session |
 | `/provider` | Show or change the current provider (prompts for API key when missing; input is masked) |
 | `/theme` | Pick a dark TUI theme (live preview); `/theme list` or `/theme <name>` |
+| `Ctrl+C` | Interrupt a run; clear prompt when idle with text; press again on empty prompt to exit |
 | *(after LLM error)* | Prompt: switch model (`m`), switch provider (`p`), or dismiss (`d`/Esc) |
 | `/save` | Save the current session |
 | `/sessions` | List saved sessions |

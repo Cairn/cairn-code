@@ -90,6 +90,9 @@ pub struct Tui {
     theme_picker_sel: usize,
     /// Theme name before opening the picker (restored on Esc).
     theme_before_picker: Option<String>,
+    /// Claude Code-style exit: first Ctrl+C on empty idle prompt arms this;
+    /// second Ctrl+C exits. Disarmed by any other key or action.
+    ctrl_c_exit_armed: bool,
 }
 
 impl Tui {
@@ -150,6 +153,7 @@ impl Tui {
             theme_picker_list: theme::all_themes(),
             theme_picker_sel: 0,
             theme_before_picker: None,
+            ctrl_c_exit_armed: false,
         }
     }
 
@@ -313,6 +317,16 @@ impl Tui {
             return true;
         }
 
+        let is_ctrl_c = matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && key.modifiers.contains(KeyModifiers::CONTROL);
+        // Claude Code: any key other than Ctrl+C disarms the "press again to exit" arm.
+        if !is_ctrl_c {
+            self.ctrl_c_exit_armed = false;
+        }
+        if is_ctrl_c {
+            return self.handle_ctrl_c();
+        }
+
         if self.show_permission_prompt {
             match key.code {
                 KeyCode::Left => {
@@ -383,9 +397,6 @@ impl Tui {
                 KeyCode::Left => { self.confirm_remove_sel = 0; }
                 KeyCode::Right => { self.confirm_remove_sel = 1; }
                 KeyCode::Esc => { self.confirm_remove_provider = None; }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.confirm_remove_provider = None;
-                }
                 KeyCode::Enter => {
                     let remove = self.confirm_remove_sel == 1;
                     self.confirm_remove_provider = None;
@@ -706,19 +717,6 @@ impl Tui {
                 }
                 true
             }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.show_command_picker {
-                    self.show_command_picker = false;
-                } else if self.show_provider_picker {
-                    self.show_provider_picker = false;
-                } else if self.show_model_picker {
-                    self.show_model_picker = false;
-                } else {
-                    self.input_buf.clear();
-                    self.cursor = 0;
-                }
-                true
-            }
             KeyCode::Char(ch) => {
                 // Allow typing into the API-key prompt and the normal input
                 // (but not while a list picker is focused).
@@ -914,6 +912,119 @@ impl Tui {
         self.provider_picker_list = names;
         self.provider_picker_sel = 0;
         self.show_provider_picker = true;
+    }
+
+    /// Claude Code Ctrl+C: interrupt running work; clear prompt when idle with
+    /// text; on empty idle prompt, arm exit then quit on a second press.
+    /// Returns `false` to exit the TUI.
+    fn handle_ctrl_c(&mut self) -> bool {
+        // Close overlays / cancel key entry first (same spirit as Esc).
+        if self.awaiting_api_key {
+            self.awaiting_api_key = false;
+            self.pending_key_after_model = false;
+            self.api_key_target = None;
+            self.input_buf.clear();
+            self.cursor = 0;
+            self.ctrl_c_exit_armed = false;
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: "API key entry cancelled.".into(),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return true;
+        }
+        if self.confirm_remove_provider.is_some() {
+            self.confirm_remove_provider = None;
+            self.ctrl_c_exit_armed = false;
+            return true;
+        }
+        if self.show_command_picker {
+            self.show_command_picker = false;
+            self.ctrl_c_exit_armed = false;
+            return true;
+        }
+        if self.show_provider_picker {
+            self.show_provider_picker = false;
+            self.ctrl_c_exit_armed = false;
+            return true;
+        }
+        if self.show_model_picker {
+            self.show_model_picker = false;
+            self.ctrl_c_exit_armed = false;
+            return true;
+        }
+        if self.show_session_picker {
+            self.show_session_picker = false;
+            self.session_picker_delete = false;
+            self.ctrl_c_exit_armed = false;
+            return true;
+        }
+        if self.show_theme_picker {
+            self.show_theme_picker = false;
+            if let Some(prev) = self.theme_before_picker.take() {
+                self.theme = theme::lookup(&prev);
+            }
+            self.ctrl_c_exit_armed = false;
+            return true;
+        }
+        if self.show_recovery_prompt {
+            self.show_recovery_prompt = false;
+            self.ctrl_c_exit_armed = false;
+            return true;
+        }
+        if self.show_permission_prompt {
+            self.show_permission_prompt = false;
+            if let Some(tx) = &self.perm_tx {
+                let _ = tx.send("deny".to_string());
+            }
+            self.ctrl_c_exit_armed = false;
+            return true;
+        }
+
+        // Interrupt a running agent turn.
+        if matches!(self.state, State::Running) {
+            if let Some(flag) = &self.cancel_flag {
+                flag.store(true, Ordering::Relaxed);
+            }
+            // Tell the agent loop as well (if it listens for "cancel").
+            if let Some(tx) = &self.agent_tx {
+                let _ = tx.send("cancel".into());
+            }
+            self.state = State::Idle;
+            self.flush_streaming();
+            self.ctrl_c_exit_armed = false;
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: "Interrupted.".into(),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return true;
+        }
+
+        // Idle: clear non-empty prompt (first action).
+        if !self.input_buf.is_empty() {
+            self.input_buf.clear();
+            self.cursor = 0;
+            self.show_command_picker = false;
+            self.cmd_picker_filtered.clear();
+            self.ctrl_c_exit_armed = false;
+            return true;
+        }
+
+        // Empty idle prompt: second Ctrl+C exits; first arms confirmation.
+        if self.ctrl_c_exit_armed {
+            return false;
+        }
+        self.ctrl_c_exit_armed = true;
+        self.output_lines.push(OutputLine {
+            type_: "system".into(),
+            content: "Press Ctrl+C again to exit".into(),
+            tool_name: String::new(),
+            duration: String::new(),
+        });
+        true
     }
 
     fn open_theme_picker(&mut self) {
