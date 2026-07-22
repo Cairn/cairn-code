@@ -116,6 +116,10 @@ pub struct Tui {
     session_created_at: u64,
     /// Full agent transcript (tools included) for session files.
     live_mirror: Option<session::LiveMirror>,
+    /// When true, the next `Done` event is a finished agent turn (play sound + refresh hint).
+    expect_turn_notify: bool,
+    /// Claude Code-style grayed-out next-task hint shown when the composer is empty.
+    idle_suggestion: Option<String>,
 }
 
 impl Tui {
@@ -184,6 +188,8 @@ impl Tui {
             current_session_id: None,
             session_created_at: 0,
             live_mirror: None,
+            expect_turn_notify: false,
+            idle_suggestion: Some(default_empty_suggestion().into()),
         }
     }
 
@@ -258,6 +264,8 @@ impl Tui {
                             if is_llm {
                                 self.show_recovery_prompt = true;
                                 self.recovery_selection = 0;
+                                crate::notify::play(crate::notify::Kind::Attention);
+                                self.refresh_idle_suggestion();
                             }
                         }
                         AgentEvent::PermissionRequest(name, input) => {
@@ -266,6 +274,8 @@ impl Tui {
                             self.perm_tool_name = name;
                             self.perm_tool_input = input;
                             self.perm_selection = 0;
+                            crate::notify::play(crate::notify::Kind::Attention);
+                            self.refresh_idle_suggestion();
                         }
                         AgentEvent::TurnEnd(u) => {
                             self.total_usage.input_tokens += u.input_tokens;
@@ -285,6 +295,14 @@ impl Tui {
                             self.state = State::Idle;
                             // Autosave after each finished turn (not only manual /save).
                             self.autosave_session(false);
+                            if self.expect_turn_notify {
+                                self.expect_turn_notify = false;
+                                // Permission/recovery already beeped Attention; skip double tone.
+                                if !self.show_permission_prompt && !self.show_recovery_prompt {
+                                    crate::notify::play(crate::notify::Kind::Done);
+                                }
+                            }
+                            self.refresh_idle_suggestion();
                             if self.pending_model_after_auth {
                                 if crate::config::has_usable_credential(&self.provider) {
                                     // Signed in — now pick a model (live catalog available).
@@ -533,12 +551,14 @@ impl Tui {
                     if let Some(tx) = &self.perm_tx {
                         let _ = tx.send(selected.to_string());
                     }
+                    self.refresh_idle_suggestion();
                 }
                 KeyCode::Esc => {
                     self.show_permission_prompt = false;
                     if let Some(tx) = &self.perm_tx {
                         let _ = tx.send("deny".to_string());
                     }
+                    self.refresh_idle_suggestion();
                 }
                 _ => {}
             }
@@ -565,6 +585,7 @@ impl Tui {
                 }
                 KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Esc => {
                     self.show_recovery_prompt = false;
+                    self.refresh_idle_suggestion();
                 }
                 KeyCode::Enter => {
                     let sel = self.recovery_selection;
@@ -572,7 +593,7 @@ impl Tui {
                     match sel {
                         0 => self.open_model_picker(),
                         1 => self.open_provider_picker(),
-                        _ => {}
+                        _ => self.refresh_idle_suggestion(),
                     }
                 }
                 _ => {}
@@ -689,10 +710,41 @@ impl Tui {
                 true
             }
             KeyCode::Right => {
-                if self.cursor < self.input_buf.len() { self.cursor += 1; }
+                // Right arrow on empty input accepts the ghost suggestion.
+                if self.cursor >= self.input_buf.len()
+                    && self.input_buf.is_empty()
+                    && !self.awaiting_api_key
+                    && !self.show_command_picker
+                {
+                    if let Some(hint) = self.idle_suggestion.clone() {
+                        self.input_buf = hint;
+                        self.cursor = self.input_buf.len();
+                        self.idle_suggestion = None;
+                        return true;
+                    }
+                }
+                if self.cursor < self.input_buf.len() {
+                    self.cursor += 1;
+                }
                 true
             }
             KeyCode::Tab => {
+                // Empty composer: accept grayed-out next-task suggestion (Claude Code-style).
+                if self.input_buf.is_empty()
+                    && !self.awaiting_api_key
+                    && !self.show_command_picker
+                    && !self.show_model_picker
+                    && !self.show_provider_picker
+                    && !self.show_theme_picker
+                    && !self.show_session_picker
+                {
+                    if let Some(hint) = self.idle_suggestion.clone() {
+                        self.input_buf = hint;
+                        self.cursor = self.input_buf.len();
+                        self.idle_suggestion = None;
+                        return true;
+                    }
+                }
                 // Slash-command completion: apply selected (or sole) match and
                 // keep the picker open for the next argument when needed.
                 if self.input_buf.starts_with('/') {
@@ -879,6 +931,8 @@ impl Tui {
                 self.show_recovery_prompt = false;
                 // New turn: pin transcript to bottom (follow latest output).
                 self.transcript_follow = true;
+                self.expect_turn_notify = true;
+                self.idle_suggestion = None;
                 self.output_lines.push(OutputLine {
                     type_: "user".into(), content: input.clone(),
                     tool_name: String::new(), duration: String::new(),
@@ -894,6 +948,9 @@ impl Tui {
                     self.input_buf.remove(self.cursor - 1);
                     self.cursor -= 1;
                     self.update_cmd_picker();
+                    if self.input_buf.is_empty() {
+                        self.refresh_idle_suggestion();
+                    }
                 }
                 true
             }
@@ -1024,7 +1081,7 @@ impl Tui {
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /auth /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions /theme\nTab completes slash commands (auth, model, theme, provider, session ids)\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)\nScroll: mouse wheel · PgUp/PgDn · Ctrl+U/D (half page) · Ctrl+Home/End\n/provider xai — browser OAuth; /auth login xai; /auth key xai for API key".into(),
+                    content: "Commands: /auth /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions /theme\nTab completes slash commands; Tab/→ accepts grayed next-task hint when empty\nSounds: done/attention beeps (CAIRN_SOUND=0 to mute)\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)\nScroll: mouse wheel · PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End\n/provider xai — browser OAuth; /auth login xai; /auth key xai for API key".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
             }
@@ -2100,12 +2157,37 @@ impl Tui {
         } else {
             let cursor = self.cursor.min(self.input_buf.len());
             let (before, after) = self.input_buf.split_at(cursor);
-            chrome.push(Line::from(vec![
-                Span::styled("❯ ", orange_fg),
-                Span::raw(before),
-                Span::raw(after),
-            ]));
-            cursor_pos = Some((display_width("❯ ") as u16 + display_width(before) as u16, 0));
+            // Claude Code-style grayed next-task hint when the composer is empty.
+            if self.input_buf.is_empty()
+                && matches!(self.state, State::Idle)
+                && !self.show_permission_prompt
+                && !self.awaiting_api_key
+            {
+                if let Some(hint) = &self.idle_suggestion {
+                    chrome.push(Line::from(vec![
+                        Span::styled("❯ ", orange_fg),
+                        Span::styled(hint.as_str(), bold_dim),
+                    ]));
+                    cursor_pos = Some((display_width("❯ ") as u16, 0));
+                } else {
+                    chrome.push(Line::from(vec![
+                        Span::styled("❯ ", orange_fg),
+                        Span::raw(before),
+                        Span::raw(after),
+                    ]));
+                    cursor_pos = Some((display_width("❯ ") as u16, 0));
+                }
+            } else {
+                chrome.push(Line::from(vec![
+                    Span::styled("❯ ", orange_fg),
+                    Span::raw(before),
+                    Span::raw(after),
+                ]));
+                cursor_pos = Some((
+                    display_width("❯ ") as u16 + display_width(before) as u16,
+                    0,
+                ));
+            }
         }
 
         let width = area.width as usize;
@@ -2281,6 +2363,18 @@ impl Tui {
         self.show_command_picker = !self.cmd_picker_filtered.is_empty();
     }
 
+    /// Refresh the grayed-out next-task hint in the empty composer.
+    fn refresh_idle_suggestion(&mut self) {
+        if !self.input_buf.is_empty() || !matches!(self.state, State::Idle) {
+            return;
+        }
+        self.idle_suggestion = Some(compute_idle_suggestion(
+            self.show_permission_prompt,
+            self.show_recovery_prompt,
+            &self.output_lines,
+        ));
+    }
+
     /// Insert a completion into the composer. Adds a trailing space when more
     /// arguments are expected so the next Tab level can open immediately.
     fn apply_slash_completion(&mut self, completion: &str) {
@@ -2293,6 +2387,63 @@ impl Tui {
         self.cursor = self.input_buf.len();
         self.update_cmd_picker();
     }
+}
+
+fn default_empty_suggestion() -> &'static str {
+    "Ask about this codebase or describe a task"
+}
+
+/// Pick a short grayed-out next-step hint from recent UI state (Claude Code-style).
+pub(crate) fn compute_idle_suggestion(
+    permission: bool,
+    recovery: bool,
+    lines: &[OutputLine],
+) -> String {
+    if permission {
+        return "Approve or deny the tool request above".into();
+    }
+    if recovery {
+        return "Switch model (m) · provider (p) · or dismiss (d)".into();
+    }
+    // Walk recent transcript for a contextual nudge.
+    let mut last_user: Option<&str> = None;
+    let mut last_assistant: Option<&str> = None;
+    let mut last_tool: Option<&str> = None;
+    let mut saw_error = false;
+    for line in lines.iter().rev().take(40) {
+        match line.type_.as_str() {
+            "user" if last_user.is_none() => last_user = Some(line.content.as_str()),
+            "text" if last_assistant.is_none() => last_assistant = Some(line.content.as_str()),
+            "tool_use" if last_tool.is_none() => last_tool = Some(line.tool_name.as_str()),
+            "error" => saw_error = true,
+            _ => {}
+        }
+    }
+    if saw_error {
+        return "Try again, or /provider /model to switch".into();
+    }
+    if let Some(tool) = last_tool {
+        if tool == "shell" {
+            return "Inspect the command output or continue".into();
+        }
+        return format!("Review {tool} results or continue");
+    }
+    if let Some(u) = last_user {
+        let lower = u.to_ascii_lowercase();
+        if lower.contains("test") {
+            return "Run the tests or fix failures".into();
+        }
+        if lower.contains("commit") || lower.contains("push") {
+            return "Review the diff, then commit & push".into();
+        }
+        if lower.contains("fix") || lower.contains("bug") {
+            return "Verify the fix still works".into();
+        }
+    }
+    if last_assistant.is_some() {
+        return "Continue, or ask a follow-up".into();
+    }
+    default_empty_suggestion().into()
 }
 
 /// Commands that still need another argument after Tab.
@@ -2437,6 +2588,43 @@ pub(crate) fn slash_completions(
             Vec::new()
         }
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    use super::*;
+
+    fn line(type_: &str, content: &str, tool: &str) -> OutputLine {
+        OutputLine {
+            type_: type_.into(),
+            content: content.into(),
+            tool_name: tool.into(),
+            duration: String::new(),
+        }
+    }
+
+    #[test]
+    fn suggestion_permission_and_recovery() {
+        assert!(compute_idle_suggestion(true, false, &[]).contains("Approve"));
+        assert!(compute_idle_suggestion(false, true, &[]).contains("Switch model"));
+    }
+
+    #[test]
+    fn suggestion_from_recent_user_and_tools() {
+        let lines = vec![
+            line("user", "please run the tests", ""),
+            line("tool_use", r#"{"command":"cargo test"}"#, "shell"),
+            line("tool_result", "ok", "shell"),
+        ];
+        let s = compute_idle_suggestion(false, false, &lines);
+        assert!(s.to_ascii_lowercase().contains("command") || s.to_ascii_lowercase().contains("continue"));
+    }
+
+    #[test]
+    fn suggestion_default_when_empty() {
+        let s = compute_idle_suggestion(false, false, &[]);
+        assert_eq!(s, default_empty_suggestion());
     }
 }
 

@@ -23,6 +23,8 @@
 - [ ] Add plugin/extension system — custom tools via Lua or WASM
 - [x] TUI theme customization — dark themes from zero + fixed dark Dune; `/theme` picker
 - [x] Add completions/suggestions for commands — Tab slash completion (`slash_completions` in `tui.rs`)
+- [x] Notification sounds on turn done / permission / recovery (`notify.rs`; mute with `CAIRN_SOUND=0`)
+- [x] Grayed-out next-task composer hints (Claude Code-style; Tab/→ to accept)
 - [ ] Performance optimization — reduce memory allocations in hot paths
 - [ ] Add benchmark tests for streaming throughput
 

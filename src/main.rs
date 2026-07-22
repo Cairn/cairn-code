@@ -11,6 +11,7 @@ mod markdown;
 mod redact;
 mod theme;
 mod oauth;
+mod notify;
 
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
