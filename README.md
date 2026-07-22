@@ -1,9 +1,9 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-1.96-F46623?style=for-the-badge&logo=rust&logoColor=white" alt="Rust"><br>
   <img src="https://img.shields.io/badge/CLI-agentic%20loop-6e40c9?style=for-the-badge" alt="Agent Loop"><br>
-  <img src="https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20OpenCode-f472b6?style=for-the-badge" alt="Multi-Provider"><br>
+  <img src="https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20OpenCode%20%7C%20OpenRouter%20%7C%20Ollama-f472b6?style=for-the-badge" alt="Multi-Provider"><br>
   <img src="https://img.shields.io/badge/TUI-ratatui-FF6F00?style=for-the-badge" alt="Ratatui"><br>
-  <img src="https://img.shields.io/badge/Tools-11-22c55e?style=for-the-badge" alt="11 Tools"><br>
+  <img src="https://img.shields.io/badge/Tools-12-22c55e?style=for-the-badge" alt="12 Tools"><br>
   <img src="https://img.shields.io/badge/Private-Cairn-1a1b26?style=for-the-badge" alt="Private">
 </p>
 
@@ -16,22 +16,22 @@
 
 ## Features
 
-- **Multi-provider LLM support** — Anthropic (Claude), OpenAI (GPT), OpenCode (free API)
+- **Multi-provider LLM support** — Anthropic (Claude), OpenAI (GPT), OpenCode (free API), OpenRouter, Ollama
 - **Agentic tool loop** — The LLM autonomously reads files, writes code, runs commands, and searches your codebase until the task is done
-- **11 built-in tools** — FileRead, FileWrite, FileEdit, Shell, Go, Git, Glob, Grep, WebSearch, WebFetch, TodoWrite
+- **12 built-in tools** — FileRead, FileWrite, FileEdit, Shell, Go, Git, Glob, Grep, Memory, WebSearch, WebFetch, TodoWrite
 - **Real-time streaming** — Token-by-token output with live tool display and thinking blocks
-- **Ratatui TUI** — Terminal UI with input history, spinner, and model picker
+- **Ratatui TUI** — Terminal UI with input history, spinner, and provider/model pickers
 - **Cost tracking** — Per-session and per-tool-call token usage with cache-aware pricing
 - **Permission system** — Per-tool auto_allow/ask/deny configuration
 - **Print mode** — Non-interactive execution for scripting and pipelines
-- **Zero runtime deps** — HTTP via `curl`, JSON via hand-written recursive descent parser
+- **Minimal deps** — Just `ratatui` and `ureq`; LLM calls go through `ureq`, JSON is a hand-written recursive descent parser, and the web tools shell out to `curl`
 
 ## Quick Start
 
 ### Prerequisites
 
 - Rust 1.96+
-- [curl](https://curl.se/) installed and on PATH
+- [curl](https://curl.se/) installed and on PATH (used by the `web_fetch` and `web_search` tools)
 
 ### Build
 
@@ -47,9 +47,11 @@ Set your API key:
 export ANTHROPIC_API_KEY="sk-ant-..."
 # or
 export OPENAI_API_KEY="sk-..."
+# or
+export OPENROUTER_API_KEY="sk-or-..."
 ```
 
-The OpenCode provider (default) requires no API key.
+Anthropic is the default provider. The OpenCode provider requires no API key; Ollama talks to a local server.
 
 Optionally create a config file:
 
@@ -88,8 +90,9 @@ src/
   agent.rs               Core agentic loop (LLM call -> tool use -> repeat)
   config.rs              Configuration loading and merging (JSON + env vars)
   cost.rs                Model pricing tables and cost estimation
-  http_client.rs         HTTP client via curl subprocess (blocking + streaming)
+  http_client.rs         HTTP client via ureq (blocking + streaming)
   json.rs                Hand-written recursive descent JSON parser
+  markdown.rs            Markdown rendering for TUI output
   session.rs             Session persistence (save/load/list)
   tui.rs                 Ratatui terminal UI
   llm/
@@ -97,6 +100,8 @@ src/
     anthropic.rs         Anthropic Messages API client (SSE streaming)
     openai.rs            OpenAI Chat Completions client (streaming)
     opencode.rs          OpenCode free API client (OpenAI-compatible, streaming)
+    openrouter.rs        OpenRouter client (OpenAI-compatible, streaming)
+    ollama.rs            Local Ollama client
   tools/
     registry.rs          Tool trait and registry
     file_read.rs         Read files with line pagination
@@ -107,8 +112,9 @@ src/
     git_tool.rs          Git command execution (no shell injection)
     glob_tool.rs         File pattern matching (glob)
     grep_tool.rs         Regex search across codebase
-    web_search.rs        DuckDuckGo web search
-    web_fetch.rs         HTTP page fetcher with HTML-to-text
+    memory.rs            Cross-session memory storage/retrieval
+    web_search.rs        DuckDuckGo web search (via curl)
+    web_fetch.rs         HTTP page fetcher with HTML-to-text (via curl)
     todo.rs              Task tracking
 ```
 
@@ -136,6 +142,7 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | **git** | Execute Git commands (avoids shell injection) | Yes |
 | **glob** | File pattern matching | No |
 | **grep** | Regex search across the codebase | No |
+| **memory** | Store and retrieve cross-session information | No |
 | **web_search** | Search the web via DuckDuckGo | No |
 | **web_fetch** | Fetch and extract web page content | Yes |
 | **todo_write** | Manage a task/todo list | No |
@@ -148,15 +155,18 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | `/clear` | Clear conversation history |
 | `/model` | Show or change the current model |
 | `/cost` | Show token usage for the session |
-| `/provider` | Show current provider |
-| `/quit` | Exit Cairn Code |
+| `/provider` | Show or change the current provider |
+| `/save` | Save the current session |
+| `/sessions` | List saved sessions |
+| `/resume` | Resume a saved session |
+| `/quit`, `/exit`, `/q` | Exit Cairn Code |
 
 ## Configuration Reference
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `default_provider` | string | `"opencode"` | LLM provider (`anthropic`, `openai`, `opencode`) |
-| `default_model` | string | `"deepseek-v4-flash-free"` | Default model identifier |
+| `default_provider` | string | `"anthropic"` | LLM provider (`anthropic`, `openai`, `opencode`, `openrouter`, `ollama`) |
+| `default_model` | string | `"claude-sonnet-4-20250514"` | Default model identifier |
 | `max_turns` | int | `100` | Maximum agent loop iterations |
 | `max_tokens` | int | `8192` | Max tokens per LLM response |
 | `system_prompt_file` | string | `"CAIRN.md"` | File to load as system prompt |
