@@ -1,0 +1,272 @@
+//! On-demand skill packs (Claude Code / zero style).
+//!
+//! Skills live as `*/SKILL.md` under a skills root. Only a short catalog is
+//! injected into the system prompt; the full body is returned when the model
+//! calls the `skill` tool with `{ "name": "..." }`.
+
+use std::fs;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone)]
+pub struct Skill {
+    pub name: String,
+    pub description: String,
+    pub content: String,
+    pub path: PathBuf,
+}
+
+/// Primary skills directory.
+///
+/// Order: `CAIRN_SKILLS_DIR` → `~/.local/share/cairn-code/skills` (Unix) /
+/// `%USERPROFILE%\.local\share\cairn-code\skills` (Windows fallback) →
+/// `~/.config/cairn-code/skills`.
+pub fn default_skills_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("CAIRN_SKILLS_DIR") {
+        let t = p.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
+    }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into());
+    let home = PathBuf::from(home);
+    let xdg = home.join(".local").join("share").join("cairn-code").join("skills");
+    if xdg.exists() {
+        return xdg;
+    }
+    home.join(".config").join("cairn-code").join("skills")
+}
+
+/// Optional shared agents skills root (`~/.agents/skills`), if present.
+pub fn agents_skills_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    let p = PathBuf::from(home).join(".agents").join("skills");
+    if p.is_dir() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// Load skills from default roots (primary first; later roots fill name gaps).
+pub fn load_skills() -> Vec<Skill> {
+    let mut roots = vec![default_skills_dir()];
+    if let Some(a) = agents_skills_dir() {
+        roots.push(a);
+    }
+    load_from_roots(&roots)
+}
+
+pub fn load_from_roots(roots: &[PathBuf]) -> Vec<Skill> {
+    let mut out: Vec<Skill> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        let mut names: Vec<_> = entries.flatten().collect();
+        names.sort_by_key(|e| e.file_name());
+        for entry in names {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let skill_md = path.join("SKILL.md");
+            if !skill_md.is_file() {
+                continue;
+            }
+            let Ok(raw) = fs::read_to_string(&skill_md) else {
+                continue;
+            };
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            let Some(mut skill) = parse_skill(&raw, &dir_name, skill_md) else {
+                continue;
+            };
+            if skill.name.is_empty() {
+                skill.name = dir_name;
+            }
+            if !seen.insert(skill.name.clone()) {
+                continue;
+            }
+            out.push(skill);
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Parse SKILL.md with optional YAML-ish frontmatter (`name`, `description` only).
+pub fn parse_skill(raw: &str, default_name: &str, path: PathBuf) -> Option<Skill> {
+    let (front, body) = split_frontmatter(raw);
+    let mut name = default_name.to_string();
+    let mut description = String::new();
+    if let Some(fm) = front {
+        for line in fm.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("name:") {
+                let v = unquote(rest.trim());
+                if !v.is_empty() {
+                    name = v;
+                }
+            } else if let Some(rest) = line.strip_prefix("description:") {
+                description = unquote(rest.trim());
+            }
+        }
+    }
+    let content = body.trim().to_string();
+    if content.is_empty() && description.is_empty() {
+        return None;
+    }
+    if description.is_empty() {
+        // First non-empty line of body as a weak description.
+        description = content
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("skill")
+            .chars()
+            .take(120)
+            .collect();
+    }
+    Some(Skill {
+        name,
+        description,
+        content,
+        path,
+    })
+}
+
+fn split_frontmatter(raw: &str) -> (Option<String>, String) {
+    let bytes = raw.as_bytes();
+    if !raw.starts_with("---") {
+        return (None, raw.to_string());
+    }
+    // After opening ---
+    let rest = &raw[3..];
+    let rest = rest.strip_prefix('\r').unwrap_or(rest);
+    let rest = rest.strip_prefix('\n').unwrap_or(rest);
+    // Find closing ---
+    if let Some(idx) = rest.find("\n---") {
+        let front = rest[..idx].to_string();
+        let after = &rest[idx + 4..];
+        let after = after.strip_prefix('\r').unwrap_or(after);
+        let after = after.strip_prefix('\n').unwrap_or(after);
+        return (Some(front), after.to_string());
+    }
+    // Also allow ---\r\n style end at start of line
+    let _ = bytes;
+    (None, raw.to_string())
+}
+
+fn unquote(s: &str) -> String {
+    let s = s.trim();
+    if (s.starts_with('"') && s.ends_with('"') && s.len() >= 2)
+        || (s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2)
+    {
+        return s[1..s.len() - 1].to_string();
+    }
+    s.to_string()
+}
+
+/// Compact catalog for the system prompt (not full bodies).
+pub fn catalog_prompt(skills: &[Skill]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "<available_skills>\n\
+         Reusable, on-demand instruction packs. Load one with the `skill` tool \
+         when its description matches the task.\n",
+    );
+    for s in skills {
+        out.push_str(&format!("- {}: {}\n", s.name, s.description));
+    }
+    out.push_str("</available_skills>");
+    out
+}
+
+/// Resolve a skill by name (case-sensitive first, then case-insensitive).
+pub fn find_skill<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
+    skills
+        .iter()
+        .find(|s| s.name == name)
+        .or_else(|| {
+            let lower = name.to_ascii_lowercase();
+            skills.iter().find(|s| s.name.to_ascii_lowercase() == lower)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_frontmatter_name_and_description() {
+        let raw = "---\nname: demo\ndescription: Do the thing\n---\n\n# Body\n\nStep 1.\n";
+        let s = parse_skill(raw, "folder", PathBuf::from("x")).unwrap();
+        assert_eq!(s.name, "demo");
+        assert_eq!(s.description, "Do the thing");
+        assert!(s.content.contains("Step 1"));
+    }
+
+    #[test]
+    fn parse_without_frontmatter_uses_dir_name() {
+        let raw = "# Hello\n\nInstructions here.\n";
+        let s = parse_skill(raw, "hello-skill", PathBuf::from("x")).unwrap();
+        assert_eq!(s.name, "hello-skill");
+        assert!(s.description.contains("Hello") || s.description.contains("Instructions"));
+        assert!(s.content.contains("Instructions"));
+    }
+
+    #[test]
+    fn catalog_lists_skills() {
+        let skills = vec![Skill {
+            name: "a".into(),
+            description: "A skill".into(),
+            content: "body".into(),
+            path: PathBuf::from("a"),
+        }];
+        let cat = catalog_prompt(&skills);
+        assert!(cat.contains("<available_skills>"));
+        assert!(cat.contains("- a: A skill"));
+    }
+
+    #[test]
+    fn load_from_temp_root() {
+        let root = std::env::temp_dir().join(format!(
+            "cairn-skills-test-{}",
+            std::process::id()
+        ));
+        let skill_dir = root.join("greet");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: Say hello\n---\n\nAlways greet the user.\n",
+        )
+        .unwrap();
+        let skills = load_from_roots(&[root.clone()]);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "greet");
+        assert_eq!(skills[0].description, "Say hello");
+        assert!(skills[0].content.contains("greet"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn find_skill_case_insensitive() {
+        let skills = vec![Skill {
+            name: "MySkill".into(),
+            description: "d".into(),
+            content: "c".into(),
+            path: PathBuf::from("p"),
+        }];
+        assert!(find_skill(&skills, "myskill").is_some());
+        assert!(find_skill(&skills, "nope").is_none());
+    }
+}

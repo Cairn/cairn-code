@@ -20,6 +20,10 @@ pub struct Config {
     /// When true, show grayed ready-to-send idle prompts in the empty composer.
     /// Default off; enable with `/suggestions on`.
     pub show_suggestions: bool,
+    /// Optional override for the skills root (else CAIRN_SKILLS_DIR / default path).
+    pub skills_dir: Option<String>,
+    /// MCP stdio servers (external tools).
+    pub mcp: crate::mcp::McpConfig,
 }
 
 impl Default for Config {
@@ -37,6 +41,8 @@ impl Default for Config {
             theme: "dark".to_string(),
             show_thinking: false,
             show_suggestions: false,
+            skills_dir: None,
+            mcp: crate::mcp::McpConfig::default(),
         }
     }
 }
@@ -400,6 +406,23 @@ fn parse_config(content: &str) -> Result<Config, String> {
     }
     if let Some(v) = obj.get("show_suggestions").and_then(|v| v.as_bool()) {
         cfg.show_suggestions = v;
+    }
+    if let Some(v) = obj.get("skills_dir").and_then(|v| v.as_str()) {
+        let t = v.trim();
+        if !t.is_empty() {
+            cfg.skills_dir = Some(t.to_string());
+        }
+    }
+    if let Some(mcp_obj) = obj.get("mcp").and_then(|v| v.as_object()) {
+        cfg.mcp = crate::mcp::McpConfig::from_json_obj(mcp_obj);
+    } else if let Some(servers) = obj.get("mcpServers").and_then(|v| v.as_object()) {
+        // Claude Code / zero-style top-level alias.
+        let mut wrap = std::collections::HashMap::new();
+        wrap.insert(
+            "servers".into(),
+            crate::json::JsonValue::Object(servers.clone()),
+        );
+        cfg.mcp = crate::mcp::McpConfig::from_json_obj(&wrap);
     }
 
     if let Some(perms) = obj.get("permissions").and_then(|v| v.as_object()) {

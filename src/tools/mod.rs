@@ -15,5 +15,6 @@ pub mod web_search;
 pub mod web_fetch;
 pub mod todo;
 pub mod memory;
+pub mod skill_tool;
 
 
