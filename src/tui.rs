@@ -80,6 +80,9 @@ pub struct Tui {
     /// When Some, a confirmation prompt to remove this provider's saved API key is shown.
     confirm_remove_provider: Option<String>,
     confirm_remove_sel: usize,
+    /// When Some, ask before sending the existing conversation to this provider.
+    confirm_history_provider: Option<String>,
+    confirm_history_sel: usize,
     awaiting_api_key: bool,
     /// After successful OAuth or API key entry from the provider picker, open the model list.
     /// Auth comes first so live model catalogs (xAI, Anthropic, …) can load.
@@ -178,6 +181,8 @@ impl Tui {
             provider_picker_keys: Vec::new(),
             confirm_remove_provider: None,
             confirm_remove_sel: 0,
+            confirm_history_provider: None,
+            confirm_history_sel: 0,
             awaiting_api_key: false,
             pending_model_after_auth: false,
             api_key_target: None,
@@ -722,7 +727,8 @@ impl Tui {
             || self.show_session_picker
             || self.show_command_picker
             || self.show_permission_prompt
-            || self.confirm_remove_provider.is_some();
+            || self.confirm_remove_provider.is_some()
+            || self.confirm_history_provider.is_some();
         if !picker_nav {
             match key.code {
                 KeyCode::PageUp => {
@@ -875,6 +881,23 @@ impl Tui {
                         });
                         self.provider_picker_keys = self.provider_picker_list.iter()
                             .map(|n| crate::config::has_usable_credential(n)).collect();
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+
+        if let Some(name) = self.confirm_history_provider.clone() {
+            match key.code {
+                KeyCode::Left => { self.confirm_history_sel = 0; }
+                KeyCode::Right => { self.confirm_history_sel = 1; }
+                KeyCode::Esc => { self.confirm_history_provider = None; }
+                KeyCode::Enter => {
+                    let proceed = self.confirm_history_sel == 1;
+                    self.confirm_history_provider = None;
+                    if proceed {
+                        self.begin_provider_selection(name);
                     }
                 }
                 _ => {}
@@ -1064,31 +1087,12 @@ impl Tui {
                 if self.show_provider_picker {
                     if self.provider_picker_sel < self.provider_picker_list.len() {
                         let name = self.provider_picker_list[self.provider_picker_sel].clone();
-                        let providers = crate::llm::default_providers();
-                        if let Some(p) = providers.get(&name) {
-                            let default_model = p.default_model().to_string();
-                            self.provider = name.clone();
-                            // Provisional default until the user picks from the model list.
-                            self.model = if name == "openrouter" {
-                                "gpt-5-mini".to_string()
-                            } else {
-                                default_model
-                            };
-                            self.show_provider_picker = false;
-                            // Auth first (browser OAuth or API key), then model list.
-                            // Live catalogs need credentials; model-before-login was backwards.
-                            if crate::config::needs_credential(&name) {
-                                self.pending_model_after_auth = true;
-                                if crate::oauth::supports_oauth(&name) {
-                                    self.begin_oauth_login(&name, true);
-                                } else {
-                                    self.begin_api_key_prompt(&name);
-                                }
-                            } else {
-                                self.open_model_picker();
-                            }
+                        self.show_provider_picker = false;
+                        if self.provider_switch_needs_confirmation(&name) {
+                            self.confirm_history_provider = Some(name);
+                            self.confirm_history_sel = 0;
                         } else {
-                            self.show_provider_picker = false;
+                            self.begin_provider_selection(name);
                         }
                     } else {
                         self.show_provider_picker = false;
@@ -1415,31 +1419,12 @@ impl Tui {
                 if parts.len() > 1 {
                     let name = parts[1].to_ascii_lowercase();
                     let providers = crate::llm::default_providers();
-                    if let Some(p) = providers.get(&name) {
-                        self.provider = name.clone();
-                        self.model = p.default_model().to_string();
-                        let _ = crate::config::save_config(&self.provider, &self.model, None);
-                        if crate::config::needs_credential(&name) {
-                            self.pending_model_after_auth = true;
-                            if crate::oauth::supports_oauth(&name) {
-                                self.begin_oauth_login(&name, true);
-                            } else {
-                                self.begin_api_key_prompt(&name);
-                            }
+                    if providers.contains_key(&name) {
+                        if self.provider_switch_needs_confirmation(&name) {
+                            self.confirm_history_provider = Some(name);
+                            self.confirm_history_sel = 0;
                         } else {
-                            self.output_lines.push(OutputLine {
-                                type_: "system".into(),
-                                content: format!(
-                                    "Provider set to: {}\nModel set to: {}",
-                                    self.provider, self.model
-                                ),
-                                tool_name: String::new(),
-                                duration: String::new(),
-                            });
-                            if let Some(tx) = &self.agent_tx {
-                                let _ = tx.send(format!("__switch__:{}:{}", self.provider, self.model));
-                            }
-                            self.open_model_picker();
+                            self.begin_provider_selection(name);
                         }
                     } else {
                         self.output_lines.push(OutputLine {
@@ -1627,6 +1612,49 @@ impl Tui {
         self.show_provider_picker = true;
     }
 
+    fn provider_switch_needs_confirmation(&self, provider: &str) -> bool {
+        if provider == self.provider {
+            return false;
+        }
+        if let Some(mirror) = &self.live_mirror {
+            if let Ok(snapshot) = mirror.lock() {
+                if !snapshot.messages.is_empty() {
+                    return true;
+                }
+            }
+        }
+        self.output_lines.iter().any(|line| {
+            matches!(line.type_.as_str(), "user" | "text" | "tool_use" | "tool_result")
+        })
+    }
+
+    fn begin_provider_selection(&mut self, name: String) {
+        let providers = crate::llm::default_providers();
+        let Some(provider) = providers.get(&name) else {
+            return;
+        };
+        let default_model = provider.default_model().to_string();
+        self.provider = name.clone();
+        // Provisional default until the user picks from the model list.
+        self.model = if name == "openrouter" {
+            "gpt-5-mini".to_string()
+        } else {
+            default_model
+        };
+        // Auth first (browser OAuth or API key), then model list. Live
+        // catalogs need credentials; model-before-login was backwards.
+        if crate::config::needs_credential(&name) {
+            self.pending_model_after_auth = true;
+            if crate::oauth::supports_oauth(&name) {
+                self.begin_oauth_login(&name, true);
+            } else {
+                self.begin_api_key_prompt(&name);
+            }
+        } else {
+            self.open_model_picker();
+        }
+    }
+
     /// Claude Code Ctrl+C: interrupt running work; clear prompt when idle with
     /// text; on empty idle prompt, arm exit then quit on a second press.
     /// Returns `false` to exit the TUI.
@@ -1649,6 +1677,11 @@ impl Tui {
         }
         if self.confirm_remove_provider.is_some() {
             self.confirm_remove_provider = None;
+            self.ctrl_c_exit_armed = false;
+            return true;
+        }
+        if self.confirm_history_provider.is_some() {
+            self.confirm_history_provider = None;
             self.ctrl_c_exit_armed = false;
             return true;
         }
@@ -2356,6 +2389,33 @@ impl Tui {
             for (i, opt) in options.iter().enumerate() {
                 if i > 0 { option_spans.push(Span::raw("  ")); }
                 let is_sel = i == self.confirm_remove_sel;
+                let open = if is_sel { "[" } else { " " };
+                let close = if is_sel { "]" } else { " " };
+                option_spans.push(Span::styled(
+                    format!("{open}{opt}{close}"),
+                    if is_sel { orange_fg.add_modifier(Modifier::BOLD) } else { dim },
+                ));
+            }
+            chrome.push(Line::from(option_spans));
+            chrome.push(Line::from(vec![
+                Span::styled("(← → navigate  Enter confirm  Esc cancel)", dim),
+            ]));
+        } else if let Some(name) = &self.confirm_history_provider {
+            chrome.push(Line::from(vec![
+                Span::styled(format!("Send existing conversation to '{name}'?"), white),
+            ]));
+            chrome.push(Line::from(vec![
+                Span::styled(
+                    "Existing prompts, source excerpts, and tool results will be sent to this provider.",
+                    dim,
+                ),
+            ]));
+            chrome.push(Line::from(""));
+            let options = ["Cancel", "Continue"];
+            let mut option_spans = Vec::new();
+            for (i, opt) in options.iter().enumerate() {
+                if i > 0 { option_spans.push(Span::raw("  ")); }
+                let is_sel = i == self.confirm_history_sel;
                 let open = if is_sel { "[" } else { " " };
                 let close = if is_sel { "]" } else { " " };
                 option_spans.push(Span::styled(
@@ -3282,6 +3342,74 @@ mod suggestion_tests {
         let s = compute_idle_suggestion(&lines);
         assert!(s.to_ascii_lowercase().contains("retry"));
         assert!(!s.contains("/provider"));
+    }
+}
+
+#[cfg(test)]
+mod provider_privacy_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn tui_with_history() -> Tui {
+        let mut tui = Tui::new("test", "claude", "anthropic", ".");
+        tui.output_lines.push(OutputLine {
+            type_: "user".into(),
+            content: "inspect private source".into(),
+            tool_name: String::new(),
+            duration: String::new(),
+        });
+        tui
+    }
+
+    #[test]
+    fn cross_provider_switch_requires_confirmation_when_history_exists() {
+        let mut tui = tui_with_history();
+        tui.show_provider_picker = true;
+        tui.provider_picker_list = vec!["ollama".into()];
+        tui.provider_picker_sel = 0;
+
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(tui.provider, "anthropic");
+        assert_eq!(tui.confirm_history_provider.as_deref(), Some("ollama"));
+        assert_eq!(tui.confirm_history_sel, 0, "confirmation must default to cancel");
+
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(tui.provider, "anthropic", "default confirmation action must cancel");
+    }
+
+    #[test]
+    fn provider_command_uses_the_same_confirmation() {
+        let mut tui = tui_with_history();
+
+        tui.handle_command("/provider ollama");
+
+        assert_eq!(tui.provider, "anthropic");
+        assert_eq!(tui.confirm_history_provider.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn confirmed_cross_provider_switch_proceeds() {
+        let mut tui = tui_with_history();
+        tui.show_provider_picker = true;
+        tui.provider_picker_list = vec!["ollama".into()];
+        tui.provider_picker_sel = 0;
+
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(tui.provider, "ollama");
+        assert!(tui.show_model_picker);
+    }
+
+    #[test]
+    fn same_provider_or_empty_history_does_not_require_confirmation() {
+        let tui = tui_with_history();
+        assert!(!tui.provider_switch_needs_confirmation("anthropic"));
+
+        let empty = Tui::new("test", "claude", "anthropic", ".");
+        assert!(!empty.provider_switch_needs_confirmation("ollama"));
     }
 }
 
