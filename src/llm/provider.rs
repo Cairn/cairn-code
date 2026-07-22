@@ -111,6 +111,11 @@ pub fn default_providers() -> HashMap<String, Box<dyn Provider>> {
         None => crate::llm::opengateway::OpenGatewayProvider::new(),
     };
     map.insert("opengateway".into(), Box::new(opengateway));
+    let xai = match crate::config::config_get_api_key("xai") {
+        Some(key) => crate::llm::xai::XaiProvider::new().with_api_key(&key),
+        None => crate::llm::xai::XaiProvider::new(),
+    };
+    map.insert("xai".into(), Box::new(xai));
     map.insert("ollama".into(), Box::new(crate::llm::ollama::OllamaProvider::new()));
     map
 }

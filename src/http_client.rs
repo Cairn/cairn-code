@@ -274,6 +274,61 @@ pub fn request(req: &HttpRequest) -> Result<HttpResponse, String> {
     }
 }
 
+/// GET with optional headers. Used for catalog endpoints like `/v1/models`.
+/// Retries the same transient failures as [`request`]. Caps wall time via curl `--max-time`.
+pub fn request_get(url: &str, headers: &[(String, String)]) -> Result<HttpResponse, String> {
+    let mut attempt = 0;
+    loop {
+        match request_get_once(url, headers) {
+            Ok(resp) => return Ok(resp),
+            Err(RequestError::Status(status, _)) if is_retriable_status(status) && attempt < MAX_RETRIES => {
+                attempt += 1;
+                std::thread::sleep(backoff_delay(attempt));
+            }
+            Err(RequestError::Transport(_)) if attempt < MAX_RETRIES => {
+                attempt += 1;
+                std::thread::sleep(backoff_delay(attempt));
+            }
+            Err(e) => return Err(e.into_string()),
+        }
+    }
+}
+
+fn request_get_once(url: &str, headers: &[(String, String)]) -> Result<HttpResponse, RequestError> {
+    let mut cmd = Command::new("curl");
+    cmd.args(["-sS", "-i", "-X", "GET", "--max-time", "12", url]);
+    for (k, v) in headers {
+        cmd.arg("-H").arg(format!("{k}: {v}"));
+    }
+    cmd.arg("-H").arg("Expect:");
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let child = cmd.spawn().map_err(|e| RequestError::Transport(format!("curl: {e}")))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| RequestError::Transport(format!("{e}")))?;
+    if !output.status.success() && output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(RequestError::Transport(stderr.trim().to_string()));
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let split_at = raw
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .or_else(|| raw.find("\n\n").map(|i| i + 2))
+        .unwrap_or(0);
+    let status = raw
+        .get(..split_at)
+        .and_then(|h| h.lines().next())
+        .map(parse_status_line)
+        .unwrap_or(0);
+    let body = raw.get(split_at..).unwrap_or(&raw).to_string();
+    if status < 200 || status >= 300 {
+        return Err(RequestError::Status(status, body));
+    }
+    Ok(HttpResponse { body })
+}
+
 enum StreamOutcome {
     Cancelled,
     IdleTimeout,

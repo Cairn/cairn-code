@@ -82,6 +82,7 @@ pub fn env_var_name(provider: &str) -> Option<&'static str> {
         "openai" => Some("OPENAI_API_KEY"),
         "openrouter" => Some("OPENROUTER_API_KEY"),
         "opengateway" => Some("GITLAWB_OPENGATEWAY_API_KEY"),
+        "xai" => Some("XAI_API_KEY"),
         _ => None,
     }
 }
@@ -253,9 +254,25 @@ pub fn provider_requires_api_key(provider: &str) -> bool {
     env_var_name(provider).is_some()
 }
 
-/// True when a usable key is available from the keyring or environment.
+/// True when the provider needs credentials and none are available yet
+/// (API key, env, or OAuth token).
+pub fn needs_credential(provider: &str) -> bool {
+    if provider == "ollama" {
+        return false;
+    }
+    provider_requires_api_key(provider) && !has_usable_credential(provider)
+}
+
+/// True when a usable key or OAuth token is available from the keyring or environment.
 pub fn has_usable_credential(provider: &str) -> bool {
-    config_has_api_key(provider) || env_key_for(provider).is_some()
+    if config_has_api_key(provider) || env_key_for(provider).is_some() {
+        return true;
+    }
+    // xAI (and future OAuth providers): valid device-code login counts as signed in.
+    if crate::oauth::supports_oauth(provider) {
+        return crate::oauth::access_token(provider).is_some();
+    }
+    false
 }
 
 /// Apply a key to the process environment for the given provider (so the
@@ -271,12 +288,19 @@ pub fn apply_key_to_env(provider: &str, key: &str) {
 
 /// Load any keyring-stored keys into the environment when the env var is unset.
 pub fn hydrate_env_from_keyring() {
-    for provider in ["anthropic", "openai", "openrouter", "opengateway"] {
+    for provider in ["anthropic", "openai", "openrouter", "opengateway", "xai"] {
         if env_key_for(provider).is_some() {
             continue;
         }
         if let Some(key) = config_get_api_key(provider) {
             apply_key_to_env(provider, &key);
+            continue;
+        }
+        // OAuth access token for providers that support device login (xAI).
+        if crate::oauth::supports_oauth(provider) {
+            if let Some(tok) = crate::oauth::access_token(provider) {
+                apply_key_to_env(provider, &tok);
+            }
         }
     }
 }
@@ -459,6 +483,7 @@ mod tests {
         assert!(provider_requires_api_key("openai"));
         assert!(provider_requires_api_key("openrouter"));
         assert!(provider_requires_api_key("opengateway"));
+        assert!(provider_requires_api_key("xai"));
         assert!(!provider_requires_api_key("ollama"));
     }
 

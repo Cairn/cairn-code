@@ -10,7 +10,7 @@ A Rust-based CLI LLM coding agent, inspired by Claude Code. Built by Cairn.
 
 ## Features
 
-- **Multi-provider LLM support** — Anthropic (Claude), OpenAI (GPT), OpenRouter, OpenGateway (GitLawb smart router), Ollama
+- **Multi-provider LLM support** — Anthropic, OpenAI, OpenRouter, OpenGateway, xAI/Grok (API key or OAuth device login), Ollama
 - **Agentic tool loop** — The LLM autonomously reads files, writes code, runs commands, and searches your codebase until the task is done
 - **13 built-in tools** — FileRead, FileWrite, FileEdit, FileUndo, Shell, Go, Git, Glob, Grep, Memory, WebSearch, WebFetch, TodoWrite
 - **Real-time streaming** — Token-by-token output with live tool display and thinking blocks
@@ -45,9 +45,11 @@ export OPENAI_API_KEY="sk-..."
 export OPENROUTER_API_KEY="sk-or-..."
 # or GitLawb OpenGateway (smart-routes by model id)
 export GITLAWB_OPENGATEWAY_API_KEY="ogw_live_..."
+# optional: xAI API key (browser OAuth is the default, like zero)
+export XAI_API_KEY="xai-..."
 ```
 
-Anthropic is the default provider. OpenGateway is an OpenAI-compatible gateway (`https://opengateway.gitlawb.com/v1`) that routes by model id. Ollama talks to a local server and needs no cloud API key.
+Anthropic is the default provider. OpenGateway is an OpenAI-compatible gateway (`https://opengateway.gitlawb.com/v1`) that routes by model id. **xAI** uses browser device-code OAuth by default when you pick the provider (or `/auth login xai`); paste a key only via `/auth key xai` or `XAI_API_KEY`. With credentials, the model picker loads the live `GET /v1/models` catalog (5-minute cache) and expands Grok 4.5 / multi-agent rows with reasoning effort (`grok-4.5:low|medium|high`). Without credentials it falls back to a curated list. Ollama talks to a local server and needs no cloud API key.
 
 Optionally create a config file:
 
@@ -93,10 +95,11 @@ src/
   tui.rs                 Ratatui terminal UI
   llm/
     provider.rs          Shared types (Message, Content, ToolDefinition, Provider trait)
-    anthropic.rs         Anthropic Messages API client (SSE streaming)
+    anthropic.rs         Anthropic Messages API (SSE + live GET /v1/models)
     openai.rs            OpenAI Chat Completions client (streaming)
     openrouter.rs        OpenRouter client (OpenAI-compatible, streaming)
     opengateway.rs       GitLawb OpenGateway (OpenAI-compatible smart router)
+    xai.rs               xAI / Grok (live model catalog + reasoning_effort)
     ollama.rs            Local Ollama client
   tools/
     registry.rs          Tool trait and registry
@@ -157,6 +160,7 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | `/cost` | Show token usage for the session |
 | `/provider` | Show or change the current provider (prompts for API key when missing; input is masked) |
 | `/theme` | Pick a dark TUI theme (live preview); `/theme list` or `/theme <name>` |
+| `/auth` | OAuth: `/auth login xai` (browser), `/auth logout xai`, `/auth status`; `/auth key xai` to paste an API key instead |
 | `Ctrl+C` | Interrupt a run; clear prompt when idle with text; press again on empty prompt to exit |
 | *(after LLM error)* | Prompt: switch model (`m`), switch provider (`p`), or dismiss (`d`/Esc) |
 | `/save` | Save the current session |
@@ -169,7 +173,7 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `default_provider` | string | `"anthropic"` | LLM provider (`anthropic`, `openai`, `openrouter`, `opengateway`, `ollama`) |
+| `default_provider` | string | `"anthropic"` | LLM provider (`anthropic`, `openai`, `openrouter`, `opengateway`, `xai`, `ollama`) |
 | `default_model` | string | `"claude-sonnet-4-20250514"` | Default model identifier |
 | `max_turns` | int | `100` | Maximum agent loop iterations |
 | `max_tokens` | int | `8192` | Max tokens per LLM response |

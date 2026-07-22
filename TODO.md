@@ -35,11 +35,11 @@ standalone system, not a small port:
 - Parallel execution of read-only tool calls
 - LSP integration (diagnostics, go-to-definition)
 - OS-level sandboxing for shell/tool execution
-- OAuth login flows for providers (vs. raw API keys only)
+- [x] OAuth login flows for providers — xAI device-code (`/auth login xai`), keyring token store
 - Model registry with live pricing/context-window/vision metadata
 - Three-way config layering (user/project/env), currently first-match-wins
 - [x] Output/log secret redaction — `redact.rs` on debug dumps, error text, sensitive headers
-- Provider catalog expansion beyond the current 5 (anthropic/openai/openrouter/opengateway/ollama)
+- Provider catalog expansion beyond the current 6 (anthropic/openai/openrouter/opengateway/xai/ollama)
 
 ## Standing Rules
 - Never force push

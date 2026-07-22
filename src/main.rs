@@ -10,6 +10,7 @@ mod tui;
 mod markdown;
 mod redact;
 mod theme;
+mod oauth;
 
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,6 +117,60 @@ fn main() {
                             let _ = event_tx.send(AgentEvent::Error(e));
                         }
                     }
+                    let _ = event_tx.send(AgentEvent::Done);
+                }
+                Ok(cmd) if cmd.starts_with("__auth_login__:") => {
+                    let provider = cmd.trim_start_matches("__auth_login__:").to_ascii_lowercase();
+                    let msg = if provider == "xai" {
+                        // Surface the user code before the blocking poll via a system-style error-free path:
+                        // request device code first, emit as text event, then poll.
+                        match crate::oauth::request_xai_device_code() {
+                            Ok(auth) => {
+                                let uri = if !auth.verification_uri_complete.is_empty() {
+                                    auth.verification_uri_complete.clone()
+                                } else {
+                                    auth.verification_uri.clone()
+                                };
+                                let notice = format!(
+                                    "xAI device login\n1. Open: {uri}\n2. Enter code: {}\nWaiting for approval…",
+                                    auth.user_code
+                                );
+                                let _ = event_tx.send(AgentEvent::Text(notice));
+                                crate::oauth::open_url(&uri);
+                                match crate::oauth::poll_xai_device_token(&auth) {
+                                    Ok(token) => {
+                                        match crate::oauth::save_token("xai", &token) {
+                                            Ok(()) => {
+                                                std::env::set_var("XAI_API_KEY", &token.access_token);
+                                                "xAI OAuth login saved to the OS keyring. You can select provider xai now.".to_string()
+                                            }
+                                            Err(e) => format!("Login succeeded but failed to save token: {e}"),
+                                        }
+                                    }
+                                    Err(e) => format!("xAI OAuth failed: {e}"),
+                                }
+                            }
+                            Err(e) => format!("xAI OAuth failed: {e}"),
+                        }
+                    } else {
+                        format!("OAuth login is not implemented for '{provider}'. Supported: xai")
+                    };
+                    let _ = event_tx.send(AgentEvent::Text(format!("\n{msg}\n")));
+                    let _ = event_tx.send(AgentEvent::Done);
+                }
+                Ok(cmd) if cmd.starts_with("__auth_logout__:") => {
+                    let provider = cmd.trim_start_matches("__auth_logout__:").to_ascii_lowercase();
+                    let msg = match crate::oauth::delete_token(&provider) {
+                        Ok(true) => format!("Removed OAuth login for {provider}."),
+                        Ok(false) => format!("No OAuth login stored for {provider}."),
+                        Err(e) => format!("Logout failed: {e}"),
+                    };
+                    let _ = event_tx.send(AgentEvent::Text(format!("\n{msg}\n")));
+                    let _ = event_tx.send(AgentEvent::Done);
+                }
+                Ok(cmd) if cmd == "__auth_status__" => {
+                    let lines = [crate::oauth::status_line("xai")];
+                    let _ = event_tx.send(AgentEvent::Text(format!("\n{}\n", lines.join("\n"))));
                     let _ = event_tx.send(AgentEvent::Done);
                 }
                 Ok(prompt) => {

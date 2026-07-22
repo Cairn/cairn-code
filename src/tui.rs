@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use ratatui::{
     Frame,
-    layout::Position,
+    layout::{Constraint, Direction, Layout, Position},
     widgets::{Paragraph, Wrap},
     style::Modifier,
     text::{Span, Line, Text},
@@ -58,8 +58,9 @@ pub struct Tui {
     confirm_remove_provider: Option<String>,
     confirm_remove_sel: usize,
     awaiting_api_key: bool,
-    /// After model selection, prompt for an API key for this provider if needed.
-    pending_key_after_model: bool,
+    /// After successful OAuth or API key entry from the provider picker, open the model list.
+    /// Auth comes first so live model catalogs (xAI, Anthropic, …) can load.
+    pending_model_after_auth: bool,
     /// Provider name to capture an API key for (e.g. "openrouter", "opengateway").
     /// When Some, the awaiting_api_key flow stores the key under this provider.
     api_key_target: Option<String>,
@@ -123,13 +124,13 @@ impl Tui {
             confirm_remove_provider: None,
             confirm_remove_sel: 0,
             awaiting_api_key: false,
-            pending_key_after_model: false,
+            pending_model_after_auth: false,
             api_key_target: None,
             show_command_picker: false,
             cmd_picker_list: vec![
-                "/clear".into(), "/compact".into(), "/cost".into(), "/delete".into(), "/exit".into(),
-                "/help".into(), "/model".into(), "/provider".into(), "/quit".into(), "/q".into(),
-                "/resume".into(), "/save".into(), "/sessions".into(), "/theme".into(),
+                "/auth".into(), "/clear".into(), "/compact".into(), "/cost".into(), "/delete".into(),
+                "/exit".into(), "/help".into(), "/model".into(), "/provider".into(), "/quit".into(),
+                "/q".into(), "/resume".into(), "/save".into(), "/sessions".into(), "/theme".into(),
             ],
             cmd_picker_filtered: Vec::new(),
             cmd_picker_sel: 0,
@@ -246,6 +247,34 @@ impl Tui {
                         AgentEvent::Done => {
                             self.flush_streaming();
                             self.state = State::Idle;
+                            if self.pending_model_after_auth {
+                                if crate::config::has_usable_credential(&self.provider) {
+                                    // Signed in — now pick a model (live catalog available).
+                                    self.pending_model_after_auth = false;
+                                    self.output_lines.push(OutputLine {
+                                        type_: "system".into(),
+                                        content: format!(
+                                            "Signed in to {}. Choose a model.",
+                                            self.provider
+                                        ),
+                                        tool_name: String::new(),
+                                        duration: String::new(),
+                                    });
+                                    self.open_model_picker();
+                                } else {
+                                    // OAuth failed; keep pending so API key still continues to model picker.
+                                    self.output_lines.push(OutputLine {
+                                        type_: "system".into(),
+                                        content: format!(
+                                            "OAuth for {} did not complete. Paste an API key below, or run `/auth login {}` again.",
+                                            self.provider, self.provider
+                                        ),
+                                        tool_name: String::new(),
+                                        duration: String::new(),
+                                    });
+                                    self.begin_api_key_prompt(&self.provider.clone());
+                                }
+                            }
                         }
                     }
                 }
@@ -517,7 +546,7 @@ impl Tui {
             KeyCode::Esc => {
                 if self.awaiting_api_key {
                     self.awaiting_api_key = false;
-                    self.pending_key_after_model = false;
+                    self.pending_model_after_auth = false;
                     self.api_key_target = None;
                     self.input_buf.clear();
                     self.cursor = 0;
@@ -570,26 +599,25 @@ impl Tui {
                         if let Some(p) = providers.get(&name) {
                             let default_model = p.default_model().to_string();
                             self.provider = name.clone();
-                            self.picker_models = p.available_models();
-                            // Prefer a sensible default when switching providers.
+                            // Provisional default until the user picks from the model list.
                             self.model = if name == "openrouter" {
-                                if self.picker_models.iter().any(|m| m.id == "gpt-5-mini") {
-                                    "gpt-5-mini".to_string()
-                                } else {
-                                    default_model
-                                }
+                                "gpt-5-mini".to_string()
                             } else {
                                 default_model
                             };
                             self.show_provider_picker = false;
-                            self.show_model_picker = true;
-                            self.picker_sel = self.picker_models.iter()
-                                .position(|m| m.id == self.model)
-                                .unwrap_or(0);
-                            self.picker_scrl = 0;
-                            self.pending_key_after_model =
-                                crate::config::provider_requires_api_key(&name)
-                                && !crate::config::has_usable_credential(&name);
+                            // Auth first (browser OAuth or API key), then model list.
+                            // Live catalogs need credentials; model-before-login was backwards.
+                            if crate::config::needs_credential(&name) {
+                                self.pending_model_after_auth = true;
+                                if crate::oauth::supports_oauth(&name) {
+                                    self.begin_oauth_login(&name, true);
+                                } else {
+                                    self.begin_api_key_prompt(&name);
+                                }
+                            } else {
+                                self.open_model_picker();
+                            }
                         } else {
                             self.show_provider_picker = false;
                         }
@@ -602,15 +630,7 @@ impl Tui {
                     if self.picker_sel < self.picker_models.len() {
                         self.model = self.picker_models[self.picker_sel].id.clone();
                         self.show_model_picker = false;
-                        let needs_key = self.pending_key_after_model
-                            || (crate::config::provider_requires_api_key(&self.provider)
-                                && !crate::config::has_usable_credential(&self.provider));
-                        self.pending_key_after_model = false;
-                        if needs_key {
-                            self.begin_api_key_prompt(&self.provider.clone());
-                        } else {
-                            self.finish_provider_model_selection(None);
-                        }
+                        self.finish_provider_model_selection(None);
                     } else {
                         self.show_model_picker = false;
                     }
@@ -662,7 +682,26 @@ impl Tui {
                     }
                     self.awaiting_api_key = false;
                     let target = self.api_key_target.take().unwrap_or_else(|| self.provider.clone());
-                    self.finish_provider_model_selection(Some((target, key)));
+                    if self.pending_model_after_auth {
+                        // Provider switch path: save key, then open model list (live catalog).
+                        self.pending_model_after_auth = false;
+                        self.provider = target.clone();
+                        crate::config::apply_key_to_env(&target, &key);
+                        let _ = crate::config::save_config(&target, &self.model, Some(&key));
+                        let tail = crate::config::mask_secret_display(&key, 4);
+                        self.output_lines.push(OutputLine {
+                            type_: "system".into(),
+                            content: format!(
+                                "API key saved for {target} ({tail}). Choose a model."
+                            ),
+                            tool_name: String::new(),
+                            duration: String::new(),
+                        });
+                        self.open_model_picker();
+                    } else {
+                        // `/auth key` or similar: save and apply without forcing the model picker.
+                        self.finish_provider_model_selection(Some((target, key)));
+                    }
                     return true;
                 }
 
@@ -778,9 +817,44 @@ impl Tui {
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions /theme\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)".into(),
+                    content: "Commands: /auth /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions /theme\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)\n/provider xai — opens browser OAuth (device code); /auth login xai to re-login; paste XAI_API_KEY only if you prefer a key".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
+            }
+            "/auth" => {
+                let sub = parts.get(1).copied().unwrap_or("status");
+                match sub {
+                    "login" => {
+                        let provider = parts.get(2).copied().unwrap_or("xai").to_ascii_lowercase();
+                        self.begin_oauth_login(&provider, false);
+                    }
+                    "key" => {
+                        // Escape hatch: paste API key instead of OAuth (xAI / others).
+                        let provider = parts.get(2).copied().unwrap_or("xai").to_ascii_lowercase();
+                        if crate::config::provider_requires_api_key(&provider) {
+                            self.begin_api_key_prompt(&provider);
+                        } else {
+                            self.output_lines.push(OutputLine {
+                                type_: "system".into(),
+                                content: format!("Provider '{provider}' does not use a cloud API key."),
+                                tool_name: String::new(), duration: String::new(),
+                            });
+                        }
+                    }
+                    "logout" => {
+                        let provider = parts.get(2).copied().unwrap_or("xai").to_ascii_lowercase();
+                        if let Some(tx) = &self.agent_tx {
+                            self.state = State::Running;
+                            let _ = tx.send(format!("__auth_logout__:{provider}"));
+                        }
+                    }
+                    "status" | _ => {
+                        if let Some(tx) = &self.agent_tx {
+                            self.state = State::Running;
+                            let _ = tx.send("__auth_status__".into());
+                        }
+                    }
+                }
             }
             "/theme" => {
                 if parts.get(1) == Some(&"list") {
@@ -921,7 +995,7 @@ impl Tui {
         // Close overlays / cancel key entry first (same spirit as Esc).
         if self.awaiting_api_key {
             self.awaiting_api_key = false;
-            self.pending_key_after_model = false;
+            self.pending_model_after_auth = false;
             self.api_key_target = None;
             self.input_buf.clear();
             self.cursor = 0;
@@ -1046,14 +1120,63 @@ impl Tui {
         self.input_buf.clear();
         self.cursor = 0;
         let env = crate::config::env_var_name(provider).unwrap_or("API_KEY");
+        let oauth_hint = if crate::oauth::supports_oauth(provider) {
+            " Prefer browser login: Esc, then `/auth login xai`."
+        } else {
+            ""
+        };
         self.output_lines.push(OutputLine {
             type_: "system".into(),
             content: format!(
-                "Enter API key for {provider} (saved to OS keyring, env {env}). Input is masked."
+                "Enter API key for {provider} (saved to OS keyring, env {env}). Input is masked.{oauth_hint}"
             ),
             tool_name: String::new(),
             duration: String::new(),
         });
+    }
+
+    /// Start device-code OAuth (browser) for a provider, like zero / Grok Build.
+    /// When `then_model_picker` is true (provider path), successful login opens
+    /// the model list; on failure, falls back to API key paste then model list.
+    fn begin_oauth_login(&mut self, provider: &str, then_model_picker: bool) {
+        if !crate::oauth::supports_oauth(provider) {
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: format!(
+                    "OAuth login is not implemented for '{provider}'. Supported: xai. Use an API key via /auth key {provider}."
+                ),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        }
+        if !matches!(self.state, State::Idle) {
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: "Wait for the current turn to finish before logging in.".into(),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        }
+        let Some(tx) = &self.agent_tx else {
+            self.output_lines.push(OutputLine {
+                type_: "error".into(),
+                content: "Agent channel not ready; cannot start OAuth.".into(),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        };
+        self.pending_model_after_auth = then_model_picker;
+        self.state = State::Running;
+        self.output_lines.push(OutputLine {
+            type_: "system".into(),
+            content: "Starting xAI browser OAuth (device code)… A browser window should open. Approve the code shown next, or open the URL manually.".into(),
+            tool_name: String::new(),
+            duration: String::new(),
+        });
+        let _ = tx.send(format!("__auth_login__:{provider}"));
     }
 
     /// Finish provider/model selection, optionally saving a freshly entered key.
@@ -1296,7 +1419,12 @@ impl Tui {
         for line in &self.output_lines {
             match line.type_.as_str() {
                 "user" => {
-                    lines.push(Line::from(vec![Span::styled("❯ ", orange), Span::raw(&line.content)]));
+                    // Use a different marker than the live composer (❯) so past turns
+                    // are not mistaken for a second prompt.
+                    lines.push(Line::from(vec![
+                        Span::styled("› ", orange),
+                        Span::raw(&line.content),
+                    ]));
                     lines.push(Line::from(""));
                 }
                 "text" => {
@@ -1344,12 +1472,17 @@ impl Tui {
             ]));
         }
 
-        // Prompt or pickers
+        // Composer / pickers live in a fixed bottom chrome region so typing never
+        // steals viewport rows from the transcript above (single-scroll layout used to
+        // push the last LLM line off-screen as soon as the prompt grew).
+        let mut chrome: Vec<Line> = Vec::new();
+        // Cursor: (x offset within chrome width, logical line index in chrome).
         let mut cursor_pos: Option<(u16, usize)> = None;
+
         if self.show_command_picker {
             let cursor = self.cursor.min(self.input_buf.len());
             let (before, after) = self.input_buf.split_at(cursor);
-            lines.push(Line::from(vec![
+            chrome.push(Line::from(vec![
                 Span::styled("❯ ", orange_fg),
                 Span::raw(before),
                 Span::styled("▋", orange_fg),
@@ -1358,18 +1491,19 @@ impl Tui {
             for (i, cmd) in self.cmd_picker_filtered.iter().enumerate() {
                 let is_sel = i == self.cmd_picker_sel;
                 let prefix = if is_sel { "▸ " } else { "  " };
-                lines.push(Line::from(vec![
+                chrome.push(Line::from(vec![
                     Span::styled(format!("{prefix}{cmd}"), if is_sel { selected } else { dim }),
                 ]));
             }
+            cursor_pos = Some((display_width("❯ ") as u16 + display_width(before) as u16, 0));
         } else if let Some(name) = &self.confirm_remove_provider {
-            lines.push(Line::from(vec![
+            chrome.push(Line::from(vec![
                 Span::styled(format!("Remove saved API key for '{name}'?"), white),
             ]));
-            lines.push(Line::from(vec![
+            chrome.push(Line::from(vec![
                 Span::styled("This only deletes the key from the config file.", dim),
             ]));
-            lines.push(Line::from(""));
+            chrome.push(Line::from(""));
             let options = ["Cancel", "Remove"];
             let mut option_spans = Vec::new();
             for (i, opt) in options.iter().enumerate() {
@@ -1382,12 +1516,12 @@ impl Tui {
                     if is_sel { orange_fg.add_modifier(Modifier::BOLD) } else { dim },
                 ));
             }
-            lines.push(Line::from(option_spans));
-            lines.push(Line::from(vec![
+            chrome.push(Line::from(option_spans));
+            chrome.push(Line::from(vec![
                 Span::styled("(← → navigate  Enter confirm  Esc cancel)", dim),
             ]));
         } else if self.show_provider_picker {
-            lines.push(Line::from(vec![
+            chrome.push(Line::from(vec![
                 Span::styled("── Provider ", orange),
                 Span::styled("(↑↓ navigate  Enter select  Del remove key  Esc cancel) ──", bold_dim),
             ]));
@@ -1395,9 +1529,15 @@ impl Tui {
                 let is_sel = i == self.provider_picker_sel;
                 let is_cur = *name == self.provider;
                 let cur_mark = if is_cur { "  (current)" } else { "" };
-                let key_mark = if self.provider_picker_keys.get(i).copied().unwrap_or(false) { "  [key saved]" } else { "" };
+                let key_mark = if self.provider_picker_keys.get(i).copied().unwrap_or(false) {
+                    "  [signed in]"
+                } else if crate::oauth::supports_oauth(name) {
+                    "  [browser login]"
+                } else {
+                    ""
+                };
                 let prefix = if is_sel { "▸ " } else { "  " };
-                lines.push(Line::from(vec![
+                chrome.push(Line::from(vec![
                     Span::styled(format!("{prefix}{name}{key_mark}{cur_mark}"), if is_sel { selected } else { dim }),
                 ]));
             }
@@ -1406,12 +1546,12 @@ impl Tui {
             let end = (self.picker_scrl + visible).min(self.picker_models.len());
             let num = self.picker_models.len();
 
-            lines.push(Line::from(vec![
+            chrome.push(Line::from(vec![
                 Span::styled("── Model ", orange),
                 Span::styled("(↑↓ navigate  Enter select  Esc cancel) ──", bold_dim),
             ]));
             if num > visible {
-                lines.push(Line::from(vec![Span::styled(format!("  … {}/{}  ↑↓ scroll", self.picker_sel + 1, num), dim)]));
+                chrome.push(Line::from(vec![Span::styled(format!("  … {}/{}  ↑↓ scroll", self.picker_sel + 1, num), dim)]));
             }
             for i in self.picker_scrl..end {
                 let m = &self.picker_models[i];
@@ -1420,12 +1560,12 @@ impl Tui {
                 let ctx = if m.max_ctx > 0 { format!(" ({}K context)", m.max_ctx / 1000) } else { String::new() };
                 let check = if is_cur { "  ✓" } else { "" };
                 let prefix = if is_sel { "▸ " } else { "  " };
-                lines.push(Line::from(vec![
+                chrome.push(Line::from(vec![
                     Span::styled(format!("{prefix}{}  {}{ctx}{check}", m.name, m.id), if is_sel { selected } else { dim }),
                 ]));
             }
         } else if self.show_theme_picker {
-            lines.push(Line::from(vec![
+            chrome.push(Line::from(vec![
                 Span::styled("── Theme ", orange),
                 Span::styled("(↑↓ live-preview  Enter apply  Esc cancel) ──", bold_dim),
             ]));
@@ -1434,7 +1574,7 @@ impl Tui {
                 let is_cur = t.name == self.theme.name;
                 let cur_mark = if is_cur { "  ✓" } else { "" };
                 let prefix = if is_sel { "▸ " } else { "  " };
-                lines.push(Line::from(vec![
+                chrome.push(Line::from(vec![
                     Span::styled(format!("{prefix}{} ({}){cur_mark}", t.label, t.name), if is_sel { selected } else { dim }),
                 ]));
             }
@@ -1453,12 +1593,12 @@ impl Tui {
             } else {
                 "(↑↓ navigate  Enter select  Esc cancel) ──"
             };
-            lines.push(Line::from(vec![
+            chrome.push(Line::from(vec![
                 Span::styled(title, orange),
                 Span::styled(hint, bold_dim),
             ]));
             if num > visible {
-                lines.push(Line::from(vec![Span::styled(format!("  … {}/{}  ↑↓ scroll", self.picker_session_sel + 1, num), dim)]));
+                chrome.push(Line::from(vec![Span::styled(format!("  … {}/{}  ↑↓ scroll", self.picker_session_sel + 1, num), dim)]));
             }
             for i in self.picker_session_scrl..end {
                 let s = &self.picker_sessions[i];
@@ -1470,11 +1610,11 @@ impl Tui {
                     s.summary.clone()
                 };
                 let time_str = format_timestamp(s.updated_at);
-                lines.push(Line::from(vec![
+                chrome.push(Line::from(vec![
                     Span::styled(format!("{prefix}{}  {}  {} msgs  {time_str}", &s.id[..8], s.model, s.msg_count), if is_sel { selected } else { dim }),
                 ]));
                 if !summary.is_empty() && is_sel {
-                    lines.push(Line::from(vec![
+                    chrome.push(Line::from(vec![
                         Span::styled(format!("   {summary}"), if is_sel { selected } else { dim }),
                     ]));
                 }
@@ -1482,23 +1622,23 @@ impl Tui {
         } else if self.show_permission_prompt {
             let cursor = self.cursor.min(self.input_buf.len());
             let (before, after) = self.input_buf.split_at(cursor);
-            let prompt_line_idx = lines.len();
-            lines.push(Line::from(vec![
+            let prompt_line_idx = chrome.len();
+            chrome.push(Line::from(vec![
                 Span::styled("❯ ", orange_fg),
                 Span::raw(before),
                 Span::styled("▋", orange_fg),
                 Span::raw(after),
             ]));
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
+            chrome.push(Line::from(""));
+            chrome.push(Line::from(vec![
                 Span::styled(format!("Tool '{}' wants to run:", self.perm_tool_name), white),
             ]));
             if !self.perm_tool_input.is_empty() {
-                lines.push(Line::from(vec![
+                chrome.push(Line::from(vec![
                     Span::styled(format!("  {}", self.perm_tool_input), dim),
                 ]));
             }
-            lines.push(Line::from(""));
+            chrome.push(Line::from(""));
             let options = ["Allow", "Always Allow", "Deny"];
             let mut option_spans = Vec::new();
             for (i, opt) in options.iter().enumerate() {
@@ -1511,20 +1651,19 @@ impl Tui {
                     if is_sel { orange_fg.add_modifier(Modifier::BOLD) } else { dim },
                 ));
             }
-            lines.push(Line::from(option_spans));
-            lines.push(Line::from(vec![
+            chrome.push(Line::from(option_spans));
+            chrome.push(Line::from(vec![
                 Span::styled("(← → navigate  Enter confirm  Esc deny)", dim),
             ]));
-            cursor_pos = Some((area.x + display_width("❯ ") as u16 + display_width(before) as u16, prompt_line_idx));
+            cursor_pos = Some((display_width("❯ ") as u16 + display_width(before) as u16, prompt_line_idx));
         } else if self.show_recovery_prompt {
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
+            chrome.push(Line::from(vec![
                 Span::styled(
                     format!("LLM failed ({}/{}). Switch and retry your request:", self.provider, self.model),
                     white,
                 ),
             ]));
-            lines.push(Line::from(""));
+            chrome.push(Line::from(""));
             let options = ["Switch model (m)", "Switch provider (p)", "Dismiss (d)"];
             let mut option_spans = Vec::new();
             for (i, opt) in options.iter().enumerate() {
@@ -1537,20 +1676,20 @@ impl Tui {
                     if is_sel { orange_fg.add_modifier(Modifier::BOLD) } else { dim },
                 ));
             }
-            lines.push(Line::from(option_spans));
-            lines.push(Line::from(vec![
+            chrome.push(Line::from(option_spans));
+            chrome.push(Line::from(vec![
                 Span::styled("(← → navigate  Enter confirm  Esc dismiss)", dim),
             ]));
             let cursor = self.cursor.min(self.input_buf.len());
             let (before, after) = self.input_buf.split_at(cursor);
-            let prompt_line_idx = lines.len();
-            lines.push(Line::from(vec![
+            let prompt_line_idx = chrome.len();
+            chrome.push(Line::from(vec![
                 Span::styled("❯ ", orange_fg),
                 Span::raw(before),
                 Span::styled("▋", orange_fg),
                 Span::raw(after),
             ]));
-            cursor_pos = Some((area.x + display_width("❯ ") as u16 + display_width(before) as u16, prompt_line_idx));
+            cursor_pos = Some((display_width("❯ ") as u16 + display_width(before) as u16, prompt_line_idx));
         } else if self.awaiting_api_key {
             let target = self.api_key_target.as_deref().unwrap_or(&self.provider);
             let env_hint = crate::config::env_var_name(target).unwrap_or("API_KEY");
@@ -1562,41 +1701,97 @@ impl Tui {
             let masked_chars: Vec<char> = masked.chars().collect();
             let before: String = masked_chars.iter().take(cursor_chars).collect();
             let after: String = masked_chars.iter().skip(cursor_chars).collect();
-            lines.push(Line::from(vec![
+            chrome.push(Line::from(vec![
                 Span::styled(format!("{label}{before}"), orange_fg),
                 Span::styled("▋", orange_fg),
                 Span::styled(after, orange_fg),
             ]));
-            lines.push(Line::from(vec![
+            chrome.push(Line::from(vec![
                 Span::styled(
                     "Hidden as you type (last 4 characters shown). Enter to save  ·  Esc to cancel",
                     dim,
                 ),
             ]));
             cursor_pos = Some((
-                area.x + display_width(&label) as u16 + display_width(&before) as u16,
-                lines.len() - 2,
+                display_width(&label) as u16 + display_width(&before) as u16,
+                0,
             ));
         } else {
             let cursor = self.cursor.min(self.input_buf.len());
             let (before, after) = self.input_buf.split_at(cursor);
-            lines.push(Line::from(vec![
+            chrome.push(Line::from(vec![
                 Span::styled("❯ ", orange_fg),
                 Span::raw(before),
                 Span::raw(after),
             ]));
-            cursor_pos = Some((area.x + display_width("❯ ") as u16 + display_width(before) as u16, lines.len() - 1));
+            cursor_pos = Some((display_width("❯ ") as u16 + display_width(before) as u16, 0));
         }
 
-        let scroll = total_wrapped(&lines, area.width as usize).saturating_sub(area.height as usize);
+        let width = area.width as usize;
+        let body_wrapped = total_wrapped(&lines, width);
+        let chrome_wrapped = total_wrapped(&chrome, width).max(1);
+        // Keep room for transcript; cap chrome so pickers cannot hide all output.
+        let max_chrome = (area.height as usize)
+            .saturating_sub(3)
+            .min((area.height as usize).saturating_mul(2) / 3)
+            .max(1);
+        let chrome_h = chrome_wrapped.min(max_chrome) as u16;
+        let chrome_scroll = chrome_wrapped.saturating_sub(chrome_h as usize);
+        let term_h = area.height as usize;
 
-        if let Some((x, line_idx)) = cursor_pos {
-            let wrapped_before = total_wrapped(&lines[..line_idx], area.width as usize);
-            let y = (area.y as usize + wrapped_before).saturating_sub(scroll) as u16;
+        // Short chats: sit the composer directly under the transcript (top of the
+        // window), not glued to the bottom with a huge empty gap that looks like a
+        // second orphaned prompt.
+        // Long chats: pin chrome to the bottom and scroll the transcript above.
+        let fits = body_wrapped.saturating_add(chrome_h as usize) <= term_h;
+        let (body_area, chrome_area) = if fits {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(body_wrapped.max(1) as u16),
+                    Constraint::Length(chrome_h),
+                    Constraint::Min(0),
+                ])
+                .split(area);
+            (chunks[0], chunks[1])
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(chrome_h),
+                ])
+                .split(area);
+            (chunks[0], chunks[1])
+        };
+
+        let body_scroll = if fits {
+            0
+        } else {
+            body_wrapped.saturating_sub(body_area.height as usize)
+        };
+
+        f.render_widget(
+            Paragraph::new(Text::from(lines))
+                .wrap(Wrap { trim: false })
+                .scroll((body_scroll as u16, 0)),
+            body_area,
+        );
+        f.render_widget(
+            Paragraph::new(Text::from(chrome.clone()))
+                .wrap(Wrap { trim: false })
+                .scroll((chrome_scroll as u16, 0)),
+            chrome_area,
+        );
+
+        if let Some((x_off, line_idx)) = cursor_pos {
+            let line_idx = line_idx.min(chrome.len().saturating_sub(1));
+            let wrapped_before = total_wrapped(&chrome[..line_idx], width);
+            let y = (chrome_area.y as usize + wrapped_before).saturating_sub(chrome_scroll) as u16;
+            let y = y.min(chrome_area.y.saturating_add(chrome_area.height.saturating_sub(1)));
+            let x = chrome_area.x.saturating_add(x_off.min(chrome_area.width.saturating_sub(1)));
             f.set_cursor_position(Position { x, y });
         }
-
-        f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }).scroll((scroll as u16, 0)), area);
     }
 
     fn flush_streaming(&mut self) {
