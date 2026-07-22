@@ -28,3 +28,38 @@ impl Tool for TodoTool {
         Ok(format!("Saved {} todo item(s) to .cairn/todos.json", todos.len()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writes_todos_file() {
+        // TodoTool always writes relative `.cairn/todos.json` under the process
+        // cwd. Use a unique nested path check by running from a temp workspace
+        // only after snapshotting and carefully restoring cwd (serialized step).
+        // Prefer not racing other tests: write then verify under cwd, then clean up.
+        let tool = TodoTool;
+        let marker = format!(
+            "ship-it-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let input = format!(
+            r#"{{"todos":[{{"content":"{marker}","status":"pending","priority":"high"}}]}}"#
+        );
+        let out = tool.execute(&input).unwrap();
+        assert!(out.contains("1 todo"), "{out}");
+        let raw = fs::read_to_string(".cairn/todos.json").unwrap();
+        assert!(raw.contains(&marker), "{raw}");
+        // Leave the file; later runs overwrite. Avoid set_current_dir (races workspace tests).
+    }
+
+    #[test]
+    fn requires_todos_array() {
+        assert!(TodoTool.execute("{}").is_err());
+        assert!(TodoTool.execute(r#"{"todos":"nope"}"#).is_err());
+    }
+}

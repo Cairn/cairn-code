@@ -14,6 +14,9 @@ pub struct Config {
     pub api_keys: HashMap<String, String>,
     /// TUI color theme name (dark themes only). Default: "dark".
     pub theme: String,
+    /// When true, stream and keep full model thinking in the transcript.
+    /// When false (default, Claude Code-style), only a short "Thought for …" line is shown.
+    pub show_thinking: bool,
 }
 
 impl Default for Config {
@@ -29,6 +32,7 @@ impl Default for Config {
             deny: Vec::new(),
             api_keys: HashMap::new(),
             theme: "dark".to_string(),
+            show_thinking: false,
         }
     }
 }
@@ -211,6 +215,25 @@ pub fn save_theme(theme: &str) -> Result<(), String> {
     std::fs::write(&path, &output).map_err(|e| e.to_string())
 }
 
+/// Persist the show-thinking preference without rewriting other keys.
+pub fn save_show_thinking(show: bool) -> Result<(), String> {
+    use crate::json::JsonValue;
+    let path = config_path();
+    let mut obj: std::collections::HashMap<String, JsonValue> = if path.exists() {
+        let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        crate::json::parse(&content).map_err(|e| e.to_string())?.as_object().cloned().unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
+    obj.insert("show_thinking".into(), JsonValue::Bool(show));
+    obj.remove("api_keys");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let output = crate::json::serialize(&JsonValue::Object(obj));
+    std::fs::write(&path, &output).map_err(|e| e.to_string())
+}
+
 pub fn save_full_config(cfg: &Config) -> Result<(), String> {
     use crate::json::JsonValue;
     let path = config_path();
@@ -224,6 +247,7 @@ pub fn save_full_config(cfg: &Config) -> Result<(), String> {
     obj.insert("default_provider".into(), JsonValue::String(cfg.default_provider.clone()));
     obj.insert("default_model".into(), JsonValue::String(cfg.default_model.clone()));
     obj.insert("theme".into(), JsonValue::String(cfg.theme.clone()));
+    obj.insert("show_thinking".into(), JsonValue::Bool(cfg.show_thinking));
 
     let perms = JsonValue::Object(std::collections::HashMap::from([
         ("auto_allow".into(), JsonValue::Array(cfg.auto_allow.iter().map(|s| JsonValue::String(s.clone())).collect())),
@@ -351,6 +375,9 @@ fn parse_config(content: &str) -> Result<Config, String> {
     if let Some(v) = obj.get("theme").and_then(|v| v.as_str()) {
         cfg.theme = v.to_string();
     }
+    if let Some(v) = obj.get("show_thinking").and_then(|v| v.as_bool()) {
+        cfg.show_thinking = v;
+    }
 
     if let Some(perms) = obj.get("permissions").and_then(|v| v.as_object()) {
         if let Some(arr) = perms.get("auto_allow").and_then(|v| v.as_array()) {
@@ -386,6 +413,15 @@ mod tests {
         assert_eq!(cfg.auto_allow.len(), 3);
         assert!(cfg.ask.contains(&"shell".to_string()));
         assert!(cfg.deny.is_empty());
+        assert!(!cfg.show_thinking, "thinking hidden by default (Claude Code-style)");
+    }
+
+    #[test]
+    fn test_parse_show_thinking() {
+        let cfg = parse_config(r#"{"show_thinking": true}"#).unwrap();
+        assert!(cfg.show_thinking);
+        let cfg = parse_config(r#"{"show_thinking": false}"#).unwrap();
+        assert!(!cfg.show_thinking);
     }
 
     #[test]
@@ -485,6 +521,22 @@ mod tests {
         assert!(provider_requires_api_key("opengateway"));
         assert!(provider_requires_api_key("xai"));
         assert!(!provider_requires_api_key("ollama"));
+    }
+
+    #[test]
+    fn test_needs_credential_ollama_never() {
+        assert!(!needs_credential("ollama"));
+    }
+
+    #[test]
+    fn test_apply_key_to_env_and_mask() {
+        apply_key_to_env("openai", "sk-test-apply-env-key");
+        assert_eq!(
+            std::env::var("OPENAI_API_KEY").ok().as_deref(),
+            Some("sk-test-apply-env-key")
+        );
+        std::env::remove_var("OPENAI_API_KEY");
+        assert_eq!(mask_secret_display("abcdefghij", 4), "••••••ghij");
     }
 
     #[test]

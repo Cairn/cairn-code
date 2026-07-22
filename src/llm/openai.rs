@@ -26,6 +26,37 @@ impl OpenAIProvider {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_and_models() {
+        let p = OpenAIProvider::new().with_api_key("sk-test");
+        assert_eq!(p.name(), "openai");
+        assert_eq!(p.default_model(), "gpt-4o");
+        assert!(!p.available_models().is_empty());
+        assert_eq!(p.get_key(), "sk-test");
+    }
+
+    #[test]
+    fn missing_key_errors() {
+        // Clear process-level key for this check without relying on env state.
+        let p = OpenAIProvider::new();
+        // Only assert empty when env/keyring have no openai key — if they do, skip.
+        let key = p.get_key();
+        if key.is_empty() {
+            let err = p
+                .complete(&[], &[], "sys", "gpt-4o", 16)
+                .unwrap_err();
+            assert!(
+                err.to_ascii_lowercase().contains("api") || err.contains("OPENAI"),
+                "{err}"
+            );
+        }
+    }
+}
+
 impl Provider for OpenAIProvider {
     fn name(&self) -> &str { "openai" }
     fn default_model(&self) -> &str { "gpt-4o" }

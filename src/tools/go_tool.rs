@@ -40,3 +40,32 @@ impl Tool for GoTool {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requires_args() {
+        assert!(GoTool.execute("{}").is_err());
+    }
+
+    #[test]
+    fn identity() {
+        let t = GoTool;
+        assert_eq!(t.name(), "go");
+        assert!(t.needs_permission());
+        assert!(crate::json::parse(&t.input_schema()).is_ok());
+    }
+
+    #[test]
+    fn version_or_missing_binary() {
+        match GoTool.execute(r#"{"args":"version"}"#) {
+            Ok(out) => assert!(out.to_ascii_lowercase().contains("go"), "{out}"),
+            Err(e) => assert!(
+                e.contains("go exec") || e.contains("go exited"),
+                "unexpected: {e}"
+            ),
+        }
+    }
+}

@@ -2,7 +2,7 @@ use std::io::stdout;
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::{
     Frame,
@@ -36,7 +36,13 @@ enum State {
     Running,
 }
 
+// Same frames as charmbracelet MiniDot (Grok Build / zero).
 const SPINNER_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+// MiniDot FPS is time.Second/12 (~83ms). Faster ticks look like flicker; slower feels sticky.
+const SPINNER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 12);
+// Cap full-frame redraws while the agent runs. Zero coalesces stream text to ~16ms
+// (60fps); without this, token-rate dirty redraws thrash the terminal around the spinner.
+const MIN_FRAME: Duration = Duration::from_millis(16);
 
 pub struct Tui {
     output_lines: Vec<OutputLine>,
@@ -120,6 +126,11 @@ pub struct Tui {
     expect_turn_notify: bool,
     /// Claude Code-style grayed-out next-task hint shown when the composer is empty.
     idle_suggestion: Option<String>,
+    /// When true, stream + keep full thinking blocks. When false (default), only
+    /// a short "Thought for …" marker is kept after each think phase.
+    show_thinking: bool,
+    /// Wall clock for the current in-flight thinking stream (for duration labels).
+    thinking_started: Option<Instant>,
 }
 
 impl Tui {
@@ -157,6 +168,7 @@ impl Tui {
                 "/auth".into(), "/clear".into(), "/compact".into(), "/cost".into(), "/delete".into(),
                 "/exit".into(), "/help".into(), "/model".into(), "/provider".into(), "/quit".into(),
                 "/q".into(), "/resume".into(), "/save".into(), "/sessions".into(), "/theme".into(),
+                "/thinking".into(),
             ],
             cmd_picker_filtered: Vec::new(),
             cmd_picker_sel: 0,
@@ -190,6 +202,8 @@ impl Tui {
             live_mirror: None,
             expect_turn_notify: false,
             idle_suggestion: Some(default_empty_suggestion().into()),
+            show_thinking: false,
+            thinking_started: None,
         }
     }
 
@@ -203,6 +217,10 @@ impl Tui {
         self.theme_picker_sel = self.theme_picker_list.iter()
             .position(|t| t.name == self.theme.name)
             .unwrap_or(0);
+    }
+
+    pub fn set_show_thinking(&mut self, show: bool) {
+        self.show_thinking = show;
     }
 
     pub fn set_agent_tx(&mut self, tx: mpsc::Sender<String>) {
@@ -227,7 +245,6 @@ impl Tui {
         let mut result = Ok(());
         let mut last_spinner_update = std::time::Instant::now();
         let mut last_draw = std::time::Instant::now();
-        const MIN_FRAME: std::time::Duration = std::time::Duration::from_micros(1_000_000 / 240);
         let mut needs_rebuild = false;
         self.dirty = true;
 
@@ -238,7 +255,12 @@ impl Tui {
                     got_event = true;
                     match event {
                         AgentEvent::Text(t) => { self.streaming_text.push_str(&t); }
-                        AgentEvent::Thinking(t) => { self.stream_thinking.push_str(&t); }
+                        AgentEvent::Thinking(t) => {
+                            if self.thinking_started.is_none() {
+                                self.thinking_started = Some(Instant::now());
+                            }
+                            self.stream_thinking.push_str(&t);
+                        }
                         AgentEvent::ToolUse(name, input) => {
                             self.flush_streaming();
                             self.output_lines.push(OutputLine {
@@ -361,7 +383,28 @@ impl Tui {
                     _ => {}
                 }
             } else {
-                let event_avail = ratatui::crossterm::event::poll(Duration::from_millis(1)).unwrap_or(false);
+                // Advance the MiniDot frame on its own clock (not on every stream dirty).
+                // Re-issuing a tick every event-loop lap is what makes the glyph flash.
+                if last_spinner_update.elapsed() >= SPINNER_INTERVAL {
+                    self.spinner_idx = self.spinner_idx.wrapping_add(1);
+                    last_spinner_update = std::time::Instant::now();
+                    self.dirty = true;
+                }
+
+                // Sleep until the next useful wake. Cap at MIN_FRAME so stream
+                // chunks in mpsc still drain at ~60fps without a 1ms busy-poll.
+                let until_spinner = SPINNER_INTERVAL
+                    .checked_sub(last_spinner_update.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                let poll_for = if self.dirty {
+                    MIN_FRAME
+                        .checked_sub(last_draw.elapsed())
+                        .unwrap_or(Duration::ZERO)
+                } else {
+                    until_spinner.min(MIN_FRAME)
+                };
+                let event_avail =
+                    ratatui::crossterm::event::poll(poll_for).unwrap_or(false);
                 if event_avail {
                     match ratatui::crossterm::event::read() {
                         Ok(Event::Key(key)) => {
@@ -381,11 +424,6 @@ impl Tui {
                         _ => {}
                     }
                 }
-                if last_spinner_update.elapsed() >= Duration::from_millis(80) {
-                    self.spinner_idx = self.spinner_idx.wrapping_add(1);
-                    last_spinner_update = std::time::Instant::now();
-                    self.dirty = true;
-                }
             }
 
             if needs_rebuild {
@@ -394,8 +432,11 @@ impl Tui {
             }
 
             if self.dirty {
-                if let Some(sleep) = MIN_FRAME.checked_sub(last_draw.elapsed()) {
-                    std::thread::sleep(sleep);
+                // While Running, coalesce stream-driven dirties to ~60fps so token
+                // rate cannot thrash the terminal around the spinner. Idle always
+                // paints immediately so keystrokes stay snappy.
+                if matches!(self.state, State::Running) && last_draw.elapsed() < MIN_FRAME {
+                    continue;
                 }
                 if let Err(e) = terminal.draw(|f| self.render(f)) {
                     result = Err(format!("Render error: {e}"));
@@ -414,12 +455,12 @@ impl Tui {
     }
 
     fn handle_mouse(&mut self, kind: MouseEventKind) {
-        // Ignore mouse while pickers own the chrome (wheel should not fight them).
+        // Ignore mouse while list pickers own the chrome (wheel should not fight them).
+        // Slash ghost completion is inline, so scrolling still works while typing `/…`.
         if self.show_model_picker
             || self.show_provider_picker
             || self.show_theme_picker
             || self.show_session_picker
-            || self.show_command_picker
         {
             return;
         }
@@ -648,8 +689,11 @@ impl Tui {
                     }
                     return true;
                 }
-                if self.show_command_picker {
-                    if self.cmd_picker_sel > 0 { self.cmd_picker_sel -= 1; }
+                // Cycle slash ghost candidates without a multi-line picker.
+                if !self.cmd_picker_filtered.is_empty() {
+                    if self.cmd_picker_sel > 0 {
+                        self.cmd_picker_sel -= 1;
+                    }
                     return true;
                 }
                 if self.show_provider_picker {
@@ -679,8 +723,10 @@ impl Tui {
                     }
                     return true;
                 }
-                if self.show_command_picker {
-                    if self.cmd_picker_sel + 1 < self.cmd_picker_filtered.len() { self.cmd_picker_sel += 1; }
+                if !self.cmd_picker_filtered.is_empty() {
+                    if self.cmd_picker_sel + 1 < self.cmd_picker_filtered.len() {
+                        self.cmd_picker_sel += 1;
+                    }
                     return true;
                 }
                 if self.show_provider_picker {
@@ -710,17 +756,22 @@ impl Tui {
                 true
             }
             KeyCode::Right => {
-                // Right arrow on empty input accepts the ghost suggestion.
-                if self.cursor >= self.input_buf.len()
-                    && self.input_buf.is_empty()
-                    && !self.awaiting_api_key
-                    && !self.show_command_picker
-                {
-                    if let Some(hint) = self.idle_suggestion.clone() {
-                        self.input_buf = hint;
-                        self.cursor = self.input_buf.len();
-                        self.idle_suggestion = None;
-                        return true;
+                // Right arrow at end: accept slash ghost, else empty-composer idle hint.
+                if self.cursor >= self.input_buf.len() && !self.awaiting_api_key {
+                    if let Some(cmd) = self.selected_slash_completion() {
+                        if slash_ghost_suffix(&self.input_buf, cmd).is_some() {
+                            let cmd = cmd.to_string();
+                            self.apply_slash_completion(&cmd);
+                            return true;
+                        }
+                    }
+                    if self.input_buf.is_empty() {
+                        if let Some(hint) = self.idle_suggestion.clone() {
+                            self.input_buf = hint;
+                            self.cursor = self.input_buf.len();
+                            self.idle_suggestion = None;
+                            return true;
+                        }
                     }
                 }
                 if self.cursor < self.input_buf.len() {
@@ -732,7 +783,6 @@ impl Tui {
                 // Empty composer: accept grayed-out next-task suggestion (Claude Code-style).
                 if self.input_buf.is_empty()
                     && !self.awaiting_api_key
-                    && !self.show_command_picker
                     && !self.show_model_picker
                     && !self.show_provider_picker
                     && !self.show_theme_picker
@@ -745,13 +795,11 @@ impl Tui {
                         return true;
                     }
                 }
-                // Slash-command completion: apply selected (or sole) match and
-                // keep the picker open for the next argument when needed.
+                // Slash ghost: Tab fills the selected completion (then next-arg candidates).
                 if self.input_buf.starts_with('/') {
                     self.update_cmd_picker();
                 }
-                if self.show_command_picker && !self.cmd_picker_filtered.is_empty() {
-                    let cmd = self.cmd_picker_filtered[self.cmd_picker_sel].clone();
+                if let Some(cmd) = self.selected_slash_completion().map(|s| s.to_string()) {
                     self.apply_slash_completion(&cmd);
                 }
                 true
@@ -769,7 +817,11 @@ impl Tui {
                         tool_name: String::new(),
                         duration: String::new(),
                     });
-                } else if self.show_command_picker { self.show_command_picker = false; }
+                } else if self.show_command_picker || !self.cmd_picker_filtered.is_empty() {
+                    self.show_command_picker = false;
+                    self.cmd_picker_filtered.clear();
+                    self.cmd_picker_sel = 0;
+                }
                 else if self.show_provider_picker { self.show_provider_picker = false; }
                 else if self.show_model_picker { self.show_model_picker = false; }
                 else if self.show_session_picker {
@@ -796,14 +848,12 @@ impl Tui {
                 true
             }
             KeyCode::Enter => {
-                if self.show_command_picker && !self.cmd_picker_filtered.is_empty() {
-                    let cmd = self.cmd_picker_filtered[self.cmd_picker_sel].clone();
+                // Enter always submits the typed buffer (Tab/Right accept the ghost first).
+                // Clear any leftover slash-completion state so it does not steal focus.
+                if self.show_command_picker || !self.cmd_picker_filtered.is_empty() {
                     self.show_command_picker = false;
                     self.cmd_picker_filtered.clear();
-                    self.input_buf.clear();
-                    self.cursor = 0;
-                    self.handle_command(&cmd);
-                    return true;
+                    self.cmd_picker_sel = 0;
                 }
                 if self.show_provider_picker {
                     if self.provider_picker_sel < self.provider_picker_list.len() {
@@ -1008,9 +1058,42 @@ impl Tui {
                 self.output_lines.clear();
                 self.streaming_text.clear();
                 self.stream_thinking.clear();
+                self.thinking_started = None;
                 self.current_session_id = None;
                 self.session_created_at = 0;
                 self.total_usage = llm::Usage::default();
+            }
+            "/thinking" => {
+                let arg = parts.get(1).map(|s| s.to_ascii_lowercase());
+                self.show_thinking = match arg.as_deref() {
+                    Some("on" | "true" | "1" | "show") => true,
+                    Some("off" | "false" | "0" | "hide") => false,
+                    Some(other) => {
+                        self.output_lines.push(OutputLine {
+                            type_: "system".into(),
+                            content: format!(
+                                "Unknown /thinking option '{other}'. Use /thinking, /thinking on, or /thinking off."
+                            ),
+                            tool_name: String::new(),
+                            duration: String::new(),
+                        });
+                        return;
+                    }
+                    None => !self.show_thinking,
+                };
+                let _ = crate::config::save_show_thinking(self.show_thinking);
+                let state = if self.show_thinking { "on" } else { "off" };
+                let detail = if self.show_thinking {
+                    "Full thinking streams and is kept in the transcript."
+                } else {
+                    "Thinking is hidden; a short \"Thought for …\" line is kept (Claude Code default)."
+                };
+                self.output_lines.push(OutputLine {
+                    type_: "system".into(),
+                    content: format!("Thinking display: {state}. {detail}"),
+                    tool_name: String::new(),
+                    duration: String::new(),
+                });
             }
             "/model" => {
                 if parts.len() > 1 {
@@ -1081,7 +1164,7 @@ impl Tui {
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /auth /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions /theme\nTab completes slash commands; Tab/→ accepts grayed next-task hint when empty\nSounds: done/attention beeps (CAIRN_SOUND=0 to mute)\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)\nScroll: mouse wheel · PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End\n/provider xai — browser OAuth; /auth login xai; /auth key xai for API key".into(),
+                    content: "Commands: /auth /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions /theme /thinking\n/thinking [on|off] — show full thinking (on) or short Thought-for lines only (off, default)\nTab completes slash commands; Tab/→ accepts grayed next-task hint when empty\nSounds: done/attention beeps (CAIRN_SOUND=0 to mute)\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)\nScroll: mouse wheel · PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End\n/provider xai — browser OAuth; /auth login xai; /auth key xai for API key".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
             }
@@ -1668,12 +1751,22 @@ impl Tui {
                             });
                         }
                         llm::Content::Thinking(t) => {
-                            lines.push(OutputLine {
-                                type_: "system".into(),
-                                content: format!("(thinking) {t}"),
-                                tool_name: String::new(),
-                                duration: String::new(),
-                            });
+                            if self.show_thinking {
+                                lines.push(OutputLine {
+                                    type_: "thinking".into(),
+                                    content: t.clone(),
+                                    tool_name: String::new(),
+                                    duration: String::new(),
+                                });
+                            } else if !t.trim().is_empty() {
+                                // Hidden mode: keep a Claude Code-style marker, not the body.
+                                lines.push(OutputLine {
+                                    type_: "thinking_summary".into(),
+                                    content: "Thought".into(),
+                                    tool_name: String::new(),
+                                    duration: String::new(),
+                                });
+                            }
                         }
                         llm::Content::ToolUse(tu) => {
                             lines.push(OutputLine {
@@ -1820,7 +1913,7 @@ impl Tui {
                     lines.push(Line::from(""));
                 }
                 "text" => {
-                    lines.extend(crate::markdown::render(&line.content));
+                    lines.extend(crate::markdown::render(&line.content, &self.theme));
                 }
                 "tool_use" => {
                     lines.push(Line::from(vec![
@@ -1880,6 +1973,22 @@ impl Tui {
                         lines.push(Line::from(vec![Span::styled(part, dim)]));
                     }
                 }
+                "thinking" => {
+                    // Full preserved thinking (only written when show_thinking is on).
+                    lines.push(Line::from(vec![Span::styled("── Thinking ──", bold_dim)]));
+                    for part in line.content.split('\n') {
+                        lines.push(Line::from(vec![Span::styled(part, dim)]));
+                    }
+                }
+                "thinking_summary" => {
+                    // Claude Code default: short marker, no body.
+                    let label = if line.content.is_empty() {
+                        "Thought".to_string()
+                    } else {
+                        line.content.clone()
+                    };
+                    lines.push(Line::from(vec![Span::styled(format!("✦ {label}"), dim)]));
+                }
                 _ => {
                     for part in line.content.split('\n') {
                         lines.push(Line::from(Span::raw(part)));
@@ -1888,19 +1997,27 @@ impl Tui {
             }
         }
 
-        // Streaming
-        if !self.stream_thinking.is_empty() {
+        // Streaming thinking: full body only when toggled on; off-mode uses spinner only.
+        if self.show_thinking && !self.stream_thinking.is_empty() {
             lines.push(Line::from(vec![Span::styled("── Thinking ──", bold_dim)]));
             for part in self.stream_thinking.split('\n') {
                 lines.push(Line::from(vec![Span::styled(part, dim)]));
             }
         }
         if !self.streaming_text.is_empty() {
-            lines.extend(crate::markdown::render(&self.streaming_text));
+            lines.extend(crate::markdown::render(&self.streaming_text, &self.theme));
         }
-        if matches!(self.state, State::Running) && self.streaming_text.is_empty() {
+        // Spinner while waiting / thinking without answer text. Skip when full
+        // thinking body is already on screen (show_thinking on).
+        let show_spin = matches!(self.state, State::Running)
+            && self.streaming_text.is_empty()
+            && !(self.show_thinking && !self.stream_thinking.is_empty());
+        if show_spin {
             let spin = SPINNER_CHARS[self.spinner_idx % SPINNER_CHARS.len()];
-            lines.push(Line::from(format!("{spin} Thinking…")));
+            lines.push(Line::from(vec![
+                Span::styled(spin, orange),
+                Span::styled(" Thinking…", dim),
+            ]));
         }
 
         // Usage
@@ -1917,24 +2034,7 @@ impl Tui {
         // Cursor: (x offset within chrome width, logical line index in chrome).
         let mut cursor_pos: Option<(u16, usize)> = None;
 
-        if self.show_command_picker {
-            let cursor = self.cursor.min(self.input_buf.len());
-            let (before, after) = self.input_buf.split_at(cursor);
-            chrome.push(Line::from(vec![
-                Span::styled("❯ ", orange_fg),
-                Span::raw(before),
-                Span::styled("▋", orange_fg),
-                Span::raw(after),
-            ]));
-            for (i, cmd) in self.cmd_picker_filtered.iter().enumerate() {
-                let is_sel = i == self.cmd_picker_sel;
-                let prefix = if is_sel { "▸ " } else { "  " };
-                chrome.push(Line::from(vec![
-                    Span::styled(format!("{prefix}{cmd}"), if is_sel { selected } else { dim }),
-                ]));
-            }
-            cursor_pos = Some((display_width("❯ ") as u16 + display_width(before) as u16, 0));
-        } else if let Some(name) = &self.confirm_remove_provider {
+        if let Some(name) = &self.confirm_remove_provider {
             chrome.push(Line::from(vec![
                 Span::styled(format!("Remove saved API key for '{name}'?"), white),
             ]));
@@ -2178,11 +2278,20 @@ impl Tui {
                     cursor_pos = Some((display_width("❯ ") as u16, 0));
                 }
             } else {
-                chrome.push(Line::from(vec![
+                // Inline slash ghost: `/e` shows gray `xit` after the caret (no dropdown).
+                let mut spans = vec![
                     Span::styled("❯ ", orange_fg),
                     Span::raw(before),
                     Span::raw(after),
-                ]));
+                ];
+                if cursor >= self.input_buf.len() {
+                    if let Some(cmd) = self.selected_slash_completion() {
+                        if let Some(suffix) = slash_ghost_suffix(&self.input_buf, cmd) {
+                            spans.push(Span::styled(suffix, bold_dim));
+                        }
+                    }
+                }
+                chrome.push(Line::from(spans));
                 cursor_pos = Some((
                     display_width("❯ ") as u16 + display_width(before) as u16,
                     0,
@@ -2295,15 +2404,39 @@ impl Tui {
     }
 
     fn flush_streaming(&mut self) {
-        if !self.streaming_text.is_empty() || !self.stream_thinking.is_empty() {
-            if !self.streaming_text.is_empty() {
+        if self.streaming_text.is_empty() && self.stream_thinking.is_empty() {
+            return;
+        }
+        // Finish the think phase before answer text so order matches Claude Code.
+        if !self.stream_thinking.is_empty() {
+            let elapsed = self.thinking_started.take().map(|t| t.elapsed());
+            if self.show_thinking {
                 self.output_lines.push(OutputLine {
-                    type_: "text".into(), content: self.streaming_text.clone(),
-                    tool_name: String::new(), duration: String::new(),
+                    type_: "thinking".into(),
+                    content: self.stream_thinking.clone(),
+                    tool_name: String::new(),
+                    duration: String::new(),
+                });
+            } else {
+                self.output_lines.push(OutputLine {
+                    type_: "thinking_summary".into(),
+                    content: format_thought_label(elapsed),
+                    tool_name: String::new(),
+                    duration: String::new(),
                 });
             }
-            self.streaming_text.clear();
             self.stream_thinking.clear();
+        } else {
+            self.thinking_started = None;
+        }
+        if !self.streaming_text.is_empty() {
+            self.output_lines.push(OutputLine {
+                type_: "text".into(),
+                content: self.streaming_text.clone(),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            self.streaming_text.clear();
         }
     }
 
@@ -2360,7 +2493,13 @@ impl Tui {
         if self.cmd_picker_sel >= self.cmd_picker_filtered.len() {
             self.cmd_picker_sel = self.cmd_picker_filtered.len().saturating_sub(1);
         }
+        // Keep flag for mouse/scroll guards; UI is ghost-only (no multi-line list).
         self.show_command_picker = !self.cmd_picker_filtered.is_empty();
+    }
+
+    /// Selected slash completion string, if any.
+    fn selected_slash_completion(&self) -> Option<&str> {
+        self.cmd_picker_filtered.get(self.cmd_picker_sel).map(|s| s.as_str())
     }
 
     /// Refresh the grayed-out next-task hint in the empty composer.
@@ -2387,6 +2526,47 @@ impl Tui {
         self.cursor = self.input_buf.len();
         self.update_cmd_picker();
     }
+}
+
+/// Claude Code-style short label for a completed think phase.
+pub(crate) fn format_thought_label(elapsed: Option<Duration>) -> String {
+    let Some(d) = elapsed else {
+        return "Thought".into();
+    };
+    let secs = d.as_secs();
+    if secs == 0 {
+        // Sub-second thinks still get a readable marker.
+        let ms = d.as_millis();
+        if ms < 100 {
+            return "Thought briefly".into();
+        }
+        return "Thought for <1s".into();
+    }
+    if secs < 60 {
+        return format!("Thought for {secs}s");
+    }
+    let m = secs / 60;
+    let s = secs % 60;
+    if s == 0 {
+        format!("Thought for {m}m")
+    } else {
+        format!("Thought for {m}m {s}s")
+    }
+}
+
+/// Gray ghost text after the typed prefix: `/e` + `/exit` → `xit`.
+/// Returns `None` when the completion does not extend the current input.
+pub(crate) fn slash_ghost_suffix(input: &str, completion: &str) -> Option<String> {
+    if completion.len() <= input.len() {
+        return None;
+    }
+    if !completion
+        .to_ascii_lowercase()
+        .starts_with(&input.to_ascii_lowercase())
+    {
+        return None;
+    }
+    Some(completion[input.len()..].to_string())
 }
 
 fn default_empty_suggestion() -> &'static str {
@@ -2460,6 +2640,7 @@ fn completion_wants_trailing_space(completion: &str) -> bool {
             | "/provider"
             | "/resume"
             | "/delete"
+            | "/thinking"
     )
 }
 
@@ -2509,6 +2690,21 @@ pub(crate) fn slash_completions(
     };
 
     match cmd.as_str() {
+        "/thinking" => {
+            let opts = ["on", "off"];
+            if parts.len() == 1 && ends_with_space {
+                return opts.iter().map(|s| format!("/thinking {s}")).collect();
+            }
+            if parts.len() == 2 && !ends_with_space {
+                let p = parts[1].to_ascii_lowercase();
+                return opts
+                    .iter()
+                    .filter(|s| s.starts_with(&p))
+                    .map(|s| format!("/thinking {s}"))
+                    .collect();
+            }
+            Vec::new()
+        }
         "/auth" => {
             let subs = ["login", "logout", "status", "key"];
             if parts.len() == 1 && ends_with_space {
@@ -2642,13 +2838,48 @@ mod completion_tests {
             "/resume".into(),
             "/delete".into(),
             "/theme".into(),
+            "/thinking".into(),
         ]
+    }
+
+    #[test]
+    fn thought_label_formats_duration() {
+        assert_eq!(format_thought_label(None), "Thought");
+        assert_eq!(
+            format_thought_label(Some(Duration::from_millis(40))),
+            "Thought briefly"
+        );
+        assert_eq!(
+            format_thought_label(Some(Duration::from_secs(3))),
+            "Thought for 3s"
+        );
+        assert_eq!(
+            format_thought_label(Some(Duration::from_secs(65))),
+            "Thought for 1m 5s"
+        );
+    }
+
+    #[test]
+    fn completes_thinking_toggle() {
+        let c = slash_completions("/thin", &base(), &[], &[], &[], &[]);
+        assert_eq!(c, vec!["/thinking".to_string()]);
+        let c = slash_completions("/thinking ", &base(), &[], &[], &[], &[]);
+        assert!(c.iter().any(|x| x == "/thinking on"));
+        assert!(c.iter().any(|x| x == "/thinking off"));
     }
 
     #[test]
     fn completes_root_command_prefix() {
         let c = slash_completions("/mo", &base(), &[], &[], &[], &[]);
         assert_eq!(c, vec!["/model".to_string()]);
+    }
+
+    #[test]
+    fn ghost_suffix_for_partial_command() {
+        assert_eq!(slash_ghost_suffix("/e", "/exit").as_deref(), Some("xit"));
+        assert_eq!(slash_ghost_suffix("/auth lo", "/auth login").as_deref(), Some("gin"));
+        assert_eq!(slash_ghost_suffix("/exit", "/exit"), None);
+        assert_eq!(slash_ghost_suffix("/z", "/exit"), None);
     }
 
     #[test]

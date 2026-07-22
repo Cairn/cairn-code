@@ -425,6 +425,24 @@ mod tests {
     }
 
     #[test]
+    fn live_mirror_roundtrip() {
+        let mirror = new_live_mirror();
+        {
+            let mut g = mirror.lock().unwrap();
+            g.messages.push(Message {
+                role: "user".into(),
+                content: crate::llm::Content::Text("hi".into()),
+            });
+            g.tokens_in = 3;
+            g.tokens_out = 7;
+        }
+        let g = mirror.lock().unwrap();
+        assert_eq!(g.messages.len(), 1);
+        assert_eq!(g.tokens_in, 3);
+        assert_eq!(g.tokens_out, 7);
+    }
+
+    #[test]
     fn test_roundtrip_tool_use_and_result() {
         let test_id = format!("test-{}", new_id());
         let dir = std::env::temp_dir().join(format!("cairn-test-session-tools-{}", new_id()));

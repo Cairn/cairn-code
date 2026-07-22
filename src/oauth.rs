@@ -518,6 +518,14 @@ mod tests {
     }
 
     #[test]
+    fn supports_oauth_only_xai() {
+        assert!(supports_oauth("xai"));
+        assert!(supports_oauth("XAI"));
+        assert!(!supports_oauth("anthropic"));
+        assert!(!supports_oauth("openai"));
+    }
+
+    #[test]
     fn access_still_fresh_logic() {
         let mut t = Token {
             access_token: "x".into(),

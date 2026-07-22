@@ -45,6 +45,10 @@ impl Registry {
     pub fn len(&self) -> usize {
         self.tools.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
+    }
 }
 
 pub fn default_registry() -> Registry {
@@ -63,4 +67,64 @@ pub fn default_registry() -> Registry {
     r.register(Box::new(crate::tools::todo::TodoTool));
     r.register(Box::new(crate::tools::memory::MemoryTool));
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_registry_has_expected_tools() {
+        let r = default_registry();
+        assert_eq!(r.len(), 13);
+        for name in [
+            "file_read",
+            "file_write",
+            "file_edit",
+            "file_undo",
+            "shell",
+            "go",
+            "git",
+            "glob",
+            "grep",
+            "web_search",
+            "web_fetch",
+            "todo_write",
+            "memory",
+        ] {
+            assert!(r.get(name).is_some(), "missing tool {name}");
+        }
+        assert!(r.get("nope").is_none());
+    }
+
+    #[test]
+    fn definitions_are_valid_json_schemas() {
+        let r = default_registry();
+        for def in r.definitions() {
+            assert!(!def.name.is_empty());
+            assert!(!def.description.is_empty());
+            let parsed = crate::json::parse(&def.input_schema);
+            assert!(parsed.is_ok(), "{} schema: {:?}", def.name, parsed.err());
+        }
+    }
+
+    #[test]
+    fn permission_flags_match_expectations() {
+        let r = default_registry();
+        assert!(!r.get("file_read").unwrap().needs_permission());
+        assert!(!r.get("glob").unwrap().needs_permission());
+        assert!(!r.get("grep").unwrap().needs_permission());
+        assert!(r.get("shell").unwrap().needs_permission());
+        assert!(r.get("file_write").unwrap().needs_permission());
+        assert!(r.get("git").unwrap().needs_permission());
+        assert!(r.get("web_fetch").unwrap().needs_permission());
+    }
+
+    #[test]
+    fn empty_registry() {
+        let r = Registry::new();
+        assert!(r.is_empty());
+        assert_eq!(r.len(), 0);
+        assert!(r.names().is_empty());
+    }
 }

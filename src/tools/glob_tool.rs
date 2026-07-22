@@ -34,7 +34,7 @@ impl Tool for GlobTool {
     }
 }
 
-fn glob_match(pattern: &str, base_dir: &str) -> Result<Vec<String>, String> {
+pub(crate) fn glob_match(pattern: &str, base_dir: &str) -> Result<Vec<String>, String> {
     let mut results = Vec::new();
     let base = Path::new(base_dir);
 
@@ -93,14 +93,18 @@ fn walk_pattern(
             }
         }
     } else if part.contains('*') || part.contains('?') {
-        // Wildcard pattern
-        let re_pattern = format!("^{}$", part.replace('.', "\\.").replace('*', ".*").replace('?', "."));
+        // Wildcard pattern. Do not wrap with `^$` as literal characters — SimpleRe
+        // treats those as literals, so `^.*\.rs$` never matched real filenames.
+        let re_pattern = part
+            .replace('.', "\\.")
+            .replace('*', ".*")
+            .replace('?', ".");
         let re = regex_wrapper(&re_pattern)?;
 
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if re.is_match(&name) {
+                if re.is_full_match(&name) {
                     let new_prefix = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
                     let path = entry.path();
                     if is_last || path.is_dir() {
@@ -144,6 +148,80 @@ fn walk_dir_recursive(dir: &Path, prefix: &str, results: &mut Vec<String>) -> Re
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_tree() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cairn-glob-{nanos}"));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/main.rs"), "fn main(){}\n").unwrap();
+        fs::write(dir.join("src/lib.rs"), "").unwrap();
+        fs::write(dir.join("README.md"), "").unwrap();
+        dir
+    }
+
+    #[test]
+    fn finds_rs_files() {
+        let dir = temp_tree();
+        let dir_s = dir.to_string_lossy().replace('\\', "/");
+        // Single-level wildcard (more reliable across path styles than `**` alone).
+        let results = glob_match("src/*.rs", &dir_s).unwrap();
+        assert!(
+            results.iter().any(|p| p.replace('\\', "/").ends_with("src/main.rs") || p.contains("main.rs")),
+            "src/*.rs => {results:?}"
+        );
+        assert!(
+            results.iter().any(|p| p.contains("lib.rs")),
+            "src/*.rs => {results:?}"
+        );
+        // Recursive form
+        let deep = glob_match("**/*.rs", &dir_s).unwrap();
+        assert!(
+            deep.iter().any(|p| p.contains("main.rs")),
+            "**/*.rs => {deep:?}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn simple_re_full_match_star_rs() {
+        let re = regex_wrapper(r".*\.rs").unwrap();
+        assert!(re.is_full_match("main.rs"));
+        assert!(re.is_full_match("lib.rs"));
+        assert!(!re.is_full_match("main.rs.bak"));
+        assert!(!re.is_full_match("README.md"));
+    }
+
+    #[test]
+    fn literal_path() {
+        let dir = temp_tree();
+        let dir_s = dir.to_string_lossy().replace('\\', "/");
+        let results = glob_match("README.md", &dir_s).unwrap();
+        assert_eq!(results.len(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn execute_no_matches() {
+        let tool = GlobTool;
+        let out = tool
+            .execute(r#"{"pattern":"**/totally_missing_file_xyz_123.nope"}"#)
+            .unwrap();
+        assert!(out.contains("No matches"), "{out}");
+    }
+
+    #[test]
+    fn requires_pattern() {
+        assert!(GlobTool.execute("{}").is_err());
+    }
+}
+
 struct SimpleRe {
     pattern: Vec<Segment>,
 }
@@ -163,6 +241,11 @@ impl SimpleRe {
 
         while i < chars.len() {
             match chars[i] {
+                // Escaped literal (e.g. `\.` from wildcard conversion of `*.rs`).
+                '\\' if i + 1 < chars.len() => {
+                    literal.push(chars[i + 1]);
+                    i += 2;
+                }
                 '.' if i + 1 < chars.len() && chars[i + 1] == '*' => {
                     if !literal.is_empty() {
                         segments.push(Segment::Literal(literal.clone()));
@@ -194,6 +277,11 @@ impl SimpleRe {
 
     fn is_match(&self, text: &str) -> bool {
         self.match_from(text, 0, 0)
+    }
+
+    /// Match the entire filename (not a substring).
+    fn is_full_match(&self, text: &str) -> bool {
+        self.is_match(text)
     }
 
     fn match_from(&self, text: &str, pi: usize, ti: usize) -> bool {

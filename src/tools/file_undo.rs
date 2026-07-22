@@ -29,32 +29,59 @@ mod tests {
     #[test]
     fn undo_restores_file_edit() {
         crate::tools::file_history::clear();
-        let path = "target/cairn_file_undo_edit.txt";
-        fs::write(path, "original").unwrap();
+        // Stay inside the workspace (cwd) so resolve_in_workspace accepts the path.
+        // Unique subdir avoids parallel test collisions; do not touch process cwd.
+        let rel = format!(
+            "target/cairn_undo_edit_{}/f.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        if let Some(parent) = std::path::Path::new(&rel).parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&rel, "original").unwrap();
 
         let edit = FileEditTool;
-        let input = format!(r#"{{"file_path":"{path}","old_string":"original","new_string":"changed"}}"#);
+        let input = format!(
+            r#"{{"file_path":"{rel}","old_string":"original","new_string":"changed"}}"#
+        );
         edit.execute(&input).unwrap();
-        assert_eq!(fs::read_to_string(path).unwrap(), "changed");
+        assert_eq!(fs::read_to_string(&rel).unwrap(), "changed");
 
         FileUndoTool.execute("{}").unwrap();
-        assert_eq!(fs::read_to_string(path).unwrap(), "original");
-        let _ = fs::remove_file(path);
+        assert_eq!(fs::read_to_string(&rel).unwrap(), "original");
+        if let Some(parent) = std::path::Path::new(&rel).parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
     }
 
     #[test]
     fn undo_removes_newly_created_file() {
         crate::tools::file_history::clear();
-        let path = "target/cairn_file_undo_create.txt";
-        let _ = fs::remove_file(path);
+        let rel = format!(
+            "target/cairn_undo_create_{}/f.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        if let Some(parent) = std::path::Path::new(&rel).parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let _ = fs::remove_file(&rel);
 
         let write = FileWriteTool;
-        let input = format!(r#"{{"file_path":"{path}","content":"brand new"}}"#);
+        let input = format!(r#"{{"file_path":"{rel}","content":"brand new"}}"#);
         write.execute(&input).unwrap();
-        assert!(std::path::Path::new(path).exists());
+        assert!(std::path::Path::new(&rel).exists());
 
         FileUndoTool.execute("{}").unwrap();
-        assert!(!std::path::Path::new(path).exists());
+        assert!(!std::path::Path::new(&rel).exists());
+        if let Some(parent) = std::path::Path::new(&rel).parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
     }
 
     #[test]

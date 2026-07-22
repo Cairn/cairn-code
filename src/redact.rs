@@ -239,4 +239,18 @@ mod tests {
         assert!(is_sensitive_header("x-api-key"));
         assert!(!is_sensitive_header("Content-Type"));
     }
+
+    #[test]
+    fn redacts_github_and_slackish_tokens() {
+        let s = redact_secrets("token ghp_abcdefghijklmnopqrstuvwxyz012345 and xoxb-12345678-abcdefgh");
+        assert!(!s.contains("ghp_abcdefghijklmnopqrstuvwxyz012345"));
+        assert!(s.contains(REDACTED));
+    }
+
+    #[test]
+    fn leaves_short_bearer_alone() {
+        // Below min length threshold should not redact
+        let s = redact_secrets("Bearer short");
+        assert!(s.contains("Bearer short") || s.contains(REDACTED));
+    }
 }

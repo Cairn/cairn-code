@@ -40,3 +40,38 @@ impl Tool for GitTool {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requires_args() {
+        assert!(GitTool.execute("{}").is_err());
+        assert!(GitTool.execute("not-json").is_err());
+    }
+
+    #[test]
+    fn identity() {
+        let t = GitTool;
+        assert_eq!(t.name(), "git");
+        assert!(t.needs_permission());
+        assert!(crate::json::parse(&t.input_schema()).is_ok());
+    }
+
+    #[test]
+    fn rev_parse_works_in_repo() {
+        // Only assert success when cwd is a git repo (this project's tree).
+        let tool = GitTool;
+        match tool.execute(r#"{"args":"rev-parse --is-inside-work-tree"}"#) {
+            Ok(out) => assert!(out.trim().contains("true") || out.contains("true"), "{out}"),
+            Err(e) => {
+                // Allow missing git binary in restricted CI.
+                assert!(
+                    e.contains("git exec") || e.contains("git exited"),
+                    "unexpected error: {e}"
+                );
+            }
+        }
+    }
+}
