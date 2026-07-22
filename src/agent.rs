@@ -41,6 +41,8 @@ pub struct Agent {
     config: Config,
     usage: Usage,
     last_input_tokens: u64,
+    /// Mirrors full message history for session autosave (shared with TUI).
+    live_mirror: Option<crate::session::LiveMirror>,
 }
 
 impl Agent {
@@ -58,6 +60,23 @@ impl Agent {
             config,
             usage: Usage::default(),
             last_input_tokens: 0,
+            live_mirror: None,
+        }
+    }
+
+    pub fn set_live_mirror(&mut self, mirror: crate::session::LiveMirror) {
+        self.live_mirror = Some(mirror);
+        self.sync_live_mirror();
+    }
+
+    fn sync_live_mirror(&self) {
+        let Some(mirror) = &self.live_mirror else {
+            return;
+        };
+        if let Ok(mut g) = mirror.lock() {
+            g.messages = self.messages.clone();
+            g.tokens_in = self.usage.input_tokens;
+            g.tokens_out = self.usage.output_tokens;
         }
     }
 
@@ -76,6 +95,7 @@ impl Agent {
         self.messages.clear();
         self.usage = Usage::default();
         self.last_input_tokens = 0;
+        self.sync_live_mirror();
         Ok(())
     }
 
@@ -83,6 +103,7 @@ impl Agent {
         self.messages = messages;
         self.usage = usage;
         self.last_input_tokens = 0;
+        self.sync_live_mirror();
     }
 
     #[allow(dead_code)]
@@ -169,6 +190,7 @@ impl Agent {
                     .into(),
             );
         }
+        self.sync_live_mirror();
         Ok(n)
     }
 
@@ -336,6 +358,7 @@ impl Agent {
         if let Err(ref e) = result {
             let _ = tx.send(AgentEvent::Error(e.clone()));
         }
+        self.sync_live_mirror();
         let _ = tx.send(AgentEvent::Done);
         result
     }

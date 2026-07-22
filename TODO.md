@@ -35,7 +35,8 @@ standalone system, not a small port:
 - Parallel execution of read-only tool calls
 - LSP integration (diagnostics, go-to-definition)
 - OS-level sandboxing for shell/tool execution
-- [x] OAuth login flows for providers — xAI device-code (`/auth login xai`), keyring token store
+- [x] OAuth login flows for providers — xAI device-code (`/auth login xai`), keyring token store, refresh_token grant
+- [x] Session autosave with full agent transcript (tools included) + resume rebuild
 - Model registry with live pricing/context-window/vision metadata
 - Three-way config layering (user/project/env), currently first-match-wins
 - [x] Output/log secret redaction — `redact.rs` on debug dumps, error text, sensitive headers

@@ -114,6 +114,8 @@ pub struct Tui {
     current_session_id: Option<String>,
     /// created_at for the active session (preserved across autosaves).
     session_created_at: u64,
+    /// Full agent transcript (tools included) for session files.
+    live_mirror: Option<session::LiveMirror>,
 }
 
 impl Tui {
@@ -181,7 +183,12 @@ impl Tui {
             last_body_wrapped: 0,
             current_session_id: None,
             session_created_at: 0,
+            live_mirror: None,
         }
+    }
+
+    pub fn set_live_mirror(&mut self, mirror: session::LiveMirror) {
+        self.live_mirror = Some(mirror);
     }
 
     pub fn set_theme_name(&mut self, name: &str) {
@@ -1368,9 +1375,17 @@ impl Tui {
         }
     }
 
-    /// Build the message list that belongs in a session file (user + assistant text).
-    fn session_messages(&self) -> Vec<llm::Message> {
-        self.output_lines
+    /// Prefer the agent's full transcript (tools included); fall back to TUI lines.
+    fn session_snapshot(&self) -> (Vec<llm::Message>, u64, u64) {
+        if let Some(mirror) = &self.live_mirror {
+            if let Ok(g) = mirror.lock() {
+                if !g.messages.is_empty() {
+                    return (g.messages.clone(), g.tokens_in, g.tokens_out);
+                }
+            }
+        }
+        let messages = self
+            .output_lines
             .iter()
             .filter_map(|l| {
                 if l.type_ == "user" {
@@ -1383,17 +1398,39 @@ impl Tui {
                         role: "assistant".into(),
                         content: llm::Content::Text(l.content.clone()),
                     })
+                } else if l.type_ == "tool_use" {
+                    Some(llm::Message {
+                        role: "assistant".into(),
+                        content: llm::Content::ToolUse(llm::ToolUse {
+                            id: String::new(),
+                            name: l.tool_name.clone(),
+                            input: l.content.clone(),
+                        }),
+                    })
+                } else if l.type_ == "tool_result" {
+                    Some(llm::Message {
+                        role: "user".into(),
+                        content: llm::Content::ToolResult(llm::ToolResult {
+                            tool_use_id: String::new(),
+                            content: l.content.clone(),
+                        }),
+                    })
                 } else {
                     None
                 }
             })
-            .collect()
+            .collect();
+        (
+            messages,
+            self.total_usage.input_tokens,
+            self.total_usage.output_tokens,
+        )
     }
 
     /// Save (or update) the current session. When `announce` is true, print a
     /// system line (manual `/save`). Autosave stays quiet unless it fails.
     fn autosave_session(&mut self, announce: bool) {
-        let messages = self.session_messages();
+        let (messages, tokens_in, tokens_out) = self.session_snapshot();
         if messages.is_empty() {
             if announce {
                 self.output_lines.push(OutputLine {
@@ -1425,8 +1462,8 @@ impl Tui {
             model: self.model.clone(),
             provider: self.provider.clone(),
             messages,
-            tokens_in: self.total_usage.input_tokens,
-            tokens_out: self.total_usage.output_tokens,
+            tokens_in,
+            tokens_out,
             created_at,
             updated_at: now,
         };
@@ -1516,18 +1553,47 @@ impl Tui {
     fn resume_session(&mut self, id: &str) {
         match session::load(&self.sessions_dir(), id) {
             Ok(sess) => {
+                // Rebuild TUI transcript including tool calls/results for continuity.
                 let mut lines = Vec::new();
                 for msg in &sess.messages {
-                    let content = match &msg.content {
-                        llm::Content::Text(t) => t.clone(),
-                        llm::Content::Thinking(t) => t.clone(),
-                        _ => continue,
-                    };
-                    lines.push(OutputLine {
-                        type_: if msg.role == "user" { "user".into() } else { "text".into() },
-                        content,
-                        tool_name: String::new(), duration: String::new(),
-                    });
+                    match &msg.content {
+                        llm::Content::Text(t) => {
+                            lines.push(OutputLine {
+                                type_: if msg.role == "user" {
+                                    "user".into()
+                                } else {
+                                    "text".into()
+                                },
+                                content: t.clone(),
+                                tool_name: String::new(),
+                                duration: String::new(),
+                            });
+                        }
+                        llm::Content::Thinking(t) => {
+                            lines.push(OutputLine {
+                                type_: "system".into(),
+                                content: format!("(thinking) {t}"),
+                                tool_name: String::new(),
+                                duration: String::new(),
+                            });
+                        }
+                        llm::Content::ToolUse(tu) => {
+                            lines.push(OutputLine {
+                                type_: "tool_use".into(),
+                                content: tu.input.clone(),
+                                tool_name: tu.name.clone(),
+                                duration: String::new(),
+                            });
+                        }
+                        llm::Content::ToolResult(tr) => {
+                            lines.push(OutputLine {
+                                type_: "tool_result".into(),
+                                content: tr.content.clone(),
+                                tool_name: "tool".into(),
+                                duration: String::new(),
+                            });
+                        }
+                    }
                 }
                 self.output_lines = lines;
                 self.total_usage = llm::Usage {
@@ -1536,6 +1602,14 @@ impl Tui {
                     cache_read: 0,
                     cache_create: 0,
                 };
+                // Seed the live mirror so the next autosave keeps full history.
+                if let Some(mirror) = &self.live_mirror {
+                    if let Ok(mut g) = mirror.lock() {
+                        g.messages = sess.messages.clone();
+                        g.tokens_in = sess.tokens_in;
+                        g.tokens_out = sess.tokens_out;
+                    }
+                }
                 self.model = sess.model.clone();
                 self.provider = sess.provider.clone();
                 self.current_session_id = Some(sess.id.clone());

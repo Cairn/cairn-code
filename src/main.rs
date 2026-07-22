@@ -77,6 +77,8 @@ fn main() {
     let (perm_tx, perm_rx) = mpsc::channel::<String>();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel2 = cancel.clone();
+    let live_mirror = session::new_live_mirror();
+    let live_mirror_agent = live_mirror.clone();
 
     let p_model_for_agent = p_model.clone();
     let p_model_for_print = p_model.clone();
@@ -84,6 +86,7 @@ fn main() {
 
     thread::spawn(move || {
         let mut agent = Agent::new(chosen_provider, p_model_for_agent, tool_registry, cfg);
+        agent.set_live_mirror(live_mirror_agent);
         loop {
             match cmd_rx.recv() {
                 Ok(cmd) if cmd == "cancel" => {
@@ -189,6 +192,7 @@ fn main() {
     tui.set_agent_tx(cmd_tx.clone());
     tui.set_perm_tx(perm_tx);
     tui.set_cancel_flag(cancel);
+    tui.set_live_mirror(live_mirror);
     tui.set_picker_models(models);
 
     if is_print_mode {

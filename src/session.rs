@@ -2,9 +2,24 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::llm::Message;
+
+/// Shared agent transcript for autosave / resume (full tool history, not just TUI text).
+#[derive(Default, Clone)]
+pub struct LiveSnapshot {
+    pub messages: Vec<Message>,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+}
+
+pub type LiveMirror = Arc<Mutex<LiveSnapshot>>;
+
+pub fn new_live_mirror() -> LiveMirror {
+    Arc::new(Mutex::new(LiveSnapshot::default()))
+}
 
 pub struct Session {
     pub id: String,
@@ -406,6 +421,64 @@ mod tests {
         // list must surface the file (corrupt JSON used to drop sessions silently)
         let listed = list(&dir_str).unwrap();
         assert!(listed.iter().any(|s| s.id == test_id));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_roundtrip_tool_use_and_result() {
+        let test_id = format!("test-{}", new_id());
+        let dir = std::env::temp_dir().join(format!("cairn-test-session-tools-{}", new_id()));
+        let dir_str = dir.to_string_lossy().to_string();
+        fs::create_dir_all(&dir).unwrap();
+
+        let session = Session {
+            id: test_id.clone(),
+            messages: vec![
+                Message {
+                    role: "user".into(),
+                    content: crate::llm::Content::Text("run tests".into()),
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: crate::llm::Content::ToolUse(crate::llm::ToolUse {
+                        id: "call_1".into(),
+                        name: "shell".into(),
+                        input: r#"{"command":"cargo test"}"#.into(),
+                    }),
+                },
+                Message {
+                    role: "user".into(),
+                    content: crate::llm::Content::ToolResult(crate::llm::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "ok\n147 passed".into(),
+                    }),
+                },
+            ],
+            model: "grok-4.5:high".into(),
+            provider: "xai".into(),
+            tokens_in: 9,
+            tokens_out: 3,
+            created_at: 1,
+            updated_at: 2,
+        };
+        save(&dir_str, &session).unwrap();
+        let loaded = load(&dir_str, &test_id).unwrap();
+        assert_eq!(loaded.messages.len(), 3);
+        match &loaded.messages[1].content {
+            crate::llm::Content::ToolUse(tu) => {
+                assert_eq!(tu.name, "shell");
+                assert_eq!(tu.id, "call_1");
+                assert!(tu.input.contains("cargo test"));
+            }
+            _ => panic!("expected tool_use"),
+        }
+        match &loaded.messages[2].content {
+            crate::llm::Content::ToolResult(tr) => {
+                assert_eq!(tr.tool_use_id, "call_1");
+                assert!(tr.content.contains("147 passed"));
+            }
+            _ => panic!("expected tool_result"),
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

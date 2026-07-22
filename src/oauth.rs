@@ -5,10 +5,14 @@
 //! works in SSH/headless sessions without a local browser callback.
 
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::json;
+
+/// Serializes refresh attempts so concurrent API calls do not thrash the token endpoint.
+static REFRESH_LOCK: Mutex<()> = Mutex::new(());
 
 const XAI_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const XAI_DEVICE_URL: &str = "https://auth.x.ai/oauth2/device/code";
@@ -320,22 +324,93 @@ pub fn delete_token(provider: &str) -> Result<bool, String> {
     }
 }
 
+/// True when the access token is missing an expiry, or still valid for >60s.
+fn access_still_fresh(tok: &Token) -> bool {
+    tok.expires_at == 0 || tok.expires_at > now_unix() + 60
+}
+
+/// Refresh an xAI access token using a refresh_token grant (RFC 6749).
+pub fn refresh_xai_token(refresh_token: &str) -> Result<Token, String> {
+    let refresh_token = refresh_token.trim();
+    if refresh_token.is_empty() {
+        return Err("oauth: no refresh token".into());
+    }
+    let client_id = xai_client_id()?;
+    let body = form_encode(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", &client_id),
+    ]);
+    let (status, resp) = form_post(XAI_TOKEN_URL, &body)?;
+    if status < 200 || status >= 300 {
+        let err = json::parse(&resp)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .and_then(|o| {
+                let code = o.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let desc = o
+                    .get("error_description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Some(if desc.is_empty() {
+                    format!("oauth refresh failed: {code} (HTTP {status})")
+                } else {
+                    format!("oauth refresh failed: {code} ({desc}) (HTTP {status})")
+                })
+            })
+            .unwrap_or_else(|| format!("oauth refresh failed (HTTP {status})"));
+        return Err(err);
+    }
+    // Some IdPs omit a new refresh_token; keep the previous one.
+    token_from_json_response(&resp, refresh_token)
+}
+
+/// Return a usable access token, refreshing via refresh_token when near expiry.
 pub fn access_token(provider: &str) -> Option<String> {
-    let tok = load_token(provider)?;
-    if tok.expires_at > 0 && tok.expires_at <= now_unix() + 60 {
-        // expired or about to expire; refresh not implemented yet
+    let provider = provider.trim().to_ascii_lowercase();
+    let tok = load_token(&provider)?;
+    if access_still_fresh(&tok) {
+        return Some(tok.access_token);
+    }
+    if provider != "xai" || tok.refresh_token.is_empty() {
         return None;
     }
-    Some(tok.access_token)
+    // Serialize refresh; re-check keyring after lock in case another thread won.
+    let _guard = REFRESH_LOCK.lock().ok()?;
+    let tok = load_token(&provider)?;
+    if access_still_fresh(&tok) {
+        return Some(tok.access_token);
+    }
+    if tok.refresh_token.is_empty() {
+        return None;
+    }
+    match refresh_xai_token(&tok.refresh_token) {
+        Ok(mut new_tok) => {
+            if new_tok.refresh_token.is_empty() {
+                new_tok.refresh_token = tok.refresh_token;
+            }
+            if save_token(&provider, &new_tok).is_err() {
+                // Still usable for this process even if keyring write failed.
+            }
+            std::env::set_var("XAI_API_KEY", &new_tok.access_token);
+            Some(new_tok.access_token)
+        }
+        Err(_) => None,
+    }
 }
 
 pub fn status_line(provider: &str) -> String {
-    match load_token(provider) {
+    let provider = provider.trim().to_ascii_lowercase();
+    match load_token(&provider) {
         Some(t) => {
             let exp = if t.expires_at == 0 {
                 "no expiry".into()
             } else if t.expires_at <= now_unix() {
-                "expired".into()
+                if t.refresh_token.is_empty() {
+                    "expired".into()
+                } else {
+                    "expired (refresh available)".into()
+                }
             } else {
                 format!("expires in {}s", t.expires_at.saturating_sub(now_unix()))
             };
@@ -365,7 +440,49 @@ pub fn open_url(url: &str) {
 }
 
 fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Parse a successful OAuth token JSON body into a [`Token`] (shared by device + refresh).
+pub fn token_from_json_response(resp: &str, fallback_refresh: &str) -> Result<Token, String> {
+    let val = json::parse(resp).map_err(|e| format!("oauth token response: {e}"))?;
+    let obj = val.as_object().ok_or("oauth token response not an object")?;
+    let access = obj
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("oauth: missing access_token")?;
+    let expires_in = obj.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(0);
+    let refresh = obj
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fallback_refresh);
+    Ok(Token {
+        access_token: access.to_string(),
+        refresh_token: refresh.to_string(),
+        token_type: obj
+            .get("token_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Bearer")
+            .to_string(),
+        expires_at: if expires_in > 0 {
+            now_unix() + expires_in
+        } else {
+            0
+        },
+    })
 }
 
 #[cfg(test)]
@@ -382,5 +499,36 @@ mod tests {
     #[test]
     fn keyring_user_normalized() {
         assert_eq!(keyring_user("xAI"), "oauth:xai");
+    }
+
+    #[test]
+    fn token_from_json_keeps_fallback_refresh() {
+        let body = r#"{"access_token":"new-access","expires_in":3600,"token_type":"Bearer"}"#;
+        let tok = token_from_json_response(body, "old-refresh").unwrap();
+        assert_eq!(tok.access_token, "new-access");
+        assert_eq!(tok.refresh_token, "old-refresh");
+        assert!(tok.expires_at > now_unix());
+    }
+
+    #[test]
+    fn token_from_json_prefers_new_refresh() {
+        let body = r#"{"access_token":"a","refresh_token":"r2","expires_in":10}"#;
+        let tok = token_from_json_response(body, "r1").unwrap();
+        assert_eq!(tok.refresh_token, "r2");
+    }
+
+    #[test]
+    fn access_still_fresh_logic() {
+        let mut t = Token {
+            access_token: "x".into(),
+            refresh_token: "y".into(),
+            token_type: "Bearer".into(),
+            expires_at: 0,
+        };
+        assert!(access_still_fresh(&t));
+        t.expires_at = now_unix() + 120;
+        assert!(access_still_fresh(&t));
+        t.expires_at = now_unix() + 10;
+        assert!(!access_still_fresh(&t));
     }
 }

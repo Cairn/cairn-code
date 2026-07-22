@@ -42,6 +42,7 @@ pub struct ModelInfo {
     pub max_ctx: u64,
 }
 
+#[derive(Debug, Clone)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
