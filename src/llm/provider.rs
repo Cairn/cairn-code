@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 
 #[derive(Debug, Clone)]
 pub struct ToolUse {
@@ -77,6 +78,7 @@ pub trait Provider: Send {
         model: &str,
         max_tokens: usize,
         on_chunk: StreamingCallback,
+        cancel: &AtomicBool,
     ) -> Result<(Vec<Message>, Usage), String>;
     fn complete(
         &self,

@@ -21,7 +21,7 @@ use llm::provider;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let version = "0.1.0";
+    let version = env!("CARGO_PKG_VERSION");
     let mut is_print_mode = false;
     let mut initial_prompt: Option<String> = None;
 
@@ -29,6 +29,14 @@ fn main() {
     while i < args.len() {
         match args[i].as_str() {
             "-p" | "--print" => is_print_mode = true,
+            "-h" | "--help" => {
+                print_help(version);
+                return;
+            }
+            "-v" | "--version" => {
+                println!("cairn-code {version}");
+                return;
+            }
             arg if !arg.starts_with('-') => {
                 initial_prompt = Some(arg.to_string());
             }
@@ -180,4 +188,25 @@ fn main() {
     }
 
     let _ = tui.run(event_rx);
+}
+
+fn print_help(version: &str) {
+    println!("cairn-code {version}");
+    println!("An AI coding agent for your terminal.");
+    println!();
+    println!("USAGE:");
+    println!("    cairn-code [OPTIONS] [PROMPT]");
+    println!();
+    println!("OPTIONS:");
+    println!("    -p, --print       Run PROMPT once non-interactively, print the result, and exit");
+    println!("    -h, --help        Print this help message and exit");
+    println!("    -v, --version     Print version information and exit");
+    println!();
+    println!("ENV:");
+    println!("    CAIRN_PROVIDER    Override the configured default provider");
+    println!("    CAIRN_MODEL       Override the configured default model");
+    println!();
+    println!("With no PROMPT, cairn-code starts the interactive TUI.");
+    println!("With PROMPT but no -p, it starts the TUI and sends PROMPT as the first message.");
+    println!("With PROMPT and -p, it runs once non-interactively and exits.");
 }

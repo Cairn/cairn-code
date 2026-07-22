@@ -32,6 +32,8 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> Self {
+        migrate_plaintext_keys_in_file(&config_path());
+
         let paths = [
             dirs_config_path(),
             PathBuf::from(".cairn/config.json"),
@@ -91,6 +93,57 @@ fn dirs_config_path() -> PathBuf {
     config_path()
 }
 
+fn keyring_entry(provider: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new("cairn-code", provider).map_err(|e| e.to_string())
+}
+
+fn keyring_set(provider: &str, key: &str) -> Result<(), String> {
+    keyring_entry(provider)?.set_password(key).map_err(|e| e.to_string())
+}
+
+fn keyring_get(provider: &str) -> Option<String> {
+    match keyring_entry(provider).ok()?.get_password() {
+        Ok(pw) if !pw.is_empty() => Some(pw),
+        _ => None,
+    }
+}
+
+fn keyring_delete(provider: &str) -> Result<bool, String> {
+    match keyring_entry(provider)?.delete_credential() {
+        Ok(()) => Ok(true),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// One-time migration: API keys used to be stored as plaintext in the config
+/// file's `api_keys` map. Move any that are still there into the OS keyring
+/// and strip them from the file.
+fn migrate_plaintext_keys_in_file(path: &std::path::Path) {
+    use crate::json::JsonValue;
+    if !path.exists() { return; }
+    let Ok(content) = fs::read_to_string(path) else { return; };
+    let Ok(val) = crate::json::parse(&content) else { return; };
+    let Some(mut obj) = val.as_object().cloned() else { return; };
+    let Some(keys) = obj.get("api_keys").and_then(|v| v.as_object()).cloned() else { return; };
+    if keys.is_empty() { return; }
+
+    let mut migrated_any = false;
+    for (provider, v) in &keys {
+        if let Some(key) = v.as_str() {
+            if !key.is_empty() && keyring_set(provider, key).is_ok() {
+                migrated_any = true;
+            }
+        }
+    }
+
+    if migrated_any {
+        obj.remove("api_keys");
+        let output = crate::json::serialize(&JsonValue::Object(obj));
+        let _ = fs::write(path, &output);
+    }
+}
+
 pub fn sessions_dir() -> String {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -110,12 +163,11 @@ pub fn save_config(provider: &str, model: &str, api_key: Option<&str>) -> Result
 
     obj.insert("default_provider".into(), JsonValue::String(provider.into()));
     obj.insert("default_model".into(), JsonValue::String(model.into()));
+    // API keys are never written to the config file; they live in the OS keyring.
+    obj.remove("api_keys");
 
     if let Some(key) = api_key {
-        let mut keys = obj.get("api_keys").and_then(|v| v.as_object()).cloned().unwrap_or_default();
-        // Store the key under the provider's name so the file is provider-agnostic.
-        keys.insert(provider.into(), JsonValue::String(key.into()));
-        obj.insert("api_keys".into(), JsonValue::Object(keys));
+        keyring_set(provider, key)?;
     }
 
     if let Some(parent) = path.parent() {
@@ -144,11 +196,8 @@ pub fn save_full_config(cfg: &Config) -> Result<(), String> {
         ("deny".into(), JsonValue::Array(cfg.deny.iter().map(|s| JsonValue::String(s.clone())).collect())),
     ]));
     obj.insert("permissions".into(), perms);
-
-    if !cfg.api_keys.is_empty() {
-        let keys: std::collections::HashMap<String, JsonValue> = cfg.api_keys.iter().map(|(k, v)| (k.clone(), JsonValue::String(v.clone()))).collect();
-        obj.insert("api_keys".into(), JsonValue::Object(keys));
-    }
+    // API keys are never written to the config file; they live in the OS keyring.
+    obj.remove("api_keys");
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -158,41 +207,17 @@ pub fn save_full_config(cfg: &Config) -> Result<(), String> {
 }
 
 pub fn config_get_api_key(provider: &str) -> Option<String> {
-    let path = config_path();
-    if !path.exists() { return None; }
-    let content = std::fs::read_to_string(&path).ok()?;
-    let val = crate::json::parse(&content).ok()?;
-    let obj = val.as_object()?;
-    let keys = obj.get("api_keys")?.as_object()?;
-    keys.get(provider)?.as_str().map(|s| s.to_string()).filter(|s| !s.is_empty())
+    keyring_get(provider)
 }
 
 pub fn config_has_api_key(provider: &str) -> bool {
     config_get_api_key(provider).is_some()
 }
 
-/// Remove the saved API key for `provider` from the config file.
-/// Only the `api_keys` entry is touched; everything else is preserved.
+/// Remove the saved API key for `provider` from the OS keyring.
 /// Returns Ok(true) if a key was removed, Ok(false) if none was stored.
 pub fn remove_api_key(provider: &str) -> Result<bool, String> {
-    remove_api_key_at(&config_path(), provider)
-}
-
-fn remove_api_key_at(path: &std::path::Path, provider: &str) -> Result<bool, String> {
-    use crate::json::JsonValue;
-    if !path.exists() { return Ok(false); }
-    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let mut obj = crate::json::parse(&content).map_err(|e| e.to_string())?
-        .as_object().cloned().unwrap_or_default();
-    let mut keys = match obj.get("api_keys").and_then(|v| v.as_object()) {
-        Some(k) => k.clone(),
-        None => return Ok(false),
-    };
-    if keys.remove(provider).is_none() { return Ok(false); }
-    obj.insert("api_keys".into(), JsonValue::Object(keys));
-    let output = crate::json::serialize(&JsonValue::Object(obj));
-    std::fs::write(path, &output).map_err(|e| e.to_string())?;
-    Ok(true)
+    keyring_delete(provider)
 }
 
 fn parse_config(content: &str) -> Result<Config, String> {
@@ -343,70 +368,40 @@ mod tests {
     }
 
     #[test]
-    fn test_save_config_stores_key_under_provider_name() {
-        // Use a temp config path by redirecting HOME/USERPROFILE temporarily.
-        // We don't want to clobber the real config; we just verify the in-memory
-        // behaviour by parsing a fresh config: save writes the key under the provider
-        // name, not under a hard-coded "openrouter".
-        let tmp = std::env::temp_dir().join(format!("cairn-test-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let cfg_path = tmp.join("config.json");
-        // write a minimal existing config
-        std::fs::write(&cfg_path, "{}").unwrap();
-        // emulate the save by reading, mutating, writing
-        let content = std::fs::read_to_string(&cfg_path).unwrap();
-        let mut obj: std::collections::HashMap<String, crate::json::JsonValue> =
-            crate::json::parse(&content).unwrap().as_object().cloned().unwrap_or_default();
-        obj.insert("default_provider".into(), crate::json::JsonValue::String("opencode".into()));
-        obj.insert("default_model".into(), crate::json::JsonValue::String("big-pickle".into()));
-        let mut keys = obj.get("api_keys").and_then(|v| v.as_object()).cloned().unwrap_or_default();
-        keys.insert("opencode".into(), crate::json::JsonValue::String("sk-oc-test".into()));
-        obj.insert("api_keys".into(), crate::json::JsonValue::Object(keys));
-        let out = crate::json::serialize(&crate::json::JsonValue::Object(obj));
-        std::fs::write(&cfg_path, &out).unwrap();
-
-        // Now read it back and confirm the key is under "opencode", not "openrouter".
-        let read = std::fs::read_to_string(&cfg_path).unwrap();
-        let parsed = crate::json::parse(&read).unwrap();
-        let keys = parsed.get("api_keys").and_then(|v| v.as_object()).unwrap();
-        assert_eq!(
-            keys.get("opencode").and_then(|v| v.as_str()),
-            Some("sk-oc-test"),
-            "api key must be stored under the provider name"
-        );
-        assert!(keys.get("openrouter").is_none(), "no key should be written for unrelated providers");
-
-        let _ = std::fs::remove_file(&cfg_path);
+    fn test_keyring_set_get_delete_roundtrip() {
+        // Distinctly-named test provider so this can never collide with a
+        // real stored credential.
+        let provider = "cairn-code-test-provider-roundtrip";
+        keyring_set(provider, "sk-roundtrip-test").unwrap();
+        assert_eq!(keyring_get(provider), Some("sk-roundtrip-test".to_string()));
+        assert_eq!(keyring_delete(provider), Ok(true));
+        assert_eq!(keyring_get(provider), None);
+        // Deleting again is a no-op, not an error.
+        assert_eq!(keyring_delete(provider), Ok(false));
     }
 
     #[test]
-    fn test_remove_api_key_at() {
-        let tmp = std::env::temp_dir().join(format!("cairn-test-rm-{}", std::process::id()));
+    fn test_migrate_plaintext_keys_moves_to_keyring_and_strips_file() {
+        let provider = "cairn-code-test-provider-migrate";
+        let tmp = std::env::temp_dir().join(format!("cairn-test-migrate-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let cfg_path = tmp.join("config.json");
-        std::fs::write(&cfg_path, r#"{
-            "default_provider": "openrouter",
-            "default_model": "gpt-5-mini",
-            "api_keys": { "openrouter": "sk-or-1", "opencode": "sk-oc-2" }
-        }"#).unwrap();
+        std::fs::write(&cfg_path, format!(
+            r#"{{"default_provider":"openrouter","default_model":"m","api_keys":{{"{provider}":"sk-migrate-test"}}}}"#
+        )).unwrap();
 
-        // Removing a stored key returns true and only deletes that entry.
-        assert_eq!(remove_api_key_at(&cfg_path, "openrouter"), Ok(true));
+        migrate_plaintext_keys_in_file(&cfg_path);
+
+        // The key moved into the keyring...
+        assert_eq!(keyring_get(provider), Some("sk-migrate-test".to_string()));
+        // ...and the file no longer carries it, while other settings survive.
         let content = std::fs::read_to_string(&cfg_path).unwrap();
         let parsed = crate::json::parse(&content).unwrap();
         let obj = parsed.as_object().unwrap();
-        let keys = obj.get("api_keys").and_then(|v| v.as_object()).unwrap();
-        assert!(keys.get("openrouter").is_none());
-        assert_eq!(keys.get("opencode").and_then(|v| v.as_str()), Some("sk-oc-2"));
-        assert_eq!(obj.get("default_provider").and_then(|v| v.as_str()), Some("openrouter"),
-            "other settings must be preserved");
+        assert!(obj.get("api_keys").is_none(), "api_keys must be stripped from the file after migration");
+        assert_eq!(obj.get("default_provider").and_then(|v| v.as_str()), Some("openrouter"));
 
-        // Removing a key that isn't stored is a no-op.
-        assert_eq!(remove_api_key_at(&cfg_path, "anthropic"), Ok(false));
-
-        // Missing file is a no-op, not an error.
-        assert_eq!(remove_api_key_at(&tmp.join("nope.json"), "openrouter"), Ok(false));
-
+        let _ = keyring_delete(provider);
         let _ = std::fs::remove_file(&cfg_path);
     }
 }

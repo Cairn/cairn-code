@@ -4,7 +4,6 @@ pub trait Tool: Send {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn input_schema(&self) -> String;
-    #[allow(dead_code)]
     fn needs_permission(&self) -> bool;
     fn execute(&self, input: &str) -> Result<String, String>;
     fn definition(&self) -> ToolDefinition {

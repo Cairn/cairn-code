@@ -1,4 +1,5 @@
 pub mod registry;
+pub mod workspace;
 pub mod file_read;
 pub mod file_write;
 pub mod file_edit;

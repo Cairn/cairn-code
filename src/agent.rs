@@ -106,7 +106,12 @@ impl Agent {
                             _ => AgentEvent::Text(chunk.to_string()),
                         });
                     }),
+                    cancel,
                 ).map_err(|e| format!("LLM error: {e}"))?;
+
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
 
                 self.usage.input_tokens += usage.input_tokens;
                 self.usage.output_tokens += usage.output_tokens;
@@ -136,9 +141,15 @@ impl Agent {
                 }
 
                 for tu in &tool_uses {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+
                     let _ = tx.send(AgentEvent::ToolUse(tu.name.clone(), tu.input.clone()));
 
-                    let needs_ask = self.config.ask.iter().any(|t| t == &tu.name);
+                    let tool = self.tools.get(&tu.name);
+                    let wants_permission = tool.map(|t| t.needs_permission()).unwrap_or(false);
+                    let needs_ask = wants_permission || self.config.ask.iter().any(|t| t == &tu.name);
                     let always_allowed = self.config.auto_allow.iter().any(|t| t == &tu.name);
                     let denied = self.config.is_tool_denied(&tu.name);
 
@@ -146,7 +157,17 @@ impl Agent {
                         Err(format!("Tool '{}' is denied by config", tu.name))
                     } else if needs_ask && !always_allowed {
                         let _ = tx.send(AgentEvent::PermissionRequest(tu.name.clone(), tu.input.clone()));
-                        let response = perm_rx.recv().unwrap_or_else(|_| "deny".to_string());
+                        let response = loop {
+                            match perm_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                                Ok(resp) => break resp,
+                                Err(mpsc::RecvTimeoutError::Timeout) => {
+                                    if cancel.load(Ordering::Relaxed) {
+                                        break "deny".to_string();
+                                    }
+                                }
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break "deny".to_string(),
+                            }
+                        };
                         match response.as_str() {
                             "always_allow" => {
                                 self.config.auto_allow.push(tu.name.clone());
