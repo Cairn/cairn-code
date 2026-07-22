@@ -187,6 +187,15 @@ impl Tui {
                             self.total_usage.input_tokens += u.input_tokens;
                             self.total_usage.output_tokens += u.output_tokens;
                         }
+                        AgentEvent::Compacted(n) => {
+                            self.flush_streaming();
+                            self.output_lines.push(OutputLine {
+                                type_: "system".into(),
+                                content: format!("Compacted {n} earlier messages into a summary."),
+                                tool_name: String::new(),
+                                duration: String::new(),
+                            });
+                        }
                         AgentEvent::Done => {
                             self.flush_streaming();
                             self.state = State::Idle;

@@ -30,7 +30,7 @@
 zero (`~/source/repos/zero`) is a much larger, mature agent CLI (~167k lines vs
 cairn-code's ~6k). These are gaps confirmed against it that are each a
 standalone system, not a small port:
-- Context/history compaction — messages grow unbounded per session
+- [x] Context/history compaction — proactive summarize-and-trim in `agent.rs` when input tokens hit 70% of model `max_ctx`
 - Session fork/lineage/rewind/checkpointing
 - Parallel execution of read-only tool calls
 - LSP integration (diagnostics, go-to-definition)
