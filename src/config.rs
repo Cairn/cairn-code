@@ -20,6 +20,11 @@ pub struct Config {
     /// When true, show grayed ready-to-send idle prompts in the empty composer.
     /// Default off; enable with `/suggestions on`.
     pub show_suggestions: bool,
+    /// When true, write request metadata (URL, header names, body size — never
+    /// header values, body content, or secrets) to
+    /// `~/.config/cairn-code/debug_request.json` for troubleshooting.
+    /// Off by default (H-03); can also be enabled with `CAIRN_DEBUG_HTTP=1`.
+    pub debug_log_requests: bool,
 }
 
 impl Default for Config {
@@ -37,6 +42,7 @@ impl Default for Config {
             theme: "dark".to_string(),
             show_thinking: false,
             show_suggestions: false,
+            debug_log_requests: false,
         }
     }
 }
@@ -262,6 +268,7 @@ pub fn save_full_config(cfg: &Config) -> Result<(), String> {
     obj.insert("theme".into(), JsonValue::String(cfg.theme.clone()));
     obj.insert("show_thinking".into(), JsonValue::Bool(cfg.show_thinking));
     obj.insert("show_suggestions".into(), JsonValue::Bool(cfg.show_suggestions));
+    obj.insert("debug_log_requests".into(), JsonValue::Bool(cfg.debug_log_requests));
 
     let perms = JsonValue::Object(std::collections::HashMap::from([
         ("auto_allow".into(), JsonValue::Array(cfg.auto_allow.iter().map(|s| JsonValue::String(s.clone())).collect())),
@@ -395,6 +402,9 @@ fn parse_config(content: &str) -> Result<Config, String> {
     if let Some(v) = obj.get("show_suggestions").and_then(|v| v.as_bool()) {
         cfg.show_suggestions = v;
     }
+    if let Some(v) = obj.get("debug_log_requests").and_then(|v| v.as_bool()) {
+        cfg.debug_log_requests = v;
+    }
 
     if let Some(perms) = obj.get("permissions").and_then(|v| v.as_object()) {
         if let Some(arr) = perms.get("auto_allow").and_then(|v| v.as_array()) {
@@ -432,6 +442,18 @@ mod tests {
         assert!(cfg.deny.is_empty());
         assert!(!cfg.show_thinking, "thinking hidden by default (Claude Code-style)");
         assert!(!cfg.show_suggestions, "idle suggestions off by default");
+        assert!(!cfg.debug_log_requests, "request debug logging off by default (H-03)");
+    }
+
+    #[test]
+    fn test_parse_debug_log_requests() {
+        let cfg = parse_config(r#"{"debug_log_requests": true}"#).unwrap();
+        assert!(cfg.debug_log_requests);
+        let cfg = parse_config(r#"{"debug_log_requests": false}"#).unwrap();
+        assert!(!cfg.debug_log_requests);
+        // Absent entirely -> stays off.
+        let cfg = parse_config(r#"{}"#).unwrap();
+        assert!(!cfg.debug_log_requests);
     }
 
     #[test]

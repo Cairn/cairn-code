@@ -167,7 +167,40 @@ fn now_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
+/// Global opt-in for [`debug_log_request`]. Off by default (H-03): request
+/// URLs, headers, and bodies previously landed on disk unconditionally on
+/// every provider call, with only heuristic secret redaction. Set from
+/// `Config::debug_log_requests` at startup, or via `CAIRN_DEBUG_HTTP=1`.
+static DEBUG_LOGGING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enables or disables writing request metadata for troubleshooting. Call
+/// once at startup from the loaded config; defaults to disabled otherwise.
+pub fn set_debug_logging_enabled(enabled: bool) {
+    DEBUG_LOGGING_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+fn debug_logging_enabled() -> bool {
+    if DEBUG_LOGGING_ENABLED.load(Ordering::Relaxed) {
+        return true;
+    }
+    matches!(
+        std::env::var("CAIRN_DEBUG_HTTP").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// When explicitly enabled, records request *metadata* only — URL, header
+/// names (never values), and body size — to
+/// `~/.config/cairn-code/debug_request.json`. Header values and body content
+/// (which can contain full prompts, source code, and credentials) are never
+/// written, so there is nothing here for heuristic redaction to miss. The
+/// file is overwritten (not appended) on every request, so it never
+/// accumulates history beyond the most recent call; written atomically with
+/// owner-only permissions where the OS supports it.
 fn debug_log_request(req: &HttpRequest) {
+    if !debug_logging_enabled() {
+        return;
+    }
     let dir = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
@@ -175,20 +208,39 @@ fn debug_log_request(req: &HttpRequest) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let mut dump = format!("URL: {}\n\nHeaders:\n", req.url);
-    for (k, v) in &req.headers {
-        let val = if crate::redact::is_sensitive_header(k) {
-            "[REDACTED]".to_string()
-        } else {
-            crate::redact::redact_secrets(v)
-        };
-        dump.push_str(&format!("{k}: {val}\n"));
+    write_atomic_private(&path, &debug_dump_content(req));
+}
+
+/// Pure formatting for [`debug_log_request`], split out so the "no header
+/// values, no body content" contract is easy to test without touching disk.
+fn debug_dump_content(req: &HttpRequest) -> String {
+    let header_names = req.headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ");
+    let body_bytes = req.body.as_ref().map(|b| b.len()).unwrap_or(0);
+    format!(
+        "timestamp_ms: {}\nurl: {}\nheader_names: {}\nbody_bytes: {}\n",
+        now_millis(),
+        req.url,
+        header_names,
+        body_bytes,
+    )
+}
+
+/// Writes `contents` to `path` via a same-directory temp file + rename, so a
+/// reader never observes a partial write, and restricts the file to
+/// owner-read/write where the OS supports Unix permission bits.
+fn write_atomic_private(path: &std::path::Path, contents: &str) {
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    if std::fs::write(&tmp, contents).is_err() {
+        return;
     }
-    dump.push_str("\nBody:\n");
-    if let Some(body) = &req.body {
-        dump.push_str(&crate::redact::redact_secrets(body));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
-    let _ = std::fs::write(&path, dump);
+    if std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 fn spawn_curl(req: &HttpRequest) -> Result<Child, String> {
@@ -607,5 +659,82 @@ mod tests {
     fn test_transport_error_dns() {
         let msg = format_transport_error("Could not resolve host: api.example.com");
         assert!(msg.to_ascii_lowercase().contains("dns") || msg.to_ascii_lowercase().contains("network"), "{msg}");
+    }
+
+    /// H-03 regression: request logging must be off unless explicitly
+    /// enabled, either via config (`set_debug_logging_enabled`) or the
+    /// `CAIRN_DEBUG_HTTP` escape hatch.
+    #[test]
+    fn debug_logging_disabled_by_default() {
+        set_debug_logging_enabled(false);
+        std::env::remove_var("CAIRN_DEBUG_HTTP");
+        assert!(!debug_logging_enabled());
+    }
+
+    #[test]
+    fn debug_logging_enabled_via_config_flag() {
+        set_debug_logging_enabled(true);
+        assert!(debug_logging_enabled());
+        set_debug_logging_enabled(false);
+        assert!(!debug_logging_enabled());
+    }
+
+    #[test]
+    fn debug_logging_enabled_via_env_var() {
+        set_debug_logging_enabled(false);
+        std::env::set_var("CAIRN_DEBUG_HTTP", "1");
+        assert!(debug_logging_enabled());
+        std::env::remove_var("CAIRN_DEBUG_HTTP");
+        assert!(!debug_logging_enabled());
+    }
+
+    /// H-03: even when logging is enabled, the dump must never contain
+    /// header values or body content — only metadata — so heuristic secret
+    /// redaction has nothing left to fail to catch.
+    #[test]
+    fn debug_dump_never_contains_header_values_or_body() {
+        let req = HttpRequest {
+            url: "https://api.example.com/v1/messages".into(),
+            headers: vec![
+                ("Authorization".into(), "Bearer sk-ant-supersecretvalue123456".into()),
+                ("Content-Type".into(), "application/json".into()),
+            ],
+            body: Some(r#"{"prompt":"delete all my files","api_key":"sk-supersecret"}"#.into()),
+        };
+        let dump = debug_dump_content(&req);
+
+        assert!(dump.contains("api.example.com"), "{dump}");
+        assert!(dump.contains("Authorization"), "header *names* are metadata: {dump}");
+        assert!(dump.contains("Content-Type"), "{dump}");
+        assert!(!dump.contains("sk-ant-supersecretvalue123456"), "leaked header value: {dump}");
+        assert!(!dump.contains("sk-supersecret"), "leaked body secret: {dump}");
+        assert!(!dump.contains("delete all my files"), "leaked prompt content: {dump}");
+        assert!(dump.contains("body_bytes"), "{dump}");
+    }
+
+    #[test]
+    fn write_atomic_private_is_atomic_and_owner_only() {
+        let dir = std::env::temp_dir().join(format!("cairn-http-client-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("debug_request.json");
+
+        write_atomic_private(&path, "first");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+
+        write_atomic_private(&path, "second");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "second",
+            "second write should fully replace the first, not append or corrupt it"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "debug log must be owner-read/write only, got {mode:o}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
