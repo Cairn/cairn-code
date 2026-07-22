@@ -1431,22 +1431,68 @@ impl Tui {
                     lines.extend(crate::markdown::render(&line.content));
                 }
                 "tool_use" => {
-                    let inner = if line.content.len() > 80 { format!("\n  {}", line.content) } else { format!("({})", line.content) };
                     lines.push(Line::from(vec![
-                        Span::styled("● ", white), Span::raw(&line.tool_name), Span::styled(inner, dim),
+                        Span::styled("● ", white),
+                        Span::raw(&line.tool_name),
                     ]));
+                    // Multi-line args (pretty JSON) need separate Lines; a single
+                    // Line with embedded \n does not wrap as real newlines in ratatui.
+                    let arg = line.content.trim();
+                    if !arg.is_empty() {
+                        let shown = if arg.chars().count() > 240 {
+                            let head: String = arg.chars().take(240).collect();
+                            format!("{head}…")
+                        } else {
+                            arg.to_string()
+                        };
+                        for part in shown.split('\n') {
+                            lines.push(Line::from(vec![
+                                Span::styled(format!("  {part}"), dim),
+                            ]));
+                        }
+                    }
                 }
                 "tool_result" => {
-                    let content = if line.content.len() > 500 { format!("{}... [truncated]", &line.content[..500]) } else { line.content.clone() };
-                    let is_err = line.content.starts_with("Error:");
+                    let is_err = line.content.starts_with("Error:")
+                        || line.content.contains("exit code")
+                            && !line.content.contains("(exit code 0)");
                     let color = if is_err { red } else { green };
-                    let dur = if line.duration.is_empty() { String::new() } else { format!(" ({})", line.duration) };
-                    lines.push(Line::from(vec![Span::styled("● ", color), Span::styled(format!("{}{dur}", line.tool_name), dim)]));
-                    lines.push(Line::from(vec![Span::styled(format!("  {content}"), dim)]));
+                    let dur = if line.duration.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", line.duration)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled("● ", color),
+                        Span::styled(format!("{}{dur}", line.tool_name), dim),
+                    ]));
+                    // Head+tail so long command output stays readable and keeps the footer.
+                    let display = truncate_display(&line.content, 80, 40);
+                    for part in display.split('\n') {
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("  {part}"), dim),
+                        ]));
+                    }
                 }
-                "error" => lines.push(Line::from(vec![Span::styled(format!("● {}", line.content), red)])),
-                "system" => lines.push(Line::from(vec![Span::styled(&line.content, dim)])),
-                _ => lines.push(Line::from(Span::raw(&line.content))),
+                "error" => {
+                    for (i, part) in line.content.split('\n').enumerate() {
+                        if i == 0 {
+                            lines.push(Line::from(vec![Span::styled(format!("● {part}"), red)]));
+                        } else {
+                            lines.push(Line::from(vec![Span::styled(format!("  {part}"), red)]));
+                        }
+                    }
+                }
+                "system" => {
+                    for part in line.content.split('\n') {
+                        lines.push(Line::from(vec![Span::styled(part, dim)]));
+                    }
+                }
+                _ => {
+                    for part in line.content.split('\n') {
+                        lines.push(Line::from(Span::raw(part)));
+                    }
+                }
             }
         }
 
@@ -1897,6 +1943,30 @@ fn total_wrapped(lines: &[Line], width: usize) -> usize {
         let line_w: usize = l.spans.iter().map(|s| display_width(&s.content)).sum();
         if line_w == 0 { 1 } else { (line_w + w - 1) / w }
     }).sum()
+}
+
+/// Limit on-screen tool output by line count (head + tail) so long shell
+/// dumps stay readable and keep the trailing summary / exit code.
+fn truncate_display(s: &str, head_lines: usize, tail_lines: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.len() <= head_lines + tail_lines {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for line in &lines[..head_lines] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let omitted = lines.len() - head_lines - tail_lines;
+    out.push_str(&format!("  … ({omitted} lines omitted) …\n"));
+    for line in &lines[lines.len() - tail_lines..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 
