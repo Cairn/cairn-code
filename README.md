@@ -1,12 +1,13 @@
 # Cairn Code
 
+[![CI](https://github.com/Cairn/cairn-code/actions/workflows/ci.yml/badge.svg)](https://github.com/Cairn/cairn-code/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-1.96-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Providers](https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20OpenRouter%20%7C%20OpenGateway%20%7C%20xAI%20%7C%20Ollama-blue)](#)
 [![TUI](https://img.shields.io/badge/TUI-ratatui-yellow)](https://ratatui.rs/)
 [![Tools](https://img.shields.io/badge/tools-13-brightgreen)](#)
 
-A Rust-based CLI LLM coding agent, inspired by Claude Code. Built by Cairn.
+A Rust-based CLI LLM coding agent, inspired by Claude Code and Zero. Built by Cairn.
 
 ## Features
 

@@ -85,6 +85,7 @@ fn main() {
     let p_model_for_print = p_model.clone();
     let theme_name = cfg.theme.clone();
     let show_thinking = cfg.show_thinking;
+    let show_suggestions = cfg.show_suggestions;
 
     thread::spawn(move || {
         let mut agent = Agent::new(chosen_provider, p_model_for_agent, tool_registry, cfg);
@@ -192,6 +193,7 @@ fn main() {
     let mut tui = tui::Tui::new(version, &p_model_for_print, &provider_name_str, &work_dir);
     tui.set_theme_name(&theme_name);
     tui.set_show_thinking(show_thinking);
+    tui.set_show_suggestions(show_suggestions);
     tui.set_agent_tx(cmd_tx.clone());
     tui.set_perm_tx(perm_tx);
     tui.set_cancel_flag(cancel);

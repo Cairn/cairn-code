@@ -1,11 +1,11 @@
-use std::io::stdout;
+use std::io::{self, stdout, Write};
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui::{
-    Frame,
+    DefaultTerminal, Frame,
     crossterm::{
         event::{
             DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -18,6 +18,15 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Paragraph, Wrap},
 };
+
+/// What to dump in plain-text select mode (outside the alternate screen).
+#[derive(Clone, Copy)]
+enum SelectDump {
+    /// Most recent assistant message (or in-progress stream).
+    LastAssistant,
+    /// Full session transcript as plain text.
+    FullTranscript,
+}
 
 use crate::llm;
 use crate::session;
@@ -129,6 +138,13 @@ pub struct Tui {
     /// When true, stream + keep full thinking blocks. When false (default), only
     /// a short "Thought for …" marker is kept after each think phase.
     show_thinking: bool,
+    /// When true, show grayed idle ready-to-send prompts. Default off.
+    show_suggestions: bool,
+    /// When true, terminal mouse capture is on (wheel scrolls transcript, but
+    /// native drag-select is blocked). Default off so LLM text is selectable.
+    mouse_capture: bool,
+    /// Leave the TUI and print plain text so the terminal can select/copy freely.
+    pending_select: Option<SelectDump>,
     /// Wall clock for the current in-flight thinking stream (for duration labels).
     thinking_started: Option<Instant>,
 }
@@ -167,8 +183,9 @@ impl Tui {
             cmd_picker_list: vec![
                 "/auth".into(), "/clear".into(), "/compact".into(), "/cost".into(), "/delete".into(),
                 "/exit".into(), "/help".into(), "/model".into(), "/provider".into(), "/quit".into(),
-                "/q".into(), "/resume".into(), "/save".into(), "/sessions".into(), "/theme".into(),
-                "/thinking".into(),
+                "/copy".into(), "/q".into(), "/resume".into(), "/save".into(), "/select".into(),
+                "/sessions".into(), "/suggestions".into(), "/theme".into(), "/thinking".into(),
+                "/mouse".into(),
             ],
             cmd_picker_filtered: Vec::new(),
             cmd_picker_sel: 0,
@@ -201,8 +218,11 @@ impl Tui {
             session_created_at: 0,
             live_mirror: None,
             expect_turn_notify: false,
-            idle_suggestion: Some(default_empty_suggestion().into()),
+            idle_suggestion: None,
             show_thinking: false,
+            show_suggestions: false,
+            mouse_capture: false,
+            pending_select: None,
             thinking_started: None,
         }
     }
@@ -223,6 +243,140 @@ impl Tui {
         self.show_thinking = show;
     }
 
+    pub fn set_show_suggestions(&mut self, show: bool) {
+        self.show_suggestions = show;
+        if show {
+            self.refresh_idle_suggestion();
+        } else {
+            self.idle_suggestion = None;
+        }
+    }
+
+    fn set_mouse_capture(&mut self, on: bool) {
+        if on == self.mouse_capture {
+            return;
+        }
+        self.mouse_capture = on;
+        if on {
+            let _ = execute!(stdout(), EnableMouseCapture);
+        } else {
+            let _ = execute!(stdout(), DisableMouseCapture);
+        }
+    }
+
+    /// Copy the most recent assistant text to the OS clipboard.
+    fn copy_last_assistant_to_clipboard(&mut self) {
+        let owned = self.last_assistant_text();
+        let Some(text) = owned.as_deref().filter(|s| !s.trim().is_empty()) else {
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: "Nothing to copy (no assistant message yet). Try /select to open plain-text view."
+                    .into(),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        };
+        match copy_text_to_clipboard(text) {
+            Ok(how) => {
+                let n = text.chars().count();
+                self.output_lines.push(OutputLine {
+                    type_: "system".into(),
+                    content: format!(
+                        "Copied last assistant message ({n} chars via {how}). For drag-select use /select (Ctrl+O)."
+                    ),
+                    tool_name: String::new(),
+                    duration: String::new(),
+                });
+            }
+            Err(e) => {
+                self.output_lines.push(OutputLine {
+                    type_: "system".into(),
+                    content: format!("Copy failed: {e}. Use /select (Ctrl+O) to drag-select instead."),
+                    tool_name: String::new(),
+                    duration: String::new(),
+                });
+            }
+        }
+    }
+
+    fn last_assistant_text(&self) -> Option<String> {
+        if let Some(l) = self
+            .output_lines
+            .iter()
+            .rev()
+            .find(|l| l.type_ == "text" && !l.content.trim().is_empty())
+        {
+            return Some(l.content.clone());
+        }
+        if !self.streaming_text.trim().is_empty() {
+            return Some(self.streaming_text.clone());
+        }
+        None
+    }
+
+    fn select_dump_text(&self, kind: SelectDump) -> String {
+        match kind {
+            SelectDump::LastAssistant => self
+                .last_assistant_text()
+                .unwrap_or_else(|| "(no assistant message yet)".into()),
+            SelectDump::FullTranscript => {
+                let mut out = String::new();
+                for line in &self.output_lines {
+                    match line.type_.as_str() {
+                        "user" => {
+                            out.push_str("› ");
+                            out.push_str(&line.content);
+                            out.push_str("\n\n");
+                        }
+                        "text" => {
+                            out.push_str(&line.content);
+                            out.push_str("\n\n");
+                        }
+                        "thinking" => {
+                            out.push_str("── Thinking ──\n");
+                            out.push_str(&line.content);
+                            out.push_str("\n\n");
+                        }
+                        "thinking_summary" => {
+                            out.push_str("✦ ");
+                            out.push_str(&line.content);
+                            out.push('\n');
+                        }
+                        "tool_use" => {
+                            out.push_str(&format!("● {} {}\n", line.tool_name, line.content));
+                        }
+                        "tool_result" => {
+                            out.push_str(&format!("● {} result:\n{}\n", line.tool_name, line.content));
+                        }
+                        "error" => {
+                            out.push_str("Error: ");
+                            out.push_str(&line.content);
+                            out.push('\n');
+                        }
+                        "system" => {
+                            out.push_str(&line.content);
+                            out.push('\n');
+                        }
+                        _ => {
+                            out.push_str(&line.content);
+                            out.push('\n');
+                        }
+                    }
+                }
+                if !self.streaming_text.is_empty() {
+                    out.push_str(&self.streaming_text);
+                    out.push('\n');
+                }
+                if out.trim().is_empty() {
+                    "(empty session)".into()
+                } else {
+                    out
+                }
+            }
+        }
+    }
+
     pub fn set_agent_tx(&mut self, tx: mpsc::Sender<String>) {
         self.agent_tx = Some(tx);
     }
@@ -238,9 +392,11 @@ impl Tui {
     pub fn run(&mut self, rx: mpsc::Receiver<AgentEvent>) -> Result<(), String> {
         let mut terminal = ratatui::init();
         terminal.clear().map_err(|e| e.to_string())?;
-        // Mouse wheel scroll works on Windows / macOS / Linux terminals that
-        // support it (same idea as videre's cross-platform input layer).
-        let _ = execute!(stdout(), EnableMouseCapture);
+        // Force mouse tracking off. On Windows Terminal, VT mouse mode (or leftover
+        // ENABLE_MOUSE_INPUT) blocks drag-select even if we never call EnableMouseCapture.
+        let _ = execute!(stdout(), DisableMouseCapture);
+        // Keyboard scroll: PgUp/PgDn, Ctrl+U/D, Ctrl+Home/End.
+        // Drag-select in the alt-screen is unreliable on WT; use /select (Ctrl+O).
 
         let mut result = Ok(());
         let mut last_spinner_update = std::time::Instant::now();
@@ -426,6 +582,23 @@ impl Tui {
                 }
             }
 
+            // Plain-text select mode: leave alt-screen so Windows Terminal (and
+            // others) can drag-select freely, then re-enter the TUI.
+            if let Some(kind) = self.pending_select.take() {
+                let text = self.select_dump_text(kind);
+                if let Err(e) = enter_plain_select_mode(&mut terminal, &text) {
+                    result = Err(e);
+                    break 'outer;
+                }
+                if self.mouse_capture {
+                    let _ = execute!(stdout(), EnableMouseCapture);
+                } else {
+                    let _ = execute!(stdout(), DisableMouseCapture);
+                }
+                needs_rebuild = true;
+                self.dirty = true;
+            }
+
             if needs_rebuild {
                 let _ = terminal.clear();
                 needs_rebuild = false;
@@ -449,7 +622,9 @@ impl Tui {
 
         // Persist conversation on clean exit so the last session is not lost.
         self.autosave_session(false);
-        let _ = execute!(stdout(), DisableMouseCapture);
+        if self.mouse_capture {
+            let _ = execute!(stdout(), DisableMouseCapture);
+        }
         ratatui::restore();
         result
     }
@@ -568,6 +743,20 @@ impl Tui {
                 }
                 KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.transcript_follow = true;
+                    return true;
+                }
+                // Copy last assistant message to the system clipboard.
+                KeyCode::Char('y') | KeyCode::Char('Y')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.copy_last_assistant_to_clipboard();
+                    return true;
+                }
+                // Plain-text select mode (reliable drag-select on Windows Terminal).
+                KeyCode::Char('o') | KeyCode::Char('O')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.pending_select = Some(SelectDump::LastAssistant);
                     return true;
                 }
                 _ => {}
@@ -1095,6 +1284,92 @@ impl Tui {
                     duration: String::new(),
                 });
             }
+            "/suggestions" => {
+                let arg = parts.get(1).map(|s| s.to_ascii_lowercase());
+                let next = match arg.as_deref() {
+                    Some("on" | "true" | "1" | "show" | "enable") => true,
+                    Some("off" | "false" | "0" | "hide" | "disable") => false,
+                    Some(other) => {
+                        self.output_lines.push(OutputLine {
+                            type_: "system".into(),
+                            content: format!(
+                                "Unknown /suggestions option '{other}'. Use /suggestions, /suggestions on, or /suggestions off."
+                            ),
+                            tool_name: String::new(),
+                            duration: String::new(),
+                        });
+                        return;
+                    }
+                    None => !self.show_suggestions,
+                };
+                self.set_show_suggestions(next);
+                let _ = crate::config::save_show_suggestions(self.show_suggestions);
+                let state = if self.show_suggestions { "on" } else { "off" };
+                let detail = if self.show_suggestions {
+                    "Grayed ready-to-send prompts appear when the composer is empty (Tab/→ to accept)."
+                } else {
+                    "Idle composer stays blank (default)."
+                };
+                self.output_lines.push(OutputLine {
+                    type_: "system".into(),
+                    content: format!("Suggestions: {state}. {detail}"),
+                    tool_name: String::new(),
+                    duration: String::new(),
+                });
+            }
+            "/mouse" => {
+                let arg = parts.get(1).map(|s| s.to_ascii_lowercase());
+                let next = match arg.as_deref() {
+                    Some("on" | "true" | "1" | "enable") => true,
+                    Some("off" | "false" | "0" | "disable") => false,
+                    Some(other) => {
+                        self.output_lines.push(OutputLine {
+                            type_: "system".into(),
+                            content: format!(
+                                "Unknown /mouse option '{other}'. Use /mouse, /mouse on, or /mouse off."
+                            ),
+                            tool_name: String::new(),
+                            duration: String::new(),
+                        });
+                        return;
+                    }
+                    None => !self.mouse_capture,
+                };
+                self.set_mouse_capture(next);
+                let state = if self.mouse_capture { "on" } else { "off" };
+                let detail = if self.mouse_capture {
+                    "Wheel scrolls the transcript. Drag-select is blocked; use Shift+drag in some terminals, or /mouse off."
+                } else {
+                    "Drag-select and copy LLM text with the mouse (default). Scroll with PgUp/PgDn or Ctrl+U/D."
+                };
+                self.output_lines.push(OutputLine {
+                    type_: "system".into(),
+                    content: format!("Mouse capture: {state}. {detail}"),
+                    tool_name: String::new(),
+                    duration: String::new(),
+                });
+            }
+            "/copy" => {
+                self.copy_last_assistant_to_clipboard();
+            }
+            "/select" => {
+                let kind = match parts.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+                    Some("all" | "full" | "session") => SelectDump::FullTranscript,
+                    Some("last" | "reply" | "assistant") | None => SelectDump::LastAssistant,
+                    Some(other) => {
+                        self.output_lines.push(OutputLine {
+                            type_: "system".into(),
+                            content: format!(
+                                "Unknown /select option '{other}'. Use /select, /select last, or /select all."
+                            ),
+                            tool_name: String::new(),
+                            duration: String::new(),
+                        });
+                        return;
+                    }
+                };
+                self.pending_select = Some(kind);
+            }
             "/model" => {
                 if parts.len() > 1 {
                     self.model = parts[1..].join(" ");
@@ -1164,7 +1439,7 @@ impl Tui {
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /auth /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions /theme /thinking\n/thinking [on|off] — show full thinking (on) or short Thought-for lines only (off, default)\nTab completes slash commands; Tab/→ accepts the grayed ready-to-send prompt when empty\nSounds: done/attention beeps (CAIRN_SOUND=0 to mute)\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)\nScroll: mouse wheel · PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End\n/provider xai — browser OAuth; /auth login xai; /auth key xai for API key".into(),
+                    content: "Commands: /auth /clear /compact /copy /cost /delete /exit /help /model /mouse /provider /resume /save /select /sessions /suggestions /theme /thinking\n/select [last|all] or Ctrl+O — plain-text view for drag-select/copy (best on Windows Terminal)\n/copy or Ctrl+Y — copy last assistant message to clipboard\n/mouse [on|off] — wheel scroll (on) vs no mouse capture (off, default)\n/thinking [on|off] · /suggestions [on|off]\nTab completes slash commands\nSounds: CAIRN_SOUND=0 to mute · Scroll: PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End\n/provider xai — browser OAuth; /auth login xai; /auth key xai for API key".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
             }
@@ -2522,6 +2797,10 @@ impl Tui {
 
     /// Refresh the grayed ready-to-send prompt in the empty composer.
     fn refresh_idle_suggestion(&mut self) {
+        if !self.show_suggestions {
+            self.idle_suggestion = None;
+            return;
+        }
         if !self.input_buf.is_empty() || !matches!(self.state, State::Idle) {
             return;
         }
@@ -2657,7 +2936,142 @@ fn completion_wants_trailing_space(completion: &str) -> bool {
             | "/resume"
             | "/delete"
             | "/thinking"
+            | "/suggestions"
+            | "/mouse"
     )
+}
+
+/// Leave the ratatui alt-screen and print plain text so the host terminal can
+/// drag-select (Windows Terminal does not reliably select inside a redrawing TUI).
+fn enter_plain_select_mode(terminal: &mut DefaultTerminal, text: &str) -> Result<(), String> {
+    // Drop mouse capture and leave alt-screen / raw mode.
+    let _ = execute!(stdout(), DisableMouseCapture);
+    // restore() disables raw mode and leaves the alternate screen.
+    ratatui::restore();
+
+    let mut out = stdout();
+    let _ = writeln!(
+        out,
+        "\n======== Cairn select mode ========\n\
+         Drag to highlight, then copy (Ctrl+Shift+C in Windows Terminal).\n\
+         Press Enter to return to Cairn.\n\
+         ==================================\n"
+    );
+    let _ = writeln!(out, "{text}");
+    let _ = writeln!(
+        out,
+        "\n======== end — press Enter to return ========\n"
+    );
+    let _ = out.flush();
+
+    // stdin is cooked again after disable_raw_mode; block until Enter.
+    let mut line = String::new();
+    let _ = io::stdin().read_line(&mut line);
+
+    *terminal = ratatui::init();
+    terminal.clear().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Best-effort clipboard write: Windows PowerShell first, then OSC 52.
+fn copy_text_to_clipboard(text: &str) -> Result<&'static str, String> {
+    #[cfg(windows)]
+    {
+        if copy_text_windows_clipboard(text).is_ok() {
+            return Ok("Windows clipboard");
+        }
+    }
+    copy_text_osc52(text)?;
+    Ok("OSC 52")
+}
+
+#[cfg(windows)]
+fn copy_text_windows_clipboard(text: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    // Temp UTF-8 file avoids command-line length limits and quoting issues.
+    let path = std::env::temp_dir().join(format!(
+        "cairn-clip-{}.txt",
+        std::process::id()
+    ));
+    std::fs::write(&path, text).map_err(|e| format!("write temp clip file: {e}"))?;
+    let path_str = path.to_string_lossy().replace('\'', "''");
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "Get-Content -LiteralPath '{path_str}' -Raw -Encoding utf8 | Set-Clipboard"
+            ),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .map_err(|e| format!("powershell: {e}"))?;
+    let _ = std::fs::remove_file(&path);
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Set-Clipboard exited {status}"))
+    }
+}
+
+/// OSC 52 clipboard write (base64 payload). No external crate.
+fn copy_text_osc52(text: &str) -> Result<(), String> {
+    let b64 = base64_encode(text.as_bytes());
+    // BEL-terminated form is widely supported (Windows Terminal, iTerm2, kitty, …).
+    let seq = format!("\x1b]52;c;{b64}\x07");
+    let mut out = stdout();
+    out.write_all(seq.as_bytes())
+        .map_err(|e| format!("write OSC 52: {e}"))?;
+    out.flush().map_err(|e| format!("flush OSC 52: {e}"))
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(T[((n >> 6) & 63) as usize] as char);
+        out.push(T[(n & 63) as usize] as char);
+        i += 3;
+    }
+    match data.len() - i {
+        1 => {
+            let n = (data[i] as u32) << 16;
+            out.push(T[((n >> 18) & 63) as usize] as char);
+            out.push(T[((n >> 12) & 63) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
+            out.push(T[((n >> 18) & 63) as usize] as char);
+            out.push(T[((n >> 12) & 63) as usize] as char);
+            out.push(T[((n >> 6) & 63) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+
+    #[test]
+    fn base64_encode_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
 }
 
 /// Contextual slash-command completions for the composer.
@@ -2706,17 +3120,18 @@ pub(crate) fn slash_completions(
     };
 
     match cmd.as_str() {
-        "/thinking" => {
+        "/thinking" | "/suggestions" | "/mouse" => {
+            let root = cmd.as_str();
             let opts = ["on", "off"];
             if parts.len() == 1 && ends_with_space {
-                return opts.iter().map(|s| format!("/thinking {s}")).collect();
+                return opts.iter().map(|s| format!("{root} {s}")).collect();
             }
             if parts.len() == 2 && !ends_with_space {
                 let p = parts[1].to_ascii_lowercase();
                 return opts
                     .iter()
                     .filter(|s| s.starts_with(&p))
-                    .map(|s| format!("/thinking {s}"))
+                    .map(|s| format!("{root} {s}"))
                     .collect();
             }
             Vec::new()
@@ -2866,9 +3281,32 @@ mod completion_tests {
             "/provider".into(),
             "/resume".into(),
             "/delete".into(),
+            "/suggestions".into(),
             "/theme".into(),
             "/thinking".into(),
+            "/mouse".into(),
+            "/copy".into(),
+            "/select".into(),
         ]
+    }
+
+    #[test]
+    fn completes_suggestions_toggle() {
+        let c = slash_completions("/sugg", &base(), &[], &[], &[], &[]);
+        assert_eq!(c, vec!["/suggestions".to_string()]);
+        let c = slash_completions("/suggestions ", &base(), &[], &[], &[], &[]);
+        assert!(c.iter().any(|x| x == "/suggestions on"));
+        assert!(c.iter().any(|x| x == "/suggestions off"));
+    }
+
+    #[test]
+    fn completes_mouse_toggle() {
+        let c = slash_completions("/mo", &base(), &[], &[], &[], &[]);
+        // /model and /mouse both match /mo
+        assert!(c.iter().any(|x| x == "/mouse") || c.iter().any(|x| x == "/model"), "{c:?}");
+        let c = slash_completions("/mouse ", &base(), &[], &[], &[], &[]);
+        assert!(c.iter().any(|x| x == "/mouse on"));
+        assert!(c.iter().any(|x| x == "/mouse off"));
     }
 
     #[test]
@@ -2900,6 +3338,9 @@ mod completion_tests {
     #[test]
     fn completes_root_command_prefix() {
         let c = slash_completions("/mo", &base(), &[], &[], &[], &[]);
+        assert!(c.contains(&"/model".to_string()), "{c:?}");
+        assert!(c.contains(&"/mouse".to_string()), "{c:?}");
+        let c = slash_completions("/mod", &base(), &[], &[], &[], &[]);
         assert_eq!(c, vec!["/model".to_string()]);
     }
 
