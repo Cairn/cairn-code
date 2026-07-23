@@ -5,6 +5,8 @@ pub trait Tool: Send {
     fn description(&self) -> &str;
     fn input_schema(&self) -> String;
     fn needs_permission(&self) -> bool;
+    fn needs_permission_for(&self, _input: &str) -> bool { self.needs_permission() }
+    fn permission_key(&self, _input: &str) -> String { self.name().to_string() }
     fn execute(&self, input: &str) -> Result<String, String>;
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -29,7 +31,10 @@ impl Registry {
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
+        self.tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|t| t.as_ref())
     }
 
     #[allow(dead_code)]
@@ -54,7 +59,11 @@ impl Registry {
 
 pub fn default_registry() -> Registry {
     let mut r = Registry::new();
-    r.register(Box::new(crate::tools::file_read::FileReadTool));
+    let workspace = crate::tools::workspace::Workspace::current()
+        .expect("current directory must be a readable workspace");
+    r.register(Box::new(crate::tools::file_read::FileReadTool::new(
+        workspace.clone(),
+    )));
     r.register(Box::new(crate::tools::file_write::FileWriteTool));
     r.register(Box::new(crate::tools::file_edit::FileEditTool));
     r.register(Box::new(crate::tools::file_undo::FileUndoTool));
@@ -63,8 +72,10 @@ pub fn default_registry() -> Registry {
     r.register(Box::new(crate::tools::python_tool::PythonTool));
     r.register(Box::new(crate::tools::go_tool::GoTool));
     r.register(Box::new(crate::tools::git_tool::GitTool));
-    r.register(Box::new(crate::tools::glob_tool::GlobTool));
-    r.register(Box::new(crate::tools::grep_tool::GrepTool));
+    r.register(Box::new(crate::tools::glob_tool::GlobTool::new(
+        workspace.clone(),
+    )));
+    r.register(Box::new(crate::tools::grep_tool::GrepTool::new(workspace)));
     r.register(Box::new(crate::tools::web_search::WebSearchTool));
     r.register(Box::new(crate::tools::web_fetch::WebFetchTool));
     r.register(Box::new(crate::tools::todo::TodoTool));

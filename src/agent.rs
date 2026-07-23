@@ -92,8 +92,6 @@ impl Agent {
         let provider = providers.remove(provider_name).ok_or_else(|| format!("Unknown provider: {provider_name}"))?;
         self.provider = provider;
         self.model = model.to_string();
-        self.messages.clear();
-        self.usage = Usage::default();
         self.last_input_tokens = 0;
         self.sync_live_mirror();
         Ok(())
@@ -336,7 +334,7 @@ impl Agent {
     /// Applies the deny/ask/auto_allow policy to a tool call and, if
     /// permitted, executes it. This is the single authorization path shared
     /// by the interactive TUI loop and print (`--print`) mode, so a tool
-    /// cannot bypass deny lists or `needs_permission()` by going through one
+    /// cannot bypass deny lists or `needs_permission_for()` by going through one
     /// path instead of the other.
     ///
     /// `interactive` carries the channels needed to prompt a human for
@@ -352,9 +350,12 @@ impl Agent {
         interactive: Option<(&mpsc::Sender<AgentEvent>, &AtomicBool, &mpsc::Receiver<String>)>,
     ) -> Result<String, String> {
         let tool = self.tools.get(&tu.name);
-        let wants_permission = tool.map(|t| t.needs_permission()).unwrap_or(false);
+        let wants_permission = tool.map(|t| t.needs_permission_for(&tu.input)).unwrap_or(false);
         let needs_ask = wants_permission || self.config.ask.iter().any(|t| t == &tu.name);
-        let always_allowed = self.config.auto_allow.iter().any(|t| t == &tu.name);
+        let permission_key = tool
+            .map(|t| t.permission_key(&tu.input))
+            .unwrap_or_else(|| tu.name.clone());
+        let always_allowed = self.config.auto_allow.iter().any(|t| t == &permission_key);
         let denied = self.config.is_tool_denied(&tu.name);
 
         if denied {
@@ -387,7 +388,9 @@ impl Agent {
         };
         match response.as_str() {
             "always_allow" => {
-                self.config.auto_allow.push(tu.name.clone());
+                if !always_allowed {
+                    self.config.auto_allow.push(permission_key);
+                }
                 let _ = crate::config::save_full_config(&self.config);
                 self.dispatch_tool(tu)
             }
@@ -589,6 +592,58 @@ mod tests {
         assert!(t.contains("assistant: hi"));
         assert!(t.contains("assistant [tool call]: grep("));
         assert!(t.contains("tool result: matches"));
+    }
+
+    #[test]
+    fn provider_and_model_switches_preserve_history_usage_and_live_mirror() {
+        let mut agent = Agent::new(
+            Box::new(crate::llm::ollama::OllamaProvider::new()),
+            "llama3.2".into(),
+            crate::tools::registry::Registry::new(),
+            crate::config::Config::default(),
+        );
+        let history = vec![
+            text("user", "inspect src/main.rs"),
+            tool_use("read", r#"{"path":"src/main.rs"}"#),
+            tool_result("fn main() {}"),
+            text("assistant", "done"),
+        ];
+        let usage = Usage {
+            input_tokens: 120,
+            output_tokens: 30,
+            cache_read: 10,
+            cache_create: 5,
+        };
+        let mirror = crate::session::new_live_mirror();
+        agent.set_live_mirror(mirror.clone());
+        agent.set_state(history, usage);
+
+        agent.switch_provider("openai", "gpt-5-mini").unwrap();
+
+        assert_eq!(agent.provider_name(), "openai");
+        assert_eq!(agent.model(), "gpt-5-mini");
+        assert_eq!(agent.messages().len(), 4);
+        assert!(matches!(&agent.messages()[0].content, Content::Text(t) if t == "inspect src/main.rs"));
+        assert!(matches!(&agent.messages()[1].content, Content::ToolUse(tu) if tu.name == "read"));
+        assert!(matches!(&agent.messages()[2].content, Content::ToolResult(tr) if tr.content == "fn main() {}"));
+        assert!(matches!(&agent.messages()[3].content, Content::Text(t) if t == "done"));
+        assert_eq!(agent.usage().input_tokens, 120);
+        assert_eq!(agent.usage().output_tokens, 30);
+        assert_eq!(agent.usage().cache_read, 10);
+        assert_eq!(agent.usage().cache_create, 5);
+
+        let snapshot = mirror.lock().unwrap();
+        assert_eq!(snapshot.messages.len(), 4);
+        assert_eq!(snapshot.tokens_in, 120);
+        assert_eq!(snapshot.tokens_out, 30);
+        drop(snapshot);
+
+        agent.switch_provider("openai", "gpt-4.1-mini").unwrap();
+
+        assert_eq!(agent.model(), "gpt-4.1-mini");
+        assert_eq!(agent.messages().len(), 4);
+        assert_eq!(agent.usage().input_tokens, 120);
+        assert_eq!(mirror.lock().unwrap().messages.len(), 4);
     }
 
     /// Live-exercises proactive compaction without a network call: first stream

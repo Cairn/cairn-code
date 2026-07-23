@@ -92,9 +92,6 @@ fn main() {
         agent.set_live_mirror(live_mirror_agent);
         loop {
             match cmd_rx.recv() {
-                Ok(cmd) if cmd == "cancel" => {
-                    cancel2.store(true, Ordering::Relaxed);
-                }
                 Ok(cmd) if cmd.starts_with("__switch__:") => {
                     let rest = cmd.trim_start_matches("__switch__:");
                     if let Some((prov, modl)) = rest.split_once(':') {
@@ -143,7 +140,7 @@ fn main() {
                                 );
                                 let _ = event_tx.send(AgentEvent::Text(notice));
                                 crate::oauth::open_url(&uri);
-                                match crate::oauth::poll_xai_device_token(&auth) {
+                                match crate::oauth::poll_xai_device_token(&auth, &cancel2) {
                                     Ok(token) => {
                                         match crate::oauth::save_token("xai", &token) {
                                             Ok(()) => {
