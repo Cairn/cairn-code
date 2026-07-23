@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::json::{self, JsonValue};
 use super::McpServerConfig;
+use crate::json::{self, JsonValue};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const INIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -29,7 +29,7 @@ struct Pending {
 
 pub struct McpClient {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     pending: Arc<Mutex<HashMap<u64, Pending>>>,
     next_id: AtomicU64,
     server_name: String,
@@ -84,7 +84,7 @@ impl McpClient {
 
         let mut client = McpClient {
             child,
-            stdin,
+            stdin: Some(stdin),
             pending,
             next_id: AtomicU64::new(1),
             server_name: server_name.to_string(),
@@ -227,11 +227,15 @@ impl McpClient {
     }
 
     fn write_message(&mut self, msg: &JsonValue) -> Result<(), String> {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| format!("MCP {}: stdin closed", self.server_name))?;
         let line = format!("{msg}\n");
-        self.stdin
+        stdin
             .write_all(line.as_bytes())
             .map_err(|e| format!("MCP {}: write: {e}", self.server_name))?;
-        self.stdin
+        stdin
             .flush()
             .map_err(|e| format!("MCP {}: flush: {e}", self.server_name))?;
         Ok(())
@@ -240,10 +244,10 @@ impl McpClient {
 
 impl Drop for McpClient {
     fn drop(&mut self) {
-        // Close stdin so the server sees EOF; then wait briefly and kill.
-        // ChildStdin drops when we replace... we can't take stdin easily; just kill.
-        let _ = self.child.kill();
+        // Close stdin so the server sees EOF and can exit cleanly.
+        self.stdin.take();
         let _ = self.child.wait();
+        let _ = self.child.kill();
     }
 }
 
@@ -270,11 +274,7 @@ fn wait_response(
     }
 }
 
-fn read_loop<R: Read>(
-    stdout: R,
-    pending: Arc<Mutex<HashMap<u64, Pending>>>,
-    server: &str,
-) {
+fn read_loop<R: Read>(stdout: R, pending: Arc<Mutex<HashMap<u64, Pending>>>, server: &str) {
     let mut reader = BufReader::new(stdout);
     let mut buf = String::new();
     loop {

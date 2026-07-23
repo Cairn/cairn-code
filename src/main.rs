@@ -1,22 +1,22 @@
-mod json;
-mod http_client;
+mod agent;
 mod config;
 mod cost;
-mod session;
+mod http_client;
+mod json;
 mod llm;
-mod agent;
+mod markdown;
+mod mcp;
+mod notify;
+mod oauth;
+mod redact;
+mod session;
+mod skills;
+mod theme;
 mod tools;
 mod tui;
-mod markdown;
-mod redact;
-mod theme;
-mod oauth;
-mod notify;
-mod skills;
-mod mcp;
 
-use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
@@ -57,15 +57,22 @@ fn main() {
 
     let mut providers = provider::default_providers();
     let (p_name, p_model) = if let Some(p) = providers.get(&provider_name) {
-        let model = if model_name.is_empty() { p.default_model().to_string() } else { model_name };
+        let model = if model_name.is_empty() {
+            p.default_model().to_string()
+        } else {
+            model_name
+        };
         (provider_name, model)
     } else {
-        ("anthropic".to_string(), "claude-sonnet-4-20250514".to_string())
+        (
+            "anthropic".to_string(),
+            "claude-sonnet-4-20250514".to_string(),
+        )
     };
 
-    let chosen_provider = providers.remove(&p_name).unwrap_or_else(|| {
-        provider::default_providers().into_values().next().unwrap()
-    });
+    let chosen_provider = providers
+        .remove(&p_name)
+        .unwrap_or_else(|| provider::default_providers().into_values().next().unwrap());
 
     let models = chosen_provider.available_models();
     let provider_name_str = chosen_provider.name().to_string();
@@ -87,6 +94,43 @@ fn main() {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| ".".to_string());
 
+    if is_print_mode {
+        let prompt = match initial_prompt {
+            Some(p) => p,
+            None => {
+                let mut input = String::new();
+                if std::io::stdin().read_line(&mut input).is_ok() {
+                    input.trim().to_string()
+                } else {
+                    String::new()
+                }
+            }
+        };
+        if !prompt.is_empty() {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let mut agent = Agent::new_with_skills(
+                    chosen_provider,
+                    p_model.clone(),
+                    tool_registry,
+                    cfg,
+                    skills_for_agent,
+                );
+                let _ = tx.send(agent.run_simple(&prompt));
+            });
+            if let Ok(result) = rx.recv() {
+                match result {
+                    Ok(output) => println!("{output}"),
+                    Err(e) => eprintln!("Error: {e}"),
+                }
+            }
+        }
+        return;
+    }
+    let theme_name = cfg.theme.clone();
+    let show_thinking = cfg.show_thinking;
+    let show_suggestions = cfg.show_suggestions;
+
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>();
     let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
     let (perm_tx, perm_rx) = mpsc::channel::<String>();
@@ -97,9 +141,6 @@ fn main() {
 
     let p_model_for_agent = p_model.clone();
     let p_model_for_print = p_model.clone();
-    let theme_name = cfg.theme.clone();
-    let show_thinking = cfg.show_thinking;
-    let show_suggestions = cfg.show_suggestions;
 
     thread::spawn(move || {
         let mut agent = Agent::new_with_skills(
@@ -146,7 +187,9 @@ fn main() {
                     agent.reset_state();
                 }
                 Ok(cmd) if cmd.starts_with("__auth_login__:") => {
-                    let provider = cmd.trim_start_matches("__auth_login__:").to_ascii_lowercase();
+                    let provider = cmd
+                        .trim_start_matches("__auth_login__:")
+                        .to_ascii_lowercase();
                     let msg = if provider == "xai" {
                         // Surface the user code before the blocking poll via a system-style error-free path:
                         // request device code first, emit as text event, then poll.
@@ -164,15 +207,15 @@ fn main() {
                                 let _ = event_tx.send(AgentEvent::Text(notice));
                                 crate::oauth::open_url(&uri);
                                 match crate::oauth::poll_xai_device_token(&auth, &cancel2) {
-                                    Ok(token) => {
-                                        match crate::oauth::save_token("xai", &token) {
-                                            Ok(()) => {
-                                                std::env::set_var("XAI_API_KEY", &token.access_token);
-                                                "xAI OAuth login saved to the OS keyring. You can select provider xai now.".to_string()
-                                            }
-                                            Err(e) => format!("Login succeeded but failed to save token: {e}"),
+                                    Ok(token) => match crate::oauth::save_token("xai", &token) {
+                                        Ok(()) => {
+                                            std::env::set_var("XAI_API_KEY", &token.access_token);
+                                            "xAI OAuth login saved to the OS keyring. You can select provider xai now.".to_string()
                                         }
-                                    }
+                                        Err(e) => {
+                                            format!("Login succeeded but failed to save token: {e}")
+                                        }
+                                    },
                                     Err(e) => format!("xAI OAuth failed: {e}"),
                                 }
                             }
@@ -185,7 +228,9 @@ fn main() {
                     let _ = event_tx.send(AgentEvent::Done);
                 }
                 Ok(cmd) if cmd.starts_with("__auth_logout__:") => {
-                    let provider = cmd.trim_start_matches("__auth_logout__:").to_ascii_lowercase();
+                    let provider = cmd
+                        .trim_start_matches("__auth_logout__:")
+                        .to_ascii_lowercase();
                     let msg = match crate::oauth::delete_token(&provider) {
                         Ok(true) => format!("Removed OAuth login for {provider}."),
                         Ok(false) => format!("No OAuth login stored for {provider}."),
@@ -246,56 +291,6 @@ fn main() {
             tool_name: String::new(),
             duration: String::new(),
         });
-    }
-
-    if is_print_mode {
-        if let Some(prompt) = initial_prompt {
-            // Simple non-streaming mode
-            drop(event_rx);
-            let (tx, rx) = mpsc::channel();
-            thread::spawn(move || {
-                // Recreate for print mode — simplified
-                let mut providers = provider::default_providers();
-                let provider = providers.remove(&p_name).unwrap_or_else(|| {
-                    provider::default_providers().into_values().next().unwrap()
-                });
-                let registry = tools::registry::default_registry();
-                let cfg = Config::load();
-                let pm = p_model_for_print.clone();
-                let mut agent = Agent::new(provider, pm, registry, cfg);
-                let _ = tx.send(agent.run_simple(&prompt));
-            });
-            if let Ok(result) = rx.recv() {
-                match result {
-                    Ok(output) => println!("{output}"),
-                    Err(e) => eprintln!("Error: {e}"),
-                }
-            }
-        } else {
-            let mut input = String::new();
-            if std::io::stdin().read_line(&mut input).is_ok() {
-                let input = input.trim().to_string();
-                let (tx, rx) = mpsc::channel();
-                thread::spawn(move || {
-                    let mut providers = provider::default_providers();
-                    let provider = providers.remove(&p_name).unwrap_or_else(|| {
-                        provider::default_providers().into_values().next().unwrap()
-                    });
-                    let registry = tools::registry::default_registry();
-                    let cfg = Config::load();
-                    let pm = p_model_for_print.clone();
-                    let mut agent = Agent::new(provider, pm, registry, cfg);
-                    let _ = tx.send(agent.run_simple(&input));
-                });
-                if let Ok(result) = rx.recv() {
-                    match result {
-                        Ok(output) => println!("{output}"),
-                        Err(e) => eprintln!("Error: {e}"),
-                    }
-                }
-            }
-        }
-        return;
     }
 
     if let Some(prompt) = initial_prompt {
