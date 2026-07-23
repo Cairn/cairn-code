@@ -822,6 +822,23 @@ mod tests {
         tool_input: String,
     }
 
+    struct RecordingTool {
+        name: String,
+        needs_permission: bool,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::tools::registry::Tool for RecordingTool {
+        fn name(&self) -> &str { &self.name }
+        fn description(&self) -> &str { "Records executions for authorization tests" }
+        fn input_schema(&self) -> String { r#"{"type":"object"}"#.into() }
+        fn needs_permission(&self) -> bool { self.needs_permission }
+        fn execute(&self, _input: &str) -> Result<String, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("recorded execution".into())
+        }
+    }
+
     impl llm::Provider for ToolCallMock {
         fn name(&self) -> &str { "mock" }
         fn default_model(&self) -> &str { "mock-model" }
@@ -862,16 +879,31 @@ mod tests {
         }
     }
 
-    fn agent_with_tool_call(tool_name: &str, tool_input: &str, config: Config) -> Agent {
+    fn agent_with_tool_call(
+        tool_name: &str,
+        needs_permission: bool,
+        config: Config,
+    ) -> (Agent, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut registry = crate::tools::registry::Registry::new();
-        registry.register(Box::new(crate::tools::shell::ShellTool));
-        registry.register(Box::new(crate::tools::file_read::FileReadTool));
-        Agent::new(
-            Box::new(ToolCallMock { tool_name: tool_name.into(), tool_input: tool_input.into() }),
-            "mock-model".into(),
-            registry,
-            config,
+        registry.register(Box::new(RecordingTool {
+            name: tool_name.into(),
+            needs_permission,
+            calls: calls.clone(),
+        }));
+        (
+            Agent::new(
+                Box::new(ToolCallMock { tool_name: tool_name.into(), tool_input: "{}".into() }),
+                "mock-model".into(),
+                registry,
+                config,
+            ),
+            calls,
         )
+    }
+
+    fn test_tool_use(name: &str) -> llm::ToolUse {
+        llm::ToolUse { id: "1".into(), name: name.into(), input: "{}".into() }
     }
 
     /// C-01 regression: print mode (`run_simple`) must not execute a tool
@@ -879,16 +911,27 @@ mod tests {
     /// to fail closed exactly like a denied tool would, not silently run.
     #[test]
     fn run_simple_denies_approval_required_tool_by_default() {
-        let mut agent = agent_with_tool_call(
-            "shell",
-            r#"{"command":"rm -rf /"}"#,
-            Config::default(),
-        );
+        let mut config = Config::default();
+        config.ask.clear();
+        config.auto_allow.clear();
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
         let output = agent.run_simple("do something").unwrap();
         assert!(
             output.to_ascii_lowercase().contains("error") && output.contains("approval"),
             "expected run_simple to fail closed on an approval-required tool, got: {output}"
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn run_simple_denies_permission_free_tool_in_ask_list() {
+        let mut config = Config::default();
+        config.auto_allow.clear();
+        config.ask = vec!["safe".into()];
+        let (mut agent, calls) = agent_with_tool_call("safe", false, config);
+        let output = agent.run_simple("do something").unwrap();
+        assert!(output.contains("requires approval"), "{output}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     /// The explicit `auto_allow` opt-in the issue calls for should still let
@@ -896,10 +939,11 @@ mod tests {
     #[test]
     fn run_simple_runs_tool_explicitly_auto_allowed() {
         let mut config = Config::default();
-        config.auto_allow.push("shell".into());
-        let mut agent = agent_with_tool_call("shell", r#"{"command":"echo hi"}"#, config);
+        config.auto_allow.push("dangerous".into());
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
         let output = agent.run_simple("do something").unwrap();
-        assert!(!output.to_ascii_lowercase().contains("requires approval"), "{output}");
+        assert!(output.contains("recorded execution"), "{output}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// Denied tools must stay denied in print mode too, matching the
@@ -907,29 +951,85 @@ mod tests {
     #[test]
     fn run_simple_respects_deny_list() {
         let mut config = Config::default();
-        config.deny.push("shell".into());
-        let mut agent = agent_with_tool_call("shell", r#"{"command":"echo hi"}"#, config);
+        config.auto_allow.push("dangerous".into());
+        config.deny.push("dangerous".into());
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
         let output = agent.run_simple("do something").unwrap();
         assert!(output.contains("denied by config"), "{output}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "deny must override auto_allow");
     }
 
     /// Tools that don't need permission should keep working unattended.
     #[test]
     fn run_simple_runs_tool_that_does_not_need_permission() {
-        let dir = std::env::temp_dir().join(format!("cairn-run-simple-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("hello.txt");
-        std::fs::write(&file_path, "hello from test").unwrap();
-
-        let mut agent = agent_with_tool_call(
-            "file_read",
-            &format!(r#"{{"file_path":"{}"}}"#, file_path.to_string_lossy().replace('\\', "\\\\")),
-            Config::default(),
-        );
+        let mut config = Config::default();
+        config.ask.clear();
+        config.auto_allow.clear();
+        let (mut agent, calls) = agent_with_tool_call("safe", false, config);
         let output = agent.run_simple("do something").unwrap();
-        assert!(output.contains("hello from test"), "{output}");
+        assert!(output.contains("recorded execution"), "{output}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn interactive_policy_prompts_and_executes_when_allowed() {
+        let mut config = Config::default();
+        config.ask.clear();
+        config.auto_allow.clear();
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
+        let (event_tx, event_rx) = mpsc::channel();
+        let (perm_tx, perm_rx) = mpsc::channel();
+        perm_tx.send("allow".into()).unwrap();
+
+        let result = agent.execute_tool_with_policy(
+            &test_tool_use("dangerous"),
+            Some((&event_tx, &AtomicBool::new(false), &perm_rx)),
+        );
+
+        assert_eq!(result.unwrap(), "recorded execution");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AgentEvent::PermissionRequest(name, _) if name == "dangerous"
+        ));
+    }
+
+    #[test]
+    fn interactive_policy_does_not_execute_when_denied() {
+        let mut config = Config::default();
+        config.ask.clear();
+        config.auto_allow.clear();
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
+        let (event_tx, event_rx) = mpsc::channel();
+        let (perm_tx, perm_rx) = mpsc::channel();
+        perm_tx.send("deny".into()).unwrap();
+
+        let result = agent.execute_tool_with_policy(
+            &test_tool_use("dangerous"),
+            Some((&event_tx, &AtomicBool::new(false), &perm_rx)),
+        );
+
+        assert!(result.unwrap_err().contains("Permission denied"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(event_rx.recv().unwrap(), AgentEvent::PermissionRequest(_, _)));
+    }
+
+    #[test]
+    fn interactive_policy_fails_closed_when_permission_channel_disconnects() {
+        let mut config = Config::default();
+        config.ask.clear();
+        config.auto_allow.clear();
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (perm_tx, perm_rx) = mpsc::channel();
+        drop(perm_tx);
+
+        let result = agent.execute_tool_with_policy(
+            &test_tool_use("dangerous"),
+            Some((&event_tx, &AtomicBool::new(false), &perm_rx)),
+        );
+
+        assert!(result.unwrap_err().contains("Permission denied"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
-
