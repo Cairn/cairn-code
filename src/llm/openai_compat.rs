@@ -21,7 +21,9 @@ pub fn build_messages_json(messages: &[Message], system: &str) -> String {
         body.push_str(&format!("{{\"role\":\"system\",\"content\":\"{escaped}\"}}"));
         first = false;
     }
-    for msg in messages.iter() {
+    let mut index = 0;
+    while index < messages.len() {
+        let msg = &messages[index];
         if !first { body.push(','); }
         first = false;
         match &msg.content {
@@ -29,12 +31,26 @@ pub fn build_messages_json(messages: &[Message], system: &str) -> String {
                 let escaped = escape_json_str(t);
                 body.push_str(&format!("{{\"role\":\"{}\",\"content\":\"{escaped}\"}}", msg.role));
             }
-            Content::ToolUse(tu) => {
-                let args_escaped = escape_json_str(&tu.input);
-                body.push_str(&format!(
-                    "{{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{{\"id\":\"{}\",\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"{}\"}}}}]}}",
-                    tu.id, tu.name, args_escaped
-                ));
+            Content::ToolUse(_) => {
+                // Providers return parallel calls as consecutive ToolUse
+                // messages. OpenAI-compatible APIs require those calls in one
+                // assistant message before any corresponding tool results.
+                body.push_str("{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[");
+                let mut first_call = true;
+                while index < messages.len() {
+                    let Content::ToolUse(tu) = &messages[index].content else { break; };
+                    if !first_call { body.push(','); }
+                    first_call = false;
+                    let id = escape_json_str(&tu.id);
+                    let name = escape_json_str(&tu.name);
+                    let args = escape_json_str(&tu.input);
+                    body.push_str(&format!(
+                        "{{\"id\":\"{id}\",\"type\":\"function\",\"function\":{{\"name\":\"{name}\",\"arguments\":\"{args}\"}}}}"
+                    ));
+                    index += 1;
+                }
+                body.push_str("]}");
+                continue;
             }
             Content::ToolResult(tr) => {
                 let escaped = escape_json_str(&tr.content);
@@ -48,6 +64,7 @@ pub fn build_messages_json(messages: &[Message], system: &str) -> String {
                 body.push_str(&format!("{{\"role\":\"assistant\",\"content\":\"{escaped}\"}}"));
             }
         }
+        index += 1;
     }
     body.push(']');
     body
@@ -265,6 +282,50 @@ mod tests {
         assert_eq!(obj.get("role").and_then(|v| v.as_str()), Some("assistant"));
         let tool_calls = obj.get("tool_calls").and_then(|v| v.as_array()).unwrap();
         assert_eq!(tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn test_build_messages_json_coalesces_parallel_tool_calls() {
+        let msgs = vec![
+            Message {
+                role: "assistant".into(),
+                content: Content::ToolUse(ToolUse {
+                    id: "call_1".into(),
+                    name: "glob".into(),
+                    input: "{}".into(),
+                }),
+            },
+            Message {
+                role: "assistant".into(),
+                content: Content::ToolUse(ToolUse {
+                    id: "call_2".into(),
+                    name: "grep".into(),
+                    input: "{}".into(),
+                }),
+            },
+            Message {
+                role: "user".into(),
+                content: Content::ToolResult(ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "a.rs".into(),
+                }),
+            },
+            Message {
+                role: "user".into(),
+                content: Content::ToolResult(ToolResult {
+                    tool_use_id: "call_2".into(),
+                    content: "match".into(),
+                }),
+            },
+        ];
+
+        let parsed = crate::json::parse(&build_messages_json(&msgs, "")).unwrap();
+        let messages = parsed.as_array().unwrap();
+        assert_eq!(messages.len(), 3, "one assistant turn plus two tool results");
+        let calls = messages[0].get("tool_calls").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(messages[1].get("tool_call_id").and_then(|v| v.as_str()), Some("call_1"));
+        assert_eq!(messages[2].get("tool_call_id").and_then(|v| v.as_str()), Some("call_2"));
     }
 
     #[test]

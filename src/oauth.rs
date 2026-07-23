@@ -5,6 +5,7 @@
 //! works in SSH/headless sessions without a local browser callback.
 
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -206,14 +207,27 @@ pub fn request_xai_device_code() -> Result<DeviceAuth, String> {
     })
 }
 
-pub fn poll_xai_device_token(auth: &DeviceAuth) -> Result<Token, String> {
+pub fn poll_xai_device_token(auth: &DeviceAuth, cancelled: &AtomicBool) -> Result<Token, String> {
     let client_id = xai_client_id()?;
     let mut interval = Duration::from_secs(auth.interval_secs.max(1));
     loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("oauth: cancelled".into());
+        }
         if now_unix() >= auth.expires_at {
             return Err("oauth: device code expired before authorization".into());
         }
-        thread::sleep(interval);
+        let wait_started = std::time::Instant::now();
+        while wait_started.elapsed() < interval {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err("oauth: cancelled".into());
+            }
+            let remaining = interval.saturating_sub(wait_started.elapsed());
+            thread::sleep(Duration::from_millis(100).min(remaining));
+        }
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("oauth: cancelled".into());
+        }
         if now_unix() >= auth.expires_at {
             return Err("oauth: device code expired before authorization".into());
         }
@@ -223,6 +237,9 @@ pub fn poll_xai_device_token(auth: &DeviceAuth) -> Result<Token, String> {
             ("client_id", &client_id),
         ]);
         let (status, resp) = form_post(XAI_TOKEN_URL, &body)?;
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("oauth: cancelled".into());
+        }
         let val = json::parse(&resp).map_err(|e| format!("oauth token response: {e}"))?;
         let obj = val.as_object().ok_or("oauth token response not an object")?;
         if let Some(access) = obj.get("access_token").and_then(|v| v.as_str()) {

@@ -8,6 +8,7 @@ repository = "https://github.com/Cairn/cairn-code"
 readme = "README.md"
 
 [dependencies]
+cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 keyring = "4.1.5"
 ratatui = "0.30.2"

@@ -124,11 +124,31 @@ pub fn resolve_in_workspace(path: &str) -> Result<PathBuf, String> {
     let cwd = cwd.canonicalize().unwrap_or(cwd);
 
     let candidate = std::path::Path::new(path);
-    let absolute = if candidate.is_absolute() {
+    let mut absolute = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
         cwd.join(candidate)
     };
+
+    // A missing component prevents the filesystem from resolving later `..`
+    // components, so normalize those lexically before finding an existing
+    // ancestor. Existing paths are canonicalized as-is to preserve symlink
+    // semantics.
+    if !absolute.exists() {
+        let mut normalized = PathBuf::new();
+        for component in absolute.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    normalized.pop();
+                }
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                    normalized.push(component.as_os_str());
+                }
+            }
+        }
+        absolute = normalized;
+    }
 
     // Walk up to the deepest ancestor that actually exists so it can be
     // canonicalized (resolving any symlinks); the remaining, not-yet-created
@@ -146,7 +166,11 @@ pub fn resolve_in_workspace(path: &str) -> Result<PathBuf, String> {
     }
     let mut resolved = existing.canonicalize().unwrap_or(existing);
     for part in tail.into_iter().rev() {
-        resolved.push(part);
+        if part == ".." {
+            resolved.pop();
+        } else if part != "." {
+            resolved.push(part);
+        }
     }
 
     if !resolved.starts_with(&cwd) {
@@ -165,6 +189,15 @@ mod tests {
     #[test]
     fn test_rejects_path_escaping_workspace() {
         let err = resolve_in_workspace("../../outside.txt").unwrap_err();
+        assert!(
+            err.contains("outside the workspace"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_path_escaping_workspace_through_missing_tail() {
+        let err = resolve_in_workspace("cairn-definitely-missing/../../outside.txt").unwrap_err();
         assert!(
             err.contains("outside the workspace"),
             "unexpected error: {err}"
