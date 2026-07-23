@@ -114,6 +114,7 @@ mod tests {
         tool.execute(r#"{"args":["init","--quiet"]}"#).unwrap();
         assert!(workspace.join(".git").is_dir());
 
+        drop(tool);
         std::fs::remove_dir_all(workspace).unwrap();
     }
 
