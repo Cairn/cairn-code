@@ -141,8 +141,9 @@ pub struct Tui {
     /// When true, show grayed idle ready-to-send prompts. Default off.
     show_suggestions: bool,
     /// When true, terminal mouse capture is on so the wheel scrolls the
-    /// transcript. Shift+drag still selects text in modern hosts (Windows
-    /// Terminal, iTerm, etc.). Default on.
+    /// transcript. Shift+drag where supported still selects text; hosts with
+    /// different native-selection gestures (e.g. iTerm's Option-based
+    /// selection) can use /mouse off or /select instead. Default on.
     mouse_capture: bool,
     /// Leave the TUI and print plain text so the terminal can select/copy freely.
     pending_select: Option<SelectDump>,
@@ -257,11 +258,12 @@ impl Tui {
         if on == self.mouse_capture {
             return;
         }
-        self.mouse_capture = on;
         if on {
-            let _ = execute!(stdout(), EnableMouseCapture);
-        } else {
-            let _ = execute!(stdout(), DisableMouseCapture);
+            if execute!(stdout(), EnableMouseCapture).is_ok() {
+                self.mouse_capture = true;
+            }
+        } else if execute!(stdout(), DisableMouseCapture).is_ok() {
+            self.mouse_capture = false;
         }
     }
 
@@ -395,11 +397,13 @@ impl Tui {
     pub fn run(&mut self, rx: mpsc::Receiver<AgentEvent>) -> Result<(), String> {
         let mut terminal = ratatui::init();
         terminal.clear().map_err(|e| e.to_string())?;
-        // Wheel scroll for transcript history. Shift+drag is handled by the
-        // terminal host (selects text without sending events to the app).
-        // Plain drag without Shift is for the app; use /select if needed.
-        let _ = execute!(stdout(), EnableMouseCapture);
-        self.mouse_capture = true;
+        // Wheel scroll for transcript history. Shift+drag where supported is
+        // handled by the terminal host (selects text without sending events
+        // to the app); hosts with different native-selection gestures (e.g.
+        // iTerm's Option-based selection) can use /mouse off or /select instead.
+        if execute!(stdout(), EnableMouseCapture).is_ok() {
+            self.mouse_capture = true;
+        }
 
         let mut result = Ok(());
         let mut last_spinner_update = std::time::Instant::now();
@@ -528,8 +532,9 @@ impl Tui {
                         }
                     }
                     Ok(Event::Mouse(m)) => {
-                        self.handle_mouse(m.kind);
-                        self.dirty = true;
+                        if self.handle_mouse(m.kind) {
+                            self.dirty = true;
+                        }
                     }
                     Ok(Event::Resize(_, _)) => {
                         needs_rebuild = true;
@@ -573,8 +578,9 @@ impl Tui {
                             }
                         }
                         Ok(Event::Mouse(m)) => {
-                            self.handle_mouse(m.kind);
-                            self.dirty = true;
+                            if self.handle_mouse(m.kind) {
+                                self.dirty = true;
+                            }
                         }
                         Ok(Event::Resize(_, _)) => {
                             needs_rebuild = true;
@@ -632,7 +638,9 @@ impl Tui {
         result
     }
 
-    fn handle_mouse(&mut self, kind: MouseEventKind) {
+    /// Returns true if the event was actually acted on (a scroll), so callers
+    /// can skip a redraw for pointer movement or other unhandled events.
+    fn handle_mouse(&mut self, kind: MouseEventKind) -> bool {
         // Ignore mouse while list pickers own the chrome (wheel should not fight them).
         // Slash ghost completion is inline, so scrolling still works while typing `/…`.
         if self.show_model_picker
@@ -640,12 +648,18 @@ impl Tui {
             || self.show_theme_picker
             || self.show_session_picker
         {
-            return;
+            return false;
         }
         match kind {
-            MouseEventKind::ScrollUp => self.scroll_transcript(-3),
-            MouseEventKind::ScrollDown => self.scroll_transcript(3),
-            _ => {}
+            MouseEventKind::ScrollUp => {
+                self.scroll_transcript(-3);
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_transcript(3);
+                true
+            }
+            _ => false,
         }
     }
 
