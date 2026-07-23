@@ -336,7 +336,7 @@ impl Agent {
     /// Applies the deny/ask/auto_allow policy to a tool call and, if
     /// permitted, executes it. This is the single authorization path shared
     /// by the interactive TUI loop and print (`--print`) mode, so a tool
-    /// cannot bypass deny lists or `needs_permission()` by going through one
+    /// cannot bypass deny lists or `needs_permission_for()` by going through one
     /// path instead of the other.
     ///
     /// `interactive` carries the channels needed to prompt a human for
@@ -352,9 +352,12 @@ impl Agent {
         interactive: Option<(&mpsc::Sender<AgentEvent>, &AtomicBool, &mpsc::Receiver<String>)>,
     ) -> Result<String, String> {
         let tool = self.tools.get(&tu.name);
-        let wants_permission = tool.map(|t| t.needs_permission()).unwrap_or(false);
+        let wants_permission = tool.map(|t| t.needs_permission_for(&tu.input)).unwrap_or(false);
         let needs_ask = wants_permission || self.config.ask.iter().any(|t| t == &tu.name);
-        let always_allowed = self.config.auto_allow.iter().any(|t| t == &tu.name);
+        let permission_key = tool
+            .map(|t| t.permission_key(&tu.input))
+            .unwrap_or_else(|| tu.name.clone());
+        let always_allowed = self.config.auto_allow.iter().any(|t| t == &permission_key);
         let denied = self.config.is_tool_denied(&tu.name);
 
         if denied {
@@ -387,7 +390,9 @@ impl Agent {
         };
         match response.as_str() {
             "always_allow" => {
-                self.config.auto_allow.push(tu.name.clone());
+                if !always_allowed {
+                    self.config.auto_allow.push(permission_key);
+                }
                 let _ = crate::config::save_full_config(&self.config);
                 self.dispatch_tool(tu)
             }
