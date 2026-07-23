@@ -92,8 +92,6 @@ impl Agent {
         let provider = providers.remove(provider_name).ok_or_else(|| format!("Unknown provider: {provider_name}"))?;
         self.provider = provider;
         self.model = model.to_string();
-        self.messages.clear();
-        self.usage = Usage::default();
         self.last_input_tokens = 0;
         self.sync_live_mirror();
         Ok(())
@@ -300,44 +298,7 @@ impl Agent {
 
                     let _ = tx.send(AgentEvent::ToolUse(tu.name.clone(), tu.input.clone()));
 
-                    let tool = self.tools.get(&tu.name);
-                    let wants_permission = tool.map(|t| t.needs_permission()).unwrap_or(false);
-                    let needs_ask = wants_permission || self.config.ask.iter().any(|t| t == &tu.name);
-                    let always_allowed = self.config.auto_allow.iter().any(|t| t == &tu.name);
-                    let denied = self.config.is_tool_denied(&tu.name);
-
-                    let result = if denied {
-                        Err(format!("Tool '{}' is denied by config", tu.name))
-                    } else if needs_ask && !always_allowed {
-                        let _ = tx.send(AgentEvent::PermissionRequest(tu.name.clone(), tu.input.clone()));
-                        let response = loop {
-                            match perm_rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                                Ok(resp) => break resp,
-                                Err(mpsc::RecvTimeoutError::Timeout) => {
-                                    if cancel.load(Ordering::Relaxed) {
-                                        break "deny".to_string();
-                                    }
-                                }
-                                Err(mpsc::RecvTimeoutError::Disconnected) => break "deny".to_string(),
-                            }
-                        };
-                        match response.as_str() {
-                            "always_allow" => {
-                                self.config.auto_allow.push(tu.name.clone());
-                                let _ = crate::config::save_full_config(&self.config);
-                                self.tools.get(&tu.name).map(|t| t.execute(&tu.input)).unwrap_or(Err(format!("Unknown tool: {}", tu.name)))
-                            }
-                            "allow" => {
-                                self.tools.get(&tu.name).map(|t| t.execute(&tu.input)).unwrap_or(Err(format!("Unknown tool: {}", tu.name)))
-                            }
-                            _ => Err(format!("Permission denied by user for tool '{}'", tu.name)),
-                        }
-                    } else {
-                        match self.tools.get(&tu.name) {
-                            Some(tool) => tool.execute(&tu.input),
-                            None => Err(format!("Unknown tool: {}", tu.name)),
-                        }
-                    };
+                    let result = self.execute_tool_with_policy(tu, Some((&tx, cancel, perm_rx)));
 
                     let result_str = match &result {
                         Ok(s) => s.clone(),
@@ -368,6 +329,81 @@ impl Agent {
         self.sync_live_mirror();
         let _ = tx.send(AgentEvent::Done);
         result
+    }
+
+    fn dispatch_tool(&self, tu: &llm::ToolUse) -> Result<String, String> {
+        match self.tools.get(&tu.name) {
+            Some(tool) => tool.execute(&tu.input),
+            None => Err(format!("Unknown tool: {}", tu.name)),
+        }
+    }
+
+    /// Applies the deny/ask/auto_allow policy to a tool call and, if
+    /// permitted, executes it. This is the single authorization path shared
+    /// by the interactive TUI loop and print (`--print`) mode, so a tool
+    /// cannot bypass deny lists or `needs_permission_for()` by going through one
+    /// path instead of the other.
+    ///
+    /// `interactive` carries the channels needed to prompt a human for
+    /// approval (`tx` to emit `PermissionRequest`, `cancel` to abort the
+    /// wait, `perm_rx` to receive the answer). When `None` (non-interactive
+    /// callers like `--print`, which have no user to ask) any tool that
+    /// would otherwise require approval fails closed instead of running
+    /// unattended; the only way to permit it is an explicit `auto_allow`
+    /// entry in config.
+    fn execute_tool_with_policy(
+        &mut self,
+        tu: &llm::ToolUse,
+        interactive: Option<(&mpsc::Sender<AgentEvent>, &AtomicBool, &mpsc::Receiver<String>)>,
+    ) -> Result<String, String> {
+        let tool = self.tools.get(&tu.name);
+        let wants_permission = tool.map(|t| t.needs_permission_for(&tu.input)).unwrap_or(false);
+        let needs_ask = wants_permission || self.config.ask.iter().any(|t| t == &tu.name);
+        let permission_key = tool
+            .map(|t| t.permission_key(&tu.input))
+            .unwrap_or_else(|| tu.name.clone());
+        let always_allowed = self.config.auto_allow.iter().any(|t| t == &permission_key);
+        let denied = self.config.is_tool_denied(&tu.name);
+
+        if denied {
+            return Err(format!("Tool '{}' is denied by config", tu.name));
+        }
+
+        if !needs_ask || always_allowed {
+            return self.dispatch_tool(tu);
+        }
+
+        let Some((tx, cancel, perm_rx)) = interactive else {
+            return Err(format!(
+                "Tool '{}' requires approval and there is no user to prompt in this mode. \
+                 Add it to auto_allow in the config to permit it non-interactively.",
+                tu.name
+            ));
+        };
+
+        let _ = tx.send(AgentEvent::PermissionRequest(tu.name.clone(), tu.input.clone()));
+        let response = loop {
+            match perm_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(resp) => break resp,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        break "deny".to_string();
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break "deny".to_string(),
+            }
+        };
+        match response.as_str() {
+            "always_allow" => {
+                if !always_allowed {
+                    self.config.auto_allow.push(permission_key);
+                }
+                let _ = crate::config::save_full_config(&self.config);
+                self.dispatch_tool(tu)
+            }
+            "allow" => self.dispatch_tool(tu),
+            _ => Err(format!("Permission denied by user for tool '{}'", tu.name)),
+        }
     }
 
     pub fn run_simple(&mut self, input: &str) -> Result<String, String> {
@@ -417,10 +453,13 @@ impl Agent {
             match &msg.content {
                 llm::Content::Text(t) => output.push_str(t),
                 llm::Content::ToolUse(tu) => {
-                    let result = match self.tools.get(&tu.name) {
-                        Some(tool) => tool.execute(&tu.input).unwrap_or_else(|e| format!("Error: {e}")),
-                        None => format!("Error: unknown tool {}", tu.name),
-                    };
+                    // No interactive channel is available in non-interactive
+                    // (`--print`) mode, so this enforces the same deny/ask/
+                    // auto_allow policy as the TUI loop and fails closed for
+                    // any tool that would otherwise require user approval.
+                    let result = self
+                        .execute_tool_with_policy(tu, None)
+                        .unwrap_or_else(|e| format!("Error: {e}"));
                     output.push_str(&format!("\n[{}({})]: {}", tu.name, tu.input, result));
                 }
                 _ => {}
@@ -560,6 +599,58 @@ mod tests {
         assert!(t.contains("assistant: hi"));
         assert!(t.contains("assistant [tool call]: grep("));
         assert!(t.contains("tool result: matches"));
+    }
+
+    #[test]
+    fn provider_and_model_switches_preserve_history_usage_and_live_mirror() {
+        let mut agent = Agent::new(
+            Box::new(crate::llm::ollama::OllamaProvider::new()),
+            "llama3.2".into(),
+            crate::tools::registry::Registry::new(),
+            crate::config::Config::default(),
+        );
+        let history = vec![
+            text("user", "inspect src/main.rs"),
+            tool_use("read", r#"{"path":"src/main.rs"}"#),
+            tool_result("fn main() {}"),
+            text("assistant", "done"),
+        ];
+        let usage = Usage {
+            input_tokens: 120,
+            output_tokens: 30,
+            cache_read: 10,
+            cache_create: 5,
+        };
+        let mirror = crate::session::new_live_mirror();
+        agent.set_live_mirror(mirror.clone());
+        agent.set_state(history, usage);
+
+        agent.switch_provider("openai", "gpt-5-mini").unwrap();
+
+        assert_eq!(agent.provider_name(), "openai");
+        assert_eq!(agent.model(), "gpt-5-mini");
+        assert_eq!(agent.messages().len(), 4);
+        assert!(matches!(&agent.messages()[0].content, Content::Text(t) if t == "inspect src/main.rs"));
+        assert!(matches!(&agent.messages()[1].content, Content::ToolUse(tu) if tu.name == "read"));
+        assert!(matches!(&agent.messages()[2].content, Content::ToolResult(tr) if tr.content == "fn main() {}"));
+        assert!(matches!(&agent.messages()[3].content, Content::Text(t) if t == "done"));
+        assert_eq!(agent.usage().input_tokens, 120);
+        assert_eq!(agent.usage().output_tokens, 30);
+        assert_eq!(agent.usage().cache_read, 10);
+        assert_eq!(agent.usage().cache_create, 5);
+
+        let snapshot = mirror.lock().unwrap();
+        assert_eq!(snapshot.messages.len(), 4);
+        assert_eq!(snapshot.tokens_in, 120);
+        assert_eq!(snapshot.tokens_out, 30);
+        drop(snapshot);
+
+        agent.switch_provider("openai", "gpt-4.1-mini").unwrap();
+
+        assert_eq!(agent.model(), "gpt-4.1-mini");
+        assert_eq!(agent.messages().len(), 4);
+        assert_eq!(agent.usage().input_tokens, 120);
+        assert_eq!(mirror.lock().unwrap().messages.len(), 4);
     }
 
     /// Live-exercises proactive compaction without a network call: first stream
@@ -822,5 +913,224 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let err = agent.compact_now(&tx).unwrap_err();
         assert!(err.to_ascii_lowercase().contains("could not compact"), "{err}");
+    }
+
+    /// Always returns a single assistant `ToolUse` message for the configured
+    /// tool, so a test can drive `run_simple`'s tool-authorization path
+    /// without a network call.
+    struct ToolCallMock {
+        tool_name: String,
+        tool_input: String,
+    }
+
+    struct RecordingTool {
+        name: String,
+        needs_permission: bool,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::tools::registry::Tool for RecordingTool {
+        fn name(&self) -> &str { &self.name }
+        fn description(&self) -> &str { "Records executions for authorization tests" }
+        fn input_schema(&self) -> String { r#"{"type":"object"}"#.into() }
+        fn needs_permission(&self) -> bool { self.needs_permission }
+        fn execute(&self, _input: &str) -> Result<String, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("recorded execution".into())
+        }
+    }
+
+    impl llm::Provider for ToolCallMock {
+        fn name(&self) -> &str { "mock" }
+        fn default_model(&self) -> &str { "mock-model" }
+        fn available_models(&self) -> Vec<llm::ModelInfo> {
+            vec![llm::ModelInfo { id: "mock-model".into(), name: "Mock".into(), max_ctx: 1000 }]
+        }
+        fn stream_complete(
+            &self,
+            _messages: &[llm::Message],
+            _tools: &[llm::ToolDefinition],
+            _system: &str,
+            _model: &str,
+            _max_tokens: usize,
+            _on_chunk: llm::StreamingCallback,
+            _cancel: &AtomicBool,
+        ) -> Result<(Vec<llm::Message>, Usage), String> {
+            unimplemented!("run_simple does not stream")
+        }
+        fn complete(
+            &self,
+            _messages: &[llm::Message],
+            _tools: &[llm::ToolDefinition],
+            _system: &str,
+            _model: &str,
+            _max_tokens: usize,
+        ) -> Result<(Vec<llm::Message>, Usage), String> {
+            Ok((
+                vec![llm::Message {
+                    role: "assistant".into(),
+                    content: llm::Content::ToolUse(llm::ToolUse {
+                        id: "1".into(),
+                        name: self.tool_name.clone(),
+                        input: self.tool_input.clone(),
+                    }),
+                }],
+                Usage::default(),
+            ))
+        }
+    }
+
+    fn agent_with_tool_call(
+        tool_name: &str,
+        needs_permission: bool,
+        config: Config,
+    ) -> (Agent, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = crate::tools::registry::Registry::new();
+        registry.register(Box::new(RecordingTool {
+            name: tool_name.into(),
+            needs_permission,
+            calls: calls.clone(),
+        }));
+        (
+            Agent::new(
+                Box::new(ToolCallMock { tool_name: tool_name.into(), tool_input: "{}".into() }),
+                "mock-model".into(),
+                registry,
+                config,
+            ),
+            calls,
+        )
+    }
+
+    fn test_tool_use(name: &str) -> llm::ToolUse {
+        llm::ToolUse { id: "1".into(), name: name.into(), input: "{}".into() }
+    }
+
+    /// C-01 regression: print mode (`run_simple`) must not execute a tool
+    /// that requires approval just because there is no user to ask. It has
+    /// to fail closed exactly like a denied tool would, not silently run.
+    #[test]
+    fn run_simple_denies_approval_required_tool_by_default() {
+        let mut config = Config::default();
+        config.ask.clear();
+        config.auto_allow.clear();
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
+        let output = agent.run_simple("do something").unwrap();
+        assert!(
+            output.to_ascii_lowercase().contains("error") && output.contains("approval"),
+            "expected run_simple to fail closed on an approval-required tool, got: {output}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn run_simple_denies_permission_free_tool_in_ask_list() {
+        let mut config = Config::default();
+        config.auto_allow.clear();
+        config.ask = vec!["safe".into()];
+        let (mut agent, calls) = agent_with_tool_call("safe", false, config);
+        let output = agent.run_simple("do something").unwrap();
+        assert!(output.contains("requires approval"), "{output}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The explicit `auto_allow` opt-in the issue calls for should still let
+    /// a would-be-approval-required tool run in non-interactive mode.
+    #[test]
+    fn run_simple_runs_tool_explicitly_auto_allowed() {
+        let mut config = Config::default();
+        config.auto_allow.push("dangerous".into());
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
+        let output = agent.run_simple("do something").unwrap();
+        assert!(output.contains("recorded execution"), "{output}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Denied tools must stay denied in print mode too, matching the
+    /// interactive loop's policy.
+    #[test]
+    fn run_simple_respects_deny_list() {
+        let mut config = Config::default();
+        config.auto_allow.push("dangerous".into());
+        config.deny.push("dangerous".into());
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
+        let output = agent.run_simple("do something").unwrap();
+        assert!(output.contains("denied by config"), "{output}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "deny must override auto_allow");
+    }
+
+    /// Tools that don't need permission should keep working unattended.
+    #[test]
+    fn run_simple_runs_tool_that_does_not_need_permission() {
+        let mut config = Config::default();
+        config.ask.clear();
+        config.auto_allow.clear();
+        let (mut agent, calls) = agent_with_tool_call("safe", false, config);
+        let output = agent.run_simple("do something").unwrap();
+        assert!(output.contains("recorded execution"), "{output}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn interactive_policy_prompts_and_executes_when_allowed() {
+        let mut config = Config::default();
+        config.ask.clear();
+        config.auto_allow.clear();
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
+        let (event_tx, event_rx) = mpsc::channel();
+        let (perm_tx, perm_rx) = mpsc::channel();
+        perm_tx.send("allow".into()).unwrap();
+
+        let result = agent.execute_tool_with_policy(
+            &test_tool_use("dangerous"),
+            Some((&event_tx, &AtomicBool::new(false), &perm_rx)),
+        );
+
+        assert_eq!(result.unwrap(), "recorded execution");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AgentEvent::PermissionRequest(name, _) if name == "dangerous"
+        ));
+    }
+
+    #[test]
+    fn interactive_policy_does_not_execute_when_denied() {
+        let mut config = Config::default();
+        config.ask.clear();
+        config.auto_allow.clear();
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
+        let (event_tx, event_rx) = mpsc::channel();
+        let (perm_tx, perm_rx) = mpsc::channel();
+        perm_tx.send("deny".into()).unwrap();
+
+        let result = agent.execute_tool_with_policy(
+            &test_tool_use("dangerous"),
+            Some((&event_tx, &AtomicBool::new(false), &perm_rx)),
+        );
+
+        assert!(result.unwrap_err().contains("Permission denied"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(event_rx.recv().unwrap(), AgentEvent::PermissionRequest(_, _)));
+    }
+
+    #[test]
+    fn interactive_policy_fails_closed_when_permission_channel_disconnects() {
+        let mut config = Config::default();
+        config.ask.clear();
+        config.auto_allow.clear();
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (perm_tx, perm_rx) = mpsc::channel();
+        drop(perm_tx);
+
+        let result = agent.execute_tool_with_policy(
+            &test_tool_use("dangerous"),
+            Some((&event_tx, &AtomicBool::new(false), &perm_rx)),
+        );
+
+        assert!(result.unwrap_err().contains("Permission denied"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

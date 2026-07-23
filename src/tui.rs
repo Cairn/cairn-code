@@ -80,10 +80,16 @@ pub struct Tui {
     /// When Some, a confirmation prompt to remove this provider's saved API key is shown.
     confirm_remove_provider: Option<String>,
     confirm_remove_sel: usize,
+    /// When Some, ask before sending the existing conversation to this provider.
+    confirm_history_provider: Option<String>,
+    confirm_history_sel: usize,
     awaiting_api_key: bool,
     /// After successful OAuth or API key entry from the provider picker, open the model list.
     /// Auth comes first so live model catalogs (xAI, Anthropic, …) can load.
     pending_model_after_auth: bool,
+    /// Cross-provider selection stays pending until a model is confirmed, so
+    /// cancelling auth or either picker cannot desynchronize the TUI and Agent.
+    pending_provider_selection: Option<String>,
     /// Provider name to capture an API key for (e.g. "openrouter", "opengateway").
     /// When Some, the awaiting_api_key flow stores the key under this provider.
     api_key_target: Option<String>,
@@ -178,8 +184,11 @@ impl Tui {
             provider_picker_keys: Vec::new(),
             confirm_remove_provider: None,
             confirm_remove_sel: 0,
+            confirm_history_provider: None,
+            confirm_history_sel: 0,
             awaiting_api_key: false,
             pending_model_after_auth: false,
+            pending_provider_selection: None,
             api_key_target: None,
             show_command_picker: false,
             cmd_picker_list: vec![
@@ -489,14 +498,16 @@ impl Tui {
                             }
                             self.refresh_idle_suggestion();
                             if self.pending_model_after_auth {
-                                if crate::config::has_usable_credential(&self.provider) {
+                                let target = self.pending_provider_selection.clone()
+                                    .unwrap_or_else(|| self.provider.clone());
+                                if crate::config::has_usable_credential(&target) {
                                     // Signed in — now pick a model (live catalog available).
                                     self.pending_model_after_auth = false;
                                     self.output_lines.push(OutputLine {
                                         type_: "system".into(),
                                         content: format!(
                                             "Signed in to {}. Choose a model.",
-                                            self.provider
+                                            target
                                         ),
                                         tool_name: String::new(),
                                         duration: String::new(),
@@ -508,12 +519,12 @@ impl Tui {
                                         type_: "system".into(),
                                         content: format!(
                                             "OAuth for {} did not complete. Paste an API key below, or run `/auth login {}` again.",
-                                            self.provider, self.provider
+                                            target, target
                                         ),
                                         tool_name: String::new(),
                                         duration: String::new(),
                                     });
-                                    self.begin_api_key_prompt(&self.provider.clone());
+                                    self.begin_api_key_prompt(&target);
                                 }
                             }
                         }
@@ -722,7 +733,8 @@ impl Tui {
             || self.show_session_picker
             || self.show_command_picker
             || self.show_permission_prompt
-            || self.confirm_remove_provider.is_some();
+            || self.confirm_remove_provider.is_some()
+            || self.confirm_history_provider.is_some();
         if !picker_nav {
             match key.code {
                 KeyCode::PageUp => {
@@ -882,6 +894,23 @@ impl Tui {
             return true;
         }
 
+        if let Some(name) = self.confirm_history_provider.clone() {
+            match key.code {
+                KeyCode::Left => { self.confirm_history_sel = 0; }
+                KeyCode::Right => { self.confirm_history_sel = 1; }
+                KeyCode::Esc => { self.confirm_history_provider = None; }
+                KeyCode::Enter => {
+                    let proceed = self.confirm_history_sel == 1;
+                    self.confirm_history_provider = None;
+                    if proceed {
+                        self.begin_provider_selection(name);
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+
         match key.code {
             KeyCode::Up => {
                 if self.show_session_picker {
@@ -1013,7 +1042,7 @@ impl Tui {
             KeyCode::Esc => {
                 if self.awaiting_api_key {
                     self.awaiting_api_key = false;
-                    self.pending_model_after_auth = false;
+                    self.cancel_pending_provider_selection();
                     self.api_key_target = None;
                     self.input_buf.clear();
                     self.cursor = 0;
@@ -1029,7 +1058,10 @@ impl Tui {
                     self.cmd_picker_sel = 0;
                 }
                 else if self.show_provider_picker { self.show_provider_picker = false; }
-                else if self.show_model_picker { self.show_model_picker = false; }
+                else if self.show_model_picker {
+                    self.show_model_picker = false;
+                    self.cancel_pending_provider_selection();
+                }
                 else if self.show_session_picker {
                     self.show_session_picker = false;
                     self.session_picker_delete = false;
@@ -1044,7 +1076,7 @@ impl Tui {
                     if let Some(flag) = &self.cancel_flag {
                         flag.store(true, Ordering::Relaxed);
                     }
-                    self.state = State::Idle;
+                    self.cancel_pending_provider_selection();
                     self.flush_streaming();
                     self.output_lines.push(OutputLine {
                         type_: "system".into(), content: "Cancelled.".into(),
@@ -1064,31 +1096,12 @@ impl Tui {
                 if self.show_provider_picker {
                     if self.provider_picker_sel < self.provider_picker_list.len() {
                         let name = self.provider_picker_list[self.provider_picker_sel].clone();
-                        let providers = crate::llm::default_providers();
-                        if let Some(p) = providers.get(&name) {
-                            let default_model = p.default_model().to_string();
-                            self.provider = name.clone();
-                            // Provisional default until the user picks from the model list.
-                            self.model = if name == "openrouter" {
-                                "gpt-5-mini".to_string()
-                            } else {
-                                default_model
-                            };
-                            self.show_provider_picker = false;
-                            // Auth first (browser OAuth or API key), then model list.
-                            // Live catalogs need credentials; model-before-login was backwards.
-                            if crate::config::needs_credential(&name) {
-                                self.pending_model_after_auth = true;
-                                if crate::oauth::supports_oauth(&name) {
-                                    self.begin_oauth_login(&name, true);
-                                } else {
-                                    self.begin_api_key_prompt(&name);
-                                }
-                            } else {
-                                self.open_model_picker();
-                            }
+                        self.show_provider_picker = false;
+                        if self.provider_switch_needs_confirmation(&name) {
+                            self.confirm_history_provider = Some(name);
+                            self.confirm_history_sel = 0;
                         } else {
-                            self.show_provider_picker = false;
+                            self.begin_provider_selection(name);
                         }
                     } else {
                         self.show_provider_picker = false;
@@ -1097,11 +1110,16 @@ impl Tui {
                 }
                 if self.show_model_picker {
                     if self.picker_sel < self.picker_models.len() {
-                        self.model = self.picker_models[self.picker_sel].id.clone();
+                        let selected_model = self.picker_models[self.picker_sel].id.clone();
                         self.show_model_picker = false;
-                        self.finish_provider_model_selection(None);
+                        if let Some(provider) = self.pending_provider_selection.take() {
+                            self.provider = provider;
+                        }
+                        self.model = selected_model;
+                        self.finish_provider_model_selection();
                     } else {
                         self.show_model_picker = false;
+                        self.cancel_pending_provider_selection();
                     }
                     return true;
                 }
@@ -1153,23 +1171,53 @@ impl Tui {
                     let target = self.api_key_target.take().unwrap_or_else(|| self.provider.clone());
                     if self.pending_model_after_auth {
                         // Provider switch path: save key, then open model list (live catalog).
-                        self.pending_model_after_auth = false;
-                        self.provider = target.clone();
-                        crate::config::apply_key_to_env(&target, &key);
-                        let _ = crate::config::save_config(&target, &self.model, Some(&key));
-                        let tail = crate::config::mask_secret_display(&key, 4);
+                        match crate::config::save_api_key(&target, &key) {
+                            Ok(()) => {
+                                self.pending_model_after_auth = false;
+                                crate::config::apply_key_to_env(&target, &key);
+                                let tail = crate::config::mask_secret_display(&key, 4);
+                                self.output_lines.push(OutputLine {
+                                    type_: "system".into(),
+                                    content: format!(
+                                        "API key saved for {target} ({tail}). Choose a model."
+                                    ),
+                                    tool_name: String::new(),
+                                    duration: String::new(),
+                                });
+                                self.open_model_picker();
+                            }
+                            Err(error) => {
+                                self.cancel_pending_provider_selection();
+                                self.output_lines.push(OutputLine {
+                                    type_: "error".into(),
+                                    content: format!("Failed to save API key for {target}: {error}"),
+                                    tool_name: String::new(),
+                                    duration: String::new(),
+                                });
+                            }
+                        }
+                    } else {
+                        // `/auth key` saves credentials only; it must not bypass
+                        // cross-provider history-transfer confirmation.
+                        let (type_, content) = match crate::config::save_api_key(&target, &key) {
+                            Ok(()) => {
+                                crate::config::apply_key_to_env(&target, &key);
+                                (
+                                    "system",
+                                    format!(
+                                        "API key saved for {target} ({}).",
+                                        crate::config::mask_secret_display(&key, 4)
+                                    ),
+                                )
+                            }
+                            Err(error) => ("error", format!("Failed to save API key for {target}: {error}")),
+                        };
                         self.output_lines.push(OutputLine {
-                            type_: "system".into(),
-                            content: format!(
-                                "API key saved for {target} ({tail}). Choose a model."
-                            ),
+                            type_: type_.into(),
+                            content,
                             tool_name: String::new(),
                             duration: String::new(),
                         });
-                        self.open_model_picker();
-                    } else {
-                        // `/auth key` or similar: save and apply without forcing the model picker.
-                        self.finish_provider_model_selection(Some((target, key)));
                     }
                     return true;
                 }
@@ -1412,11 +1460,7 @@ impl Tui {
             "/model" => {
                 if parts.len() > 1 {
                     self.model = parts[1..].join(" ");
-                    let _ = crate::config::save_config(&self.provider, &self.model, None);
-                    self.output_lines.push(OutputLine {
-                        type_: "system".into(), content: format!("Model set to: {}", self.model),
-                        tool_name: String::new(), duration: String::new(),
-                    });
+                    self.finish_provider_model_selection();
                 } else {
                     self.open_model_picker();
                 }
@@ -1437,31 +1481,12 @@ impl Tui {
                 if parts.len() > 1 {
                     let name = parts[1].to_ascii_lowercase();
                     let providers = crate::llm::default_providers();
-                    if let Some(p) = providers.get(&name) {
-                        self.provider = name.clone();
-                        self.model = p.default_model().to_string();
-                        let _ = crate::config::save_config(&self.provider, &self.model, None);
-                        if crate::config::needs_credential(&name) {
-                            self.pending_model_after_auth = true;
-                            if crate::oauth::supports_oauth(&name) {
-                                self.begin_oauth_login(&name, true);
-                            } else {
-                                self.begin_api_key_prompt(&name);
-                            }
+                    if providers.contains_key(&name) {
+                        if self.provider_switch_needs_confirmation(&name) {
+                            self.confirm_history_provider = Some(name);
+                            self.confirm_history_sel = 0;
                         } else {
-                            self.output_lines.push(OutputLine {
-                                type_: "system".into(),
-                                content: format!(
-                                    "Provider set to: {}\nModel set to: {}",
-                                    self.provider, self.model
-                                ),
-                                tool_name: String::new(),
-                                duration: String::new(),
-                            });
-                            if let Some(tx) = &self.agent_tx {
-                                let _ = tx.send(format!("__switch__:{}:{}", self.provider, self.model));
-                            }
-                            self.open_model_picker();
+                            self.begin_provider_selection(name);
                         }
                     } else {
                         self.output_lines.push(OutputLine {
@@ -1626,11 +1651,24 @@ impl Tui {
 
     fn open_model_picker(&mut self) {
         let providers = crate::llm::default_providers();
-        if let Some(p) = providers.get(&self.provider) {
+        let provider_name = self.pending_provider_selection.as_deref()
+            .unwrap_or(&self.provider);
+        if let Some(p) = providers.get(provider_name) {
             self.picker_models = p.available_models();
+            let selected_model = if self.pending_provider_selection.is_some() {
+                if provider_name == "openrouter" {
+                    "gpt-5-mini"
+                } else {
+                    p.default_model()
+                }
+            } else {
+                &self.model
+            };
+            self.picker_sel = self.picker_models.iter()
+                .position(|m| m.id == selected_model)
+                .unwrap_or(0);
         }
         self.show_model_picker = true;
-        self.picker_sel = self.picker_models.iter().position(|m| m.id == self.model).unwrap_or(0);
         let vh = self.picker_visible_height();
         self.picker_scrl = self.picker_sel.saturating_sub(vh.saturating_sub(1));
     }
@@ -1649,6 +1687,47 @@ impl Tui {
         self.show_provider_picker = true;
     }
 
+    fn provider_switch_needs_confirmation(&self, provider: &str) -> bool {
+        if provider == self.provider {
+            return false;
+        }
+        if let Some(mirror) = &self.live_mirror {
+            if let Ok(snapshot) = mirror.lock() {
+                if !snapshot.messages.is_empty() {
+                    return true;
+                }
+            }
+        }
+        self.output_lines.iter().any(|line| {
+            matches!(line.type_.as_str(), "user" | "text" | "tool_use" | "tool_result")
+        })
+    }
+
+    fn begin_provider_selection(&mut self, name: String) {
+        let providers = crate::llm::default_providers();
+        if !providers.contains_key(&name) {
+            return;
+        }
+        self.pending_provider_selection = (name != self.provider).then(|| name.clone());
+        // Auth first (browser OAuth or API key), then model list. Live
+        // catalogs need credentials; model-before-login was backwards.
+        if crate::config::needs_credential(&name) {
+            self.pending_model_after_auth = true;
+            if crate::oauth::supports_oauth(&name) {
+                self.begin_oauth_login(&name, true);
+            } else {
+                self.begin_api_key_prompt(&name);
+            }
+        } else {
+            self.open_model_picker();
+        }
+    }
+
+    fn cancel_pending_provider_selection(&mut self) {
+        self.pending_model_after_auth = false;
+        self.pending_provider_selection = None;
+    }
+
     /// Claude Code Ctrl+C: interrupt running work; clear prompt when idle with
     /// text; on empty idle prompt, arm exit then quit on a second press.
     /// Returns `false` to exit the TUI.
@@ -1656,7 +1735,7 @@ impl Tui {
         // Close overlays / cancel key entry first (same spirit as Esc).
         if self.awaiting_api_key {
             self.awaiting_api_key = false;
-            self.pending_model_after_auth = false;
+            self.cancel_pending_provider_selection();
             self.api_key_target = None;
             self.input_buf.clear();
             self.cursor = 0;
@@ -1674,6 +1753,11 @@ impl Tui {
             self.ctrl_c_exit_armed = false;
             return true;
         }
+        if self.confirm_history_provider.is_some() {
+            self.confirm_history_provider = None;
+            self.ctrl_c_exit_armed = false;
+            return true;
+        }
         if self.show_command_picker {
             self.show_command_picker = false;
             self.ctrl_c_exit_armed = false;
@@ -1686,6 +1770,7 @@ impl Tui {
         }
         if self.show_model_picker {
             self.show_model_picker = false;
+            self.cancel_pending_provider_selection();
             self.ctrl_c_exit_armed = false;
             return true;
         }
@@ -1722,11 +1807,7 @@ impl Tui {
             if let Some(flag) = &self.cancel_flag {
                 flag.store(true, Ordering::Relaxed);
             }
-            // Tell the agent loop as well (if it listens for "cancel").
-            if let Some(tx) = &self.agent_tx {
-                let _ = tx.send("cancel".into());
-            }
-            self.state = State::Idle;
+            self.cancel_pending_provider_selection();
             self.flush_streaming();
             self.ctrl_c_exit_armed = false;
             self.output_lines.push(OutputLine {
@@ -1829,6 +1910,9 @@ impl Tui {
             });
             return;
         };
+        if let Some(flag) = &self.cancel_flag {
+            flag.store(false, Ordering::Relaxed);
+        }
         self.pending_model_after_auth = then_model_picker;
         self.state = State::Running;
         self.output_lines.push(OutputLine {
@@ -1840,35 +1924,27 @@ impl Tui {
         let _ = tx.send(format!("__auth_login__:{provider}"));
     }
 
-    /// Finish provider/model selection, optionally saving a freshly entered key.
-    fn finish_provider_model_selection(&mut self, new_key: Option<(String, String)>) {
-        if let Some((provider, key)) = new_key {
-            crate::config::apply_key_to_env(&provider, &key);
-            let _ = crate::config::save_config(&provider, &self.model, Some(&key));
-            self.provider = provider;
-            let tail = crate::config::mask_secret_display(&key, 4);
-            self.output_lines.push(OutputLine {
-                type_: "system".into(),
-                content: format!(
-                    "API key saved for {} ({}). Provider set to: {}\nModel set to: {}",
-                    self.provider, tail, self.provider, self.model
-                ),
-                tool_name: String::new(),
-                duration: String::new(),
-            });
-        } else {
-            let _ = crate::config::save_config(&self.provider, &self.model, None);
-            self.output_lines.push(OutputLine {
-                type_: "system".into(),
-                content: format!("Provider set to: {}\nModel set to: {}", self.provider, self.model),
-                tool_name: String::new(),
-                duration: String::new(),
-            });
-        }
+    /// Finish provider/model selection and synchronize the Agent.
+    fn finish_provider_model_selection(&mut self) {
+        Self::persist_provider_model(&self.provider, &self.model);
+        self.output_lines.push(OutputLine {
+            type_: "system".into(),
+            content: format!("Provider set to: {}\nModel set to: {}", self.provider, self.model),
+            tool_name: String::new(),
+            duration: String::new(),
+        });
         if let Some(tx) = &self.agent_tx {
             let _ = tx.send(format!("__switch__:{}:{}", self.provider, self.model));
         }
     }
+
+    #[cfg(not(test))]
+    fn persist_provider_model(provider: &str, model: &str) {
+        let _ = crate::config::save_config(provider, model, None);
+    }
+
+    #[cfg(test)]
+    fn persist_provider_model(_provider: &str, _model: &str) {}
 
     /// Prefer the agent's full transcript (tools included); fall back to TUI lines.
     fn session_snapshot(&self) -> (Vec<llm::Message>, u64, u64) {
@@ -2378,6 +2454,33 @@ impl Tui {
             for (i, opt) in options.iter().enumerate() {
                 if i > 0 { option_spans.push(Span::raw("  ")); }
                 let is_sel = i == self.confirm_remove_sel;
+                let open = if is_sel { "[" } else { " " };
+                let close = if is_sel { "]" } else { " " };
+                option_spans.push(Span::styled(
+                    format!("{open}{opt}{close}"),
+                    if is_sel { orange_fg.add_modifier(Modifier::BOLD) } else { dim },
+                ));
+            }
+            chrome.push(Line::from(option_spans));
+            chrome.push(Line::from(vec![
+                Span::styled("(← → navigate  Enter confirm  Esc cancel)", dim),
+            ]));
+        } else if let Some(name) = &self.confirm_history_provider {
+            chrome.push(Line::from(vec![
+                Span::styled(format!("Send existing conversation to '{name}'?"), white),
+            ]));
+            chrome.push(Line::from(vec![
+                Span::styled(
+                    "Existing prompts, source excerpts, and tool results will be sent to this provider.",
+                    dim,
+                ),
+            ]));
+            chrome.push(Line::from(""));
+            let options = ["Cancel", "Continue"];
+            let mut option_spans = Vec::new();
+            for (i, opt) in options.iter().enumerate() {
+                if i > 0 { option_spans.push(Span::raw("  ")); }
+                let is_sel = i == self.confirm_history_sel;
                 let open = if is_sel { "[" } else { " " };
                 let close = if is_sel { "]" } else { " " };
                 option_spans.push(Span::styled(
@@ -3308,6 +3411,139 @@ mod suggestion_tests {
 }
 
 #[cfg(test)]
+mod provider_privacy_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn tui_with_history() -> Tui {
+        let mut tui = Tui::new("test", "claude", "anthropic", ".");
+        tui.output_lines.push(OutputLine {
+            type_: "user".into(),
+            content: "inspect private source".into(),
+            tool_name: String::new(),
+            duration: String::new(),
+        });
+        tui
+    }
+
+    #[test]
+    fn cross_provider_switch_requires_confirmation_when_history_exists() {
+        let mut tui = tui_with_history();
+        tui.show_provider_picker = true;
+        tui.provider_picker_list = vec!["ollama".into()];
+        tui.provider_picker_sel = 0;
+
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(tui.provider, "anthropic");
+        assert_eq!(tui.confirm_history_provider.as_deref(), Some("ollama"));
+        assert_eq!(tui.confirm_history_sel, 0, "confirmation must default to cancel");
+
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(tui.provider, "anthropic", "default confirmation action must cancel");
+    }
+
+    #[test]
+    fn provider_command_uses_the_same_confirmation() {
+        let mut tui = tui_with_history();
+
+        tui.handle_command("/provider ollama");
+
+        assert_eq!(tui.provider, "anthropic");
+        assert_eq!(tui.confirm_history_provider.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn confirmed_cross_provider_switch_proceeds() {
+        let mut tui = tui_with_history();
+        tui.show_provider_picker = true;
+        tui.provider_picker_list = vec!["ollama".into()];
+        tui.provider_picker_sel = 0;
+
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(tui.provider, "anthropic", "provider stays committed until model selection");
+        assert_eq!(tui.pending_provider_selection.as_deref(), Some("ollama"));
+        assert!(tui.show_model_picker);
+
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(tui.provider, "ollama");
+        assert!(tui.pending_provider_selection.is_none());
+    }
+
+    #[test]
+    fn same_provider_or_empty_history_does_not_require_confirmation() {
+        let tui = tui_with_history();
+        assert!(!tui.provider_switch_needs_confirmation("anthropic"));
+
+        let empty = Tui::new("test", "claude", "anthropic", ".");
+        assert!(!empty.provider_switch_needs_confirmation("ollama"));
+    }
+
+    #[test]
+    fn selecting_current_provider_preserves_current_model_selection() {
+        let mut tui = Tui::new("test", "mistral", "ollama", ".");
+
+        tui.begin_provider_selection("ollama".into());
+
+        assert!(tui.pending_provider_selection.is_none());
+        assert!(tui.show_model_picker);
+        assert_eq!(tui.picker_models[tui.picker_sel].id, "mistral");
+    }
+
+    #[test]
+    fn cancelling_provider_model_picker_keeps_committed_provider_and_model() {
+        let mut tui = tui_with_history();
+        tui.show_provider_picker = true;
+        tui.provider_picker_list = vec!["ollama".into()];
+
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(tui.show_model_picker);
+
+        tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(tui.provider, "anthropic");
+        assert_eq!(tui.model, "claude");
+        assert!(tui.pending_provider_selection.is_none());
+    }
+
+    #[test]
+    fn direct_model_command_switches_agent_model() {
+        let mut tui = Tui::new("test", "old-model", "ollama", ".");
+        let (tx, rx) = mpsc::channel();
+        tui.agent_tx = Some(tx);
+
+        tui.handle_command("/model new-model");
+
+        assert_eq!(tui.model, "new-model");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "__switch__:ollama:new-model"
+        );
+    }
+
+    #[test]
+    fn interrupt_waits_for_worker_done_before_becoming_idle() {
+        let mut tui = Tui::new("test", "llama3.2", "ollama", ".");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        tui.cancel_flag = Some(cancelled.clone());
+        tui.agent_tx = Some(tx);
+        tui.state = State::Running;
+
+        assert!(tui.handle_ctrl_c());
+
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(matches!(tui.state, State::Running));
+        assert!(rx.try_recv().is_err(), "cancellation must not leave a stale command queued");
+    }
+}
+
+#[cfg(test)]
 mod completion_tests {
     use super::*;
 
@@ -3714,5 +3950,3 @@ mod tool_display_tests {
         assert!(h.contains("pattern=src/**/*.rs"), "{h}");
     }
 }
-
-

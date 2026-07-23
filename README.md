@@ -1,11 +1,15 @@
+<p align="center">
+  <img src="docs/banner.png" alt="Cairn Code" width="560">
+</p>
+
 # Cairn Code
 
 [![CI](https://github.com/Cairn/cairn-code/actions/workflows/ci.yml/badge.svg)](https://github.com/Cairn/cairn-code/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-1.96-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Providers](https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20OpenRouter%20%7C%20OpenGateway%20%7C%20xAI%20%7C%20Ollama-blue)](#)
+[![Providers](https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20OpenRouter%20%7C%20OpenGateway%20%7C%20xAI%20%7C%20Ollama-blue)](#features)
 [![TUI](https://img.shields.io/badge/TUI-ratatui-yellow)](https://ratatui.rs/)
-[![Tools](https://img.shields.io/badge/tools-13-brightgreen)](#)
+[![Tools](https://img.shields.io/badge/tools-14-brightgreen)](#tools)
 
 A Rust-based CLI LLM coding agent, inspired by Claude Code and Zero. Built by Cairn.
 
@@ -13,7 +17,7 @@ A Rust-based CLI LLM coding agent, inspired by Claude Code and Zero. Built by Ca
 
 - **Multi-provider LLM support** — Anthropic, OpenAI, OpenRouter, OpenGateway, xAI/Grok (API key or OAuth device login), Ollama
 - **Agentic tool loop** — The LLM autonomously reads files, writes code, runs commands, and searches your codebase until the task is done
-- **13 built-in tools** — FileRead, FileWrite, FileEdit, FileUndo, Shell, Go, Git, Glob, Grep, Memory, WebSearch, WebFetch, TodoWrite
+- **14 built-in tools** — FileRead, FileWrite, FileEdit, FileUndo, Shell, PowerShell, Go, Git, Glob, Grep, Memory, WebSearch, WebFetch, TodoWrite
 - **Real-time streaming** — Token-by-token output with live tool display and thinking blocks
 - **Ratatui TUI** — Terminal UI with input history, spinner, provider/model pickers, and syntect-highlighted fenced code blocks
 - **Cost tracking** — Per-session and per-tool-call token usage with cache-aware pricing
