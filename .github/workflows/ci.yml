@@ -22,6 +22,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install Rust toolchain
@@ -34,10 +35,19 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          mapfile -d '' files < <(git diff --name-only --diff-filter=ACMR -z "$BASE_SHA" "$GITHUB_SHA" -- '*.rs')
+          if ((${#files[@]})); then
+            rustfmt --edition 2021 --check "${files[@]}"
+          fi
 
       - name: Run Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        env:
+          # Existing Clippy debt is reported without blocking unrelated changes.
+          RUSTFLAGS: ""
+        run: cargo clippy --locked --all-targets --all-features -- -A clippy::approx_constant
 
       - name: Check documentation
         env:

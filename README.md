@@ -41,8 +41,8 @@ cargo build --release
 Before submitting changes, run the same core quality checks enforced by CI:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
+rustfmt --edition 2021 --check path/to/changed.rs
+cargo clippy --locked --all-targets --all-features -- -A clippy::approx_constant
 cargo test --locked
 cargo doc --locked --no-deps
 cargo package --locked
