@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+reviews:
+  # Report commit status checks
+  commit_status: true
+  # Fail the status check if CodeRabbit cannot review (rate limited, errors, etc.)
+  fail_commit_status: true
+  # Show status messages when reviews are skipped
+  review_status: true
+  # Do not auto-approve PRs
+  request_changes_workflow: false
