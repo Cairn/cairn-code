@@ -114,8 +114,8 @@ src/
     file_history.rs      In-process undo stack for edit/write
     file_undo.rs         Undo last file_edit/file_write
     shell.rs             Shell command execution with timeout
-    go_tool.rs           Go command execution (no shell injection)
-    git_tool.rs          Git command execution (no shell injection)
+    go_tool.rs           Go command execution with direct arguments
+    git_tool.rs          Git command execution (shell-equivalent risk)
     glob_tool.rs         File pattern matching (glob)
     grep_tool.rs         Regex search across codebase
     memory.rs            Cross-session memory storage/retrieval
@@ -145,8 +145,8 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | **file_edit** | Find-and-replace editing | Yes |
 | **file_undo** | Undo last file_edit/file_write in this process | Yes |
 | **shell** | Execute shell commands with timeout | Yes |
-| **go** | Execute Go commands (avoids shell injection) | Yes |
-| **git** | Execute Git commands (avoids shell injection) | Yes |
+| **go** | Execute Go commands with a JSON array of arguments | Yes |
+| **git** | Execute Git commands with a JSON argument array; shell-equivalent risk | Yes |
 | **glob** | File pattern matching | No |
 | **grep** | Regex search across the codebase | No |
 | **memory** | Store and retrieve cross-session information | No |

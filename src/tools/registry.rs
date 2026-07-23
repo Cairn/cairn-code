@@ -69,8 +69,12 @@ pub fn default_registry() -> Registry {
     r.register(Box::new(crate::tools::file_undo::FileUndoTool));
     r.register(Box::new(crate::tools::shell::ShellTool));
     r.register(Box::new(crate::tools::powershell_tool::PowerShellTool));
-    r.register(Box::new(crate::tools::go_tool::GoTool));
-    r.register(Box::new(crate::tools::git_tool::GitTool));
+    r.register(Box::new(crate::tools::go_tool::GoTool::new(
+        workspace.clone(),
+    )));
+    r.register(Box::new(crate::tools::git_tool::GitTool::new(
+        workspace.clone(),
+    )));
     r.register(Box::new(crate::tools::glob_tool::GlobTool::new(
         workspace.clone(),
     )));

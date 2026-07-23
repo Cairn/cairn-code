@@ -61,6 +61,10 @@ impl Workspace {
         &self.dir
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn access_error(&self, path: &Path, error: std::io::Error) -> String {
         if error.kind() == std::io::ErrorKind::PermissionDenied {
             self.outside(path)

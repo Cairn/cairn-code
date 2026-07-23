@@ -2583,6 +2583,11 @@ impl Tui {
             chrome.push(Line::from(vec![
                 Span::styled(format!("Tool '{}' wants to run:", self.perm_tool_name), white),
             ]));
+            if let Some(warning) = permission_risk_warning(&self.perm_tool_name) {
+                chrome.push(Line::from(vec![
+                    Span::styled(format!("  {warning}"), orange_fg),
+                ]));
+            }
             if !self.perm_tool_input.is_empty() {
                 chrome.push(Line::from(vec![
                     Span::styled(format!("  {}", self.perm_tool_input), dim),
@@ -3747,6 +3752,15 @@ fn truncate_display(s: &str, head_lines: usize, tail_lines: usize) -> String {
     out
 }
 
+fn permission_risk_warning(tool_name: &str) -> Option<&'static str> {
+    match tool_name {
+        "git" => Some(
+            "Shell-equivalent risk: Git may execute aliases, hooks, helpers, and configured commands.",
+        ),
+        _ => None,
+    }
+}
+
 /// One-line arg preview for tool_use rows (avoid dumping pretty JSON).
 fn compact_tool_arg_hint(input: &str) -> String {
     let trimmed = input.trim();
@@ -3772,6 +3786,17 @@ fn compact_tool_arg_hint(input: &str) -> String {
                     let ellipsis = if v.chars().count() > 64 { "…" } else { "" };
                     return format!("{key}={shown}{ellipsis}");
                 }
+            }
+            if let Some(args) = obj.get("args").and_then(|value| value.as_array()) {
+                let args = args
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(|value| format!("{value:?}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let shown: String = args.chars().take(64).collect();
+                let ellipsis = if args.chars().count() > 64 { "…" } else { "" };
+                return format!("args={shown}{ellipsis}");
             }
         }
     }
@@ -3926,5 +3951,18 @@ mod tool_display_tests {
     fn compact_tool_arg_hint_extracts_pattern() {
         let h = compact_tool_arg_hint(r#"{"pattern":"src/**/*.rs"}"#);
         assert!(h.contains("pattern=src/**/*.rs"), "{h}");
+    }
+
+    #[test]
+    fn compact_tool_arg_hint_preserves_array_boundaries() {
+        let hint = compact_tool_arg_hint(r#"{"args":["status","path with spaces",""]}"#);
+        assert_eq!(hint, r#"args="status" "path with spaces" """#);
+    }
+
+    #[test]
+    fn git_permission_warning_classifies_shell_equivalent_risk() {
+        let warning = permission_risk_warning("git").unwrap();
+        assert!(warning.contains("Shell-equivalent risk"));
+        assert!(permission_risk_warning("go").is_none());
     }
 }
