@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +17,8 @@ pub struct LiveSnapshot {
 }
 
 pub type LiveMirror = Arc<Mutex<LiveSnapshot>>;
+
+static LAST_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
 pub fn new_live_mirror() -> LiveMirror {
     Arc::new(Mutex::new(LiveSnapshot::default()))
@@ -33,10 +36,16 @@ pub struct Session {
 }
 
 pub fn new_id() -> String {
-    let nanos = SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos();
+        .as_nanos() as u64;
+    let nanos = LAST_SESSION_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            Some(now.max(last.saturating_add(1)))
+        })
+        .map(|last| now.max(last.saturating_add(1)))
+        .unwrap_or(now);
     format!("{:016x}", nanos)
 }
 
