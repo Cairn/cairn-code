@@ -3,12 +3,13 @@ use cap_std::{
     ambient_authority,
     fs::{Dir, File, OpenOptions},
 };
-use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use super::registry::Tool;
 
 pub struct MemoryTool;
+static MEMORY_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl Tool for MemoryTool {
     fn name(&self) -> &str { "memory" }
@@ -44,53 +45,29 @@ impl Tool for MemoryTool {
         let obj = val.as_object().ok_or("expected object")?;
         let action = obj.get("action").and_then(|v| v.as_str()).ok_or("action required")?;
 
-        let dir = memory_dir();
-
         match action {
             "save" => {
                 let key = obj.get("key").and_then(|v| v.as_str()).ok_or("key required for save")?;
                 let content = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                let root = open_memory_dir(&dir, true)?;
-                let name = memory_file_name(key)?;
-                let now = timestamp();
-                let (created, existing_content) = match read_memory_file(&root, &name, key) {
-                    Ok(existing) => {
-                        let c = parse_frontmatter(&existing);
-                        (c.0, c.1)
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        (now.clone(), String::new())
-                    }
-                    Err(_) => {
-                        (now.clone(), String::new())
-                    }
-                };
-                let body = if content.is_empty() { &existing_content } else { content };
-                let out = format!("---\nkey: {key}\ncreated_at: {created}\nupdated_at: {now}\n---\n\n{body}");
-                let mut options = OpenOptions::new();
-                options.write(true).create(true).truncate(true);
-                let mut file = open_memory_file(&root, &name, key, &options)
-                    .map_err(|e| format!("write: {e}"))?;
-                file.write_all(out.as_bytes()).map_err(|e| format!("write: {e}"))?;
+                let root = open_memory_dir(true).map_err(|e| format!("open memory directory: {e}"))?;
+                save_memory(&root, key, content)?;
                 Ok(format!("Saved memory '{}'", key))
             }
             "recall" => {
                 let key = obj.get("key").and_then(|v| v.as_str()).ok_or("key required for recall")?;
-                if !dir.exists() {
+                let Some(root) = open_existing_memory_dir()? else {
                     return Err(format!("Memory '{}' not found", key));
-                }
-                let root = open_memory_dir(&dir, false)?;
+                };
                 let content = read_memory(&root, key)?;
                 let (_, body) = parse_frontmatter(&content);
                 Ok(format!("---\n{}\n{}", key, body.trim()))
             }
             "list" => {
                 let query = obj.get("query").and_then(|v| v.as_str()).unwrap_or("");
-                if !dir.exists() {
+                let Some(root) = open_existing_memory_dir()? else {
                     return Ok("No memories found.".to_string());
-                }
+                };
                 let mut entries: Vec<String> = Vec::new();
-                let root = open_memory_dir(&dir, false)?;
                 for entry in root.entries().map_err(|e| format!("read dir: {e}"))? {
                     let entry = entry.map_err(|e| format!("entry: {e}"))?;
                     let name = entry.file_name().to_string_lossy().to_string();
@@ -113,10 +90,9 @@ impl Tool for MemoryTool {
             }
             "delete" => {
                 let key = obj.get("key").and_then(|v| v.as_str()).ok_or("key required for delete")?;
-                if !dir.exists() {
+                let Some(root) = open_existing_memory_dir()? else {
                     return Err(format!("Memory '{}' not found", key));
-                }
-                let root = open_memory_dir(&dir, false)?;
+                };
                 let name = memory_file_name(key)?;
                 reject_symlink(&root, &name, key)?;
                 root.remove_file(&name).map_err(|e| {
@@ -131,11 +107,10 @@ impl Tool for MemoryTool {
             "search" => {
                 let query = obj.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 if query.is_empty() { return Err("query required for search".into()); }
-                if !dir.exists() {
+                let Some(root) = open_existing_memory_dir()? else {
                     return Ok("No memories match query.".to_string());
-                }
+                };
                 let mut results: Vec<(String, String)> = Vec::new();
-                let root = open_memory_dir(&dir, false)?;
                 for entry in root.entries().map_err(|e| format!("read dir: {e}"))? {
                     let entry = entry.map_err(|e| format!("entry: {e}"))?;
                     let name = entry.file_name().to_string_lossy().to_string();
@@ -161,11 +136,11 @@ impl Tool for MemoryTool {
     }
 }
 
-fn memory_dir() -> PathBuf {
-    let home = std::env::var("HOME")
+fn memory_home() -> Result<PathBuf, String> {
+    std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config/cairn-code/memory")
+        .map(PathBuf::from)
+        .map_err(|_| "HOME or USERPROFILE is required for memory storage".to_string())
 }
 
 fn validate_memory_key(key: &str) -> Result<(), String> {
@@ -182,22 +157,78 @@ fn memory_file_name(key: &str) -> Result<String, String> {
     Ok(format!("{key}.md"))
 }
 
-fn open_memory_dir(dir: &Path, create: bool) -> Result<Dir, String> {
-    let parent_path = dir.parent().ok_or("memory directory has no parent")?;
-    let name = dir.file_name().ok_or("memory directory has no name")?;
-    if create && !parent_path.exists() {
-        fs::create_dir_all(parent_path).map_err(|e| format!("mkdir: {e}"))?;
-    }
-    let parent = Dir::open_ambient_dir(parent_path, ambient_authority())
-        .map_err(|e| format!("open memory directory parent: {e}"))?;
-    if create {
-        match parent.create_dir(name) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(format!("mkdir: {error}")),
+fn open_memory_dir(create: bool) -> std::io::Result<Dir> {
+    let home = memory_home().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    open_memory_dir_at(&home, create)
+}
+
+fn open_memory_dir_at(home: &Path, create: bool) -> std::io::Result<Dir> {
+    let mut current = Dir::open_ambient_dir(home, ambient_authority())?;
+    for component in [".config", "cairn-code", "memory"] {
+        if create {
+            match current.create_dir(component) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
         }
+        current = current.open_dir_nofollow(component)?;
     }
-    parent.open_dir_nofollow(name).map_err(|e| format!("open memory directory: {e}"))
+    Ok(current)
+}
+
+fn open_existing_memory_dir() -> Result<Option<Dir>, String> {
+    match open_memory_dir(false) {
+        Ok(dir) => Ok(Some(dir)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("open memory directory: {error}")),
+    }
+}
+
+fn save_memory(root: &Dir, key: &str, content: &str) -> Result<(), String> {
+    let name = memory_file_name(key)?;
+    let now = timestamp();
+    let (created, existing_content) = match read_memory_file(root, &name, key) {
+        Ok(existing) => parse_frontmatter(&existing),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            (now.clone(), String::new())
+        }
+        Err(error) => return Err(format!("read existing memory: {error}")),
+    };
+    let body = if content.is_empty() { &existing_content } else { content };
+    let output = format!("---\nkey: {key}\ncreated_at: {created}\nupdated_at: {now}\n---\n\n{body}");
+    write_memory_file_atomic(root, &name, output.as_bytes()).map_err(|e| format!("write: {e}"))
+}
+
+fn write_memory_file_atomic(root: &Dir, name: &str, contents: &[u8]) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+
+    for _ in 0..16 {
+        let sequence = MEMORY_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_name = format!(".memory-{}-{sequence}.tmp", std::process::id());
+        let mut file = match open_memory_file(root, &temp_name, &temp_name, &options) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+
+        let result = (|| {
+            file.write_all(contents)?;
+            file.sync_all()?;
+            drop(file);
+            root.rename(&temp_name, root, name)
+        })();
+        if result.is_err() {
+            let _ = root.remove_file(&temp_name);
+        }
+        return result;
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a temporary memory file",
+    ))
 }
 
 fn reject_symlink(root: &Dir, name: &str, key: &str) -> Result<(), String> {
@@ -302,6 +333,7 @@ fn parse_frontmatter(content: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn temp_path(label: &str) -> PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -376,13 +408,12 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let base = temp_path("symlink-test");
-        let dir = base.join("memory");
         let outside = base.join("outside.md");
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&base).unwrap();
+        let root = open_memory_dir_at(&base, true).unwrap();
         fs::write(&outside, "secret").unwrap();
-        symlink(&outside, dir.join("linked.md")).unwrap();
+        symlink(&outside, base.join(".config/cairn-code/memory/linked.md")).unwrap();
 
-        let root = open_memory_dir(&dir, false).unwrap();
         let error = read_memory(&root, "linked").unwrap_err();
         assert!(error.contains("symlink"), "unexpected error: {error}");
 
@@ -395,31 +426,53 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let base = temp_path("symlink-swap-test");
-        let dir = base.join("memory");
         let outside = base.join("outside.md");
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&base).unwrap();
+        let root = open_memory_dir_at(&base, true).unwrap();
         fs::write(&outside, "secret").unwrap();
 
-        let root = open_memory_dir(&dir, false).unwrap();
         reject_symlink(&root, "linked.md", "linked").unwrap();
-        symlink(&outside, dir.join("linked.md")).unwrap();
+        symlink(&outside, base.join(".config/cairn-code/memory/linked.md")).unwrap();
 
         assert!(read_memory_file(&root, "linked.md", "linked").is_err());
 
         let _ = fs::remove_dir_all(base);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_memory_root_rejects_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_path("parent-symlink-test");
+        let home = base.join("home");
+        let outside = base.join("outside");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(outside.join("cairn-code/memory")).unwrap();
+        fs::write(outside.join("cairn-code/memory/sentinel.md"), "outside secret").unwrap();
+        symlink(&outside, home.join(".config")).unwrap();
+
+        assert!(open_memory_dir_at(&home, false).is_err());
+        assert_eq!(
+            fs::read_to_string(outside.join("cairn-code/memory/sentinel.md")).unwrap(),
+            "outside secret"
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
     #[cfg(windows)]
     #[test]
-    fn test_memory_path_rejects_junction() {
+    fn test_memory_root_rejects_junctioned_parent() {
         use std::process::Command;
 
         let base = temp_path("junction-test");
-        let dir = base.join("memory");
+        let home = base.join("home");
         let outside = base.join("outside");
-        let junction = dir.join("linked.md");
-        fs::create_dir_all(&dir).unwrap();
-        fs::create_dir_all(&outside).unwrap();
+        let junction = home.join(".config");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(outside.join("cairn-code/memory")).unwrap();
+        fs::write(outside.join("cairn-code/memory/sentinel.md"), "outside secret").unwrap();
 
         let status = Command::new("cmd")
             .args(["/C", "mklink", "/J"])
@@ -429,13 +482,45 @@ mod tests {
             .unwrap();
         assert!(status.success(), "failed to create test junction");
 
-        let root = open_memory_dir(&dir, false).unwrap();
-        let error = read_memory(&root, "linked").unwrap_err();
-        assert!(
-            error.contains("outside") || error.contains("symlink"),
-            "unexpected error: {error}"
+        assert!(open_memory_dir_at(&home, false).is_err());
+        assert_eq!(
+            fs::read_to_string(outside.join("cairn-code/memory/sentinel.md")).unwrap(),
+            "outside secret"
         );
 
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_save_replaces_hard_link_without_modifying_outside_file() {
+        let base = temp_path("hard-link-test");
+        let outside = base.join("outside.md");
+        let memory_path = base.join(".config/cairn-code/memory/linked.md");
+        fs::create_dir_all(&base).unwrap();
+        let root = open_memory_dir_at(&base, true).unwrap();
+        fs::write(&outside, "outside content").unwrap();
+        fs::hard_link(&outside, &memory_path).unwrap();
+
+        save_memory(&root, "linked", "new memory").unwrap();
+
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside content");
+        assert!(fs::read_to_string(&memory_path).unwrap().contains("new memory"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_save_read_error_preserves_existing_file() {
+        let base = temp_path("read-error-test");
+        let memory_path = base.join(".config/cairn-code/memory/binary.md");
+        fs::create_dir_all(&base).unwrap();
+        let root = open_memory_dir_at(&base, true).unwrap();
+        let original = [0xff, 0xfe, 0xfd];
+        fs::write(&memory_path, original).unwrap();
+
+        let error = save_memory(&root, "binary", "replacement").unwrap_err();
+
+        assert!(error.contains("read existing memory"), "unexpected error: {error}");
+        assert_eq!(fs::read(&memory_path).unwrap(), original);
         let _ = fs::remove_dir_all(base);
     }
 
