@@ -1,4 +1,3 @@
-use std::fs;
 use super::registry::Tool;
 
 pub struct FileEditTool;
@@ -20,8 +19,8 @@ impl Tool for FileEditTool {
         let new_string = obj.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
         let replace_all = obj.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
 
-        let resolved = super::workspace::resolve_in_workspace(file_path)?;
-        let content = fs::read_to_string(&resolved).map_err(|e| format!("read error: {e}"))?;
+        let secured = super::workspace::acquire(file_path, false, true)?;
+        let content = secured.previous.clone().expect("required existing file");
 
         // Exact match first; if that fails, retry tolerant of CRLF/LF
         // differences between the file and a model-generated old_string
@@ -82,8 +81,8 @@ impl Tool for FileEditTool {
             1
         };
 
-        super::file_history::record_snapshot(resolved.clone(), file_path, content);
-        fs::write(&resolved, &new_content).map_err(|e| format!("write error: {e}"))?;
+        super::workspace::atomic_replace(&secured, &new_content)?;
+        super::file_history::record_snapshot(secured.relative, file_path, Some(content));
         Ok(format!("Applied {count} edit(s) to {file_path}"))
     }
 }
@@ -91,6 +90,14 @@ impl Tool for FileEditTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_path(label: &str) -> String {
+        format!("target/cairn_{label}_{}_{}", std::process::id(), TEST_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
 
     #[test]
     fn test_workspace_escape_is_rejected() {
@@ -102,33 +109,60 @@ mod tests {
 
     #[test]
     fn test_workspace_escape_after_nonexistent_prefix_is_rejected() {
+        let prefix = unique_path("missing_edit_prefix");
+        let victim = format!(
+            "outside_cairn_edit_{}_{}.txt",
+            std::process::id(),
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let outside = std::env::current_dir().unwrap().parent().unwrap().join(&victim);
+        assert!(!outside.exists(), "unique outside victim unexpectedly exists");
+        fs::write(&outside, "original").unwrap();
         let tool = FileEditTool;
-        let input = r#"{"file_path":"target/cairn_missing_edit_prefix/../../../outside_cairn_edit_test.txt","old_string":"a","new_string":"b"}"#;
-        let err = tool.execute(input).unwrap_err();
+        let input = format!(r#"{{"file_path":"{prefix}/../../../{victim}","old_string":"original","new_string":"changed"}}"#);
+        let err = tool.execute(&input).unwrap_err();
         assert!(err.contains("outside the workspace"), "unexpected error: {err}");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "original");
+        assert!(!std::path::Path::new(&prefix).exists());
+        fs::remove_file(outside).unwrap();
     }
 
     #[test]
     fn test_exact_match_replaces_content() {
-        let path = "target/cairn_file_edit_test_exact.txt";
-        fs::write(path, "hello world").unwrap();
+        let path = unique_path("file_edit_exact");
+        fs::write(&path, "hello world").unwrap();
         let tool = FileEditTool;
         let input = format!(r#"{{"file_path":"{path}","old_string":"world","new_string":"rust"}}"#);
         tool.execute(&input).unwrap();
-        assert_eq!(fs::read_to_string(path).unwrap(), "hello rust");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello rust");
         let _ = fs::remove_file(path);
     }
 
     #[test]
     fn test_crlf_fallback_match_preserves_crlf() {
-        let path = "target/cairn_file_edit_test_crlf.txt";
-        fs::write(path, "line1\r\nline2\r\nline3").unwrap();
+        let path = unique_path("file_edit_crlf");
+        fs::write(&path, "line1\r\nline2\r\nline3").unwrap();
         let tool = FileEditTool;
         // old_string uses bare \n, the file uses \r\n: exact match fails, the
         // CRLF-tolerant fallback should still find and apply it.
         let input = format!(r#"{{"file_path":"{path}","old_string":"line1\nline2","new_string":"REPLACED"}}"#);
         tool.execute(&input).unwrap();
-        assert_eq!(fs::read_to_string(path).unwrap(), "REPLACED\r\nline3");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "REPLACED\r\nline3");
         let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_final_symlink_cannot_modify_outside_file() {
+        use std::os::unix::fs::symlink;
+        let link = unique_path("edit_link");
+        let outside = std::env::temp_dir().join(format!("cairn-outside-edit-{}-{}", std::process::id(), TEST_COUNTER.fetch_add(1, Ordering::Relaxed)));
+        fs::write(&outside, "original").unwrap();
+        symlink(&outside, &link).unwrap();
+        let input = format!(r#"{{"file_path":"{link}","old_string":"original","new_string":"changed"}}"#);
+        assert!(FileEditTool.execute(&input).is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "original");
+        fs::remove_file(link).unwrap();
+        fs::remove_file(outside).unwrap();
     }
 }
