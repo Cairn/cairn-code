@@ -127,4 +127,12 @@ jobs:
         run: cargo build --locked
 
       - name: Test
+        if: runner.os != 'Windows'
         run: cargo test --locked
+
+      - name: Test (Windows without OS keyring integration)
+        if: runner.os == 'Windows'
+        run: >-
+          cargo test --locked --
+          --skip config::tests::test_keyring_set_get_delete_roundtrip
+          --skip config::tests::test_migrate_plaintext_keys_moves_to_keyring_and_strips_file
