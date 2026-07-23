@@ -1,5 +1,6 @@
 use super::registry::Tool;
 use super::workspace::Workspace;
+#[cfg(test)]
 use std::fs;
 
 pub struct FileReadTool {
@@ -37,11 +38,15 @@ impl Tool for FileReadTool {
         let offset = obj.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let limit = obj.get("limit").and_then(|v| v.as_u64());
 
-        let resolved = self
+        let relative = self
             .workspace
-            .resolve_existing(file_path)
+            .relative_path(file_path)
             .map_err(|e| format!("read error: {e}"))?;
-        let content = fs::read_to_string(resolved).map_err(|e| format!("read error: {e}"))?;
+        let content = self
+            .workspace
+            .dir()
+            .read_to_string(&relative)
+            .map_err(|e| format!("read error: {}", self.workspace.access_error(&relative, e)))?;
         let lines: Vec<&str> = content.lines().collect();
 
         let start = offset.min(lines.len());

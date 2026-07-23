@@ -1,8 +1,10 @@
 use super::registry::Tool;
 use super::workspace::Workspace;
-use std::collections::HashSet;
+use cap_std::fs::{Dir, File};
+#[cfg(test)]
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::Path;
 
 pub struct GrepTool {
     workspace: Workspace,
@@ -50,22 +52,35 @@ impl Tool for GrepTool {
         ))
         .map_err(|e| format!("invalid pattern: {e}"))?;
 
-        let search_path = self.workspace.resolve_existing(search_path)?;
-        let mut results = Vec::new();
-        let relative = workspace_relative(&search_path, self.workspace.root())?;
-        if search_path.is_file() {
-            search_file(&search_path, &re, include, &relative, &mut results);
+        let search_path = self.workspace.relative_path(search_path)?;
+        let access_path = if search_path.as_os_str().is_empty() {
+            Path::new(".")
         } else {
-            let mut visited = HashSet::from([search_path.clone()]);
-            search_dir(
-                &search_path,
-                &self.workspace,
-                &mut visited,
-                &re,
-                include,
-                &relative,
-                &mut results,
-            )?;
+            &search_path
+        };
+        let mut results = Vec::new();
+        let relative = display_path(&search_path);
+        let metadata = match self.workspace.dir().metadata(access_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok("No matches found.".into());
+            }
+            Err(error) => return Err(self.workspace.access_error(&search_path, error)),
+        };
+        if metadata.is_file() {
+            let file = self
+                .workspace
+                .dir()
+                .open(access_path)
+                .map_err(|error| self.workspace.access_error(&search_path, error))?;
+            search_file(file, &search_path, &re, include, &relative, &mut results);
+        } else if metadata.is_dir() {
+            let dir = self
+                .workspace
+                .dir()
+                .open_dir(access_path)
+                .map_err(|error| self.workspace.access_error(&search_path, error))?;
+            search_dir(&dir, &re, include, &relative, &mut results)?;
         }
 
         if results.is_empty() {
@@ -144,6 +159,19 @@ mod tests {
         );
         let out = tool.execute(&input).unwrap();
         assert!(out.contains("No matches"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_in_workspace_path_is_an_empty_result() {
+        let dir = temp_dir();
+        let tool = GrepTool::new(Workspace::new(&dir).unwrap());
+
+        let out = tool
+            .execute(r#"{"pattern":"anything","path":"missing"}"#)
+            .unwrap();
+        assert_eq!(out, "No matches found.");
+
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -280,17 +308,15 @@ mod tests {
 }
 
 fn search_dir(
-    dir: &Path,
-    workspace: &Workspace,
-    visited: &mut HashSet<PathBuf>,
+    dir: &Dir,
     re: &SimpleRe,
     include: Option<&str>,
     relative: &str,
     results: &mut Vec<(String, usize, String)>,
 ) -> Result<(), String> {
-    if let Ok(entries) = fs::read_dir(dir) {
+    if let Ok(entries) = dir.entries() {
         for entry in entries.flatten() {
-            let Ok(path) = workspace.resolve_existing(entry.path()) else {
+            let Ok(file_type) = entry.file_type() else {
                 continue;
             };
             let name = entry.file_name().to_string_lossy().to_string();
@@ -306,12 +332,14 @@ fn search_dir(
                 format!("{relative}/{name}")
             };
 
-            if path.is_dir() {
-                if visited.insert(path.clone()) {
-                    search_dir(&path, workspace, visited, re, include, &rel, results)?;
+            if file_type.is_dir() {
+                if let Ok(child) = entry.open_dir() {
+                    search_dir(&child, re, include, &rel, results)?;
                 }
-            } else if path.is_file() {
-                search_file(&path, re, include, &rel, results);
+            } else if file_type.is_file() {
+                if let Ok(file) = entry.open() {
+                    search_file(file, Path::new(&name), re, include, &rel, results);
+                }
             }
         }
     }
@@ -319,6 +347,7 @@ fn search_dir(
 }
 
 fn search_file(
+    mut file: File,
     path: &Path,
     re: &SimpleRe,
     include: Option<&str>,
@@ -335,7 +364,8 @@ fn search_file(
         }
     }
 
-    if let Ok(content) = fs::read_to_string(path) {
+    let mut content = String::new();
+    if file.read_to_string(&mut content).is_ok() {
         for (index, line) in content.lines().enumerate() {
             if re.is_match(line) {
                 results.push((relative.to_string(), index + 1, line.to_string()));
@@ -344,22 +374,11 @@ fn search_file(
     }
 }
 
-fn workspace_relative(path: &Path, root: &Path) -> Result<String, String> {
-    path.strip_prefix(root)
-        .map(|relative| {
-            relative
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/")
-        })
-        .map_err(|_| {
-            format!(
-                "refusing to access '{}': outside the workspace ({})",
-                path.display(),
-                root.display()
-            )
-        })
+fn display_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 struct SimpleRe {

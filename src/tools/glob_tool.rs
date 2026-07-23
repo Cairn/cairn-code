@@ -1,8 +1,9 @@
 use super::registry::Tool;
 use super::workspace::Workspace;
-use std::collections::HashSet;
+use cap_std::fs::Dir;
+#[cfg(test)]
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 
 /// Cap listed paths so broad globs (`src/**/*.rs`) do not flood the transcript.
 /// The total count is always reported so the model knows the full match size.
@@ -46,6 +47,7 @@ impl Tool for GlobTool {
         let mut results = glob_match(pattern, &self.workspace)?;
         // Stable order keeps caps deterministic across runs.
         results.sort();
+        results.dedup();
 
         Ok(format_glob_results(&results, MAX_LISTED_PATHS))
     }
@@ -74,53 +76,26 @@ pub(crate) fn format_glob_results(results: &[String], max_listed: usize) -> Stri
 }
 
 pub(crate) fn glob_match(pattern: &str, workspace: &Workspace) -> Result<Vec<String>, String> {
-    if Path::new(pattern).components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
+    if Path::new(pattern).is_absolute() {
         return Err(format!(
             "refusing to access '{pattern}': outside the workspace"
         ));
     }
 
+    let pattern = workspace.relative_path(pattern)?;
     let mut results = Vec::new();
-    let base = workspace.root();
-
-    // Split pattern into parts
-    let parts: Vec<&str> = pattern.split(std::path::is_separator).collect();
-
-    // If pattern starts with **, we just need to match the rest
-    if parts.len() == 1 && !parts[0].contains('*') && !parts[0].contains('?') {
-        let path = base.join(parts[0]);
-        if path.exists() {
-            if workspace.resolve_existing(&path).is_ok() {
-                results.push(parts[0].to_string());
-            }
-        }
-        return Ok(results);
-    }
-
-    let mut visited = HashSet::from([base.to_path_buf()]);
-    walk_pattern(
-        base,
-        workspace,
-        &mut visited,
-        &parts,
-        0,
-        String::new(),
-        &mut results,
-    )?;
+    let parts: Vec<String> = pattern
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    walk_pattern(workspace.dir(), &parts, 0, String::new(), &mut results)?;
 
     Ok(results)
 }
 
 fn walk_pattern(
-    dir: &Path,
-    workspace: &Workspace,
-    visited: &mut HashSet<PathBuf>,
-    parts: &[&str],
+    dir: &Dir,
+    parts: &[String],
     idx: usize,
     prefix: String,
     results: &mut Vec<String>,
@@ -129,7 +104,7 @@ fn walk_pattern(
         return Ok(());
     }
 
-    let part = parts[idx];
+    let part = &parts[idx];
     let is_last = idx == parts.len() - 1;
 
     if part == "**" {
@@ -138,26 +113,28 @@ fn walk_pattern(
 
         if rest.is_empty() {
             // ** at end - match everything recursively
-            walk_dir_recursive(dir, workspace, visited, &prefix, results)?;
+            walk_dir_recursive(dir, &prefix, results)?;
             return Ok(());
         }
 
         // ** followed by more pattern - try at current level and subdirs
-        walk_pattern(dir, workspace, visited, rest, 0, prefix.clone(), results)?;
+        walk_pattern(dir, rest, 0, prefix.clone(), results)?;
 
-        if let Ok(entries) = fs::read_dir(dir) {
+        if let Ok(entries) = dir.entries() {
             for entry in entries.flatten() {
-                let Ok(path) = workspace.resolve_existing(entry.path()) else {
+                let Ok(file_type) = entry.file_type() else {
                     continue;
                 };
-                if path.is_dir() && visited.insert(path.clone()) {
+                if file_type.is_dir() {
                     let name = entry.file_name().to_string_lossy().to_string();
                     let new_prefix = if prefix.is_empty() {
                         name
                     } else {
                         format!("{prefix}/{name}")
                     };
-                    walk_pattern(&path, workspace, visited, parts, idx, new_prefix, results)?;
+                    if let Ok(child) = entry.open_dir() {
+                        walk_pattern(&child, parts, idx, new_prefix, results)?;
+                    }
                 }
             }
         }
@@ -170,9 +147,9 @@ fn walk_pattern(
             .replace('?', ".");
         let re = regex_wrapper(&re_pattern)?;
 
-        if let Ok(entries) = fs::read_dir(dir) {
+        if let Ok(entries) = dir.entries() {
             for entry in entries.flatten() {
-                let Ok(path) = workspace.resolve_existing(entry.path()) else {
+                let Ok(file_type) = entry.file_type() else {
                     continue;
                 };
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -182,52 +159,52 @@ fn walk_pattern(
                     } else {
                         format!("{prefix}/{name}")
                     };
-                    if is_last || path.is_dir() {
+                    if is_last || file_type.is_dir() {
                         results.push(new_prefix);
                     }
-                    if !is_last && path.is_dir() && visited.insert(path.clone()) {
-                        walk_pattern(
-                            &path,
-                            workspace,
-                            visited,
-                            parts,
-                            idx + 1,
-                            if prefix.is_empty() {
-                                name
-                            } else {
-                                format!("{prefix}/{name}")
-                            },
-                            results,
-                        )?;
+                    if !is_last && file_type.is_dir() {
+                        if let Ok(child) = entry.open_dir() {
+                            walk_pattern(
+                                &child,
+                                parts,
+                                idx + 1,
+                                if prefix.is_empty() {
+                                    name
+                                } else {
+                                    format!("{prefix}/{name}")
+                                },
+                                results,
+                            )?;
+                        }
                     }
                 }
             }
         }
     } else {
         // Literal component
-        let child = dir.join(part);
         let new_prefix = if prefix.is_empty() {
             part.to_string()
         } else {
             format!("{prefix}/{part}")
         };
 
-        if is_last {
-            if child.exists() && workspace.resolve_existing(&child).is_ok() {
-                results.push(new_prefix);
-            }
-        } else if child.is_dir() {
-            let child = workspace.resolve_existing(child)?;
-            if visited.insert(child.clone()) {
-                walk_pattern(
-                    &child,
-                    workspace,
-                    visited,
-                    parts,
-                    idx + 1,
-                    new_prefix,
-                    results,
-                )?;
+        if let Ok(entries) = dir.entries() {
+            for entry in entries.flatten() {
+                if !names_equal(&entry.file_name(), part) {
+                    continue;
+                }
+                if is_last {
+                    results.push(new_prefix);
+                } else if entry
+                    .file_type()
+                    .map(|file_type| file_type.is_dir())
+                    .unwrap_or(false)
+                {
+                    if let Ok(child) = entry.open_dir() {
+                        walk_pattern(&child, parts, idx + 1, new_prefix, results)?;
+                    }
+                }
+                break;
             }
         }
     }
@@ -235,16 +212,21 @@ fn walk_pattern(
     Ok(())
 }
 
-fn walk_dir_recursive(
-    dir: &Path,
-    workspace: &Workspace,
-    visited: &mut HashSet<PathBuf>,
-    prefix: &str,
-    results: &mut Vec<String>,
-) -> Result<(), String> {
-    if let Ok(entries) = fs::read_dir(dir) {
+fn names_equal(actual: &std::ffi::OsStr, expected: &str) -> bool {
+    #[cfg(windows)]
+    {
+        actual.to_string_lossy().eq_ignore_ascii_case(expected)
+    }
+    #[cfg(not(windows))]
+    {
+        actual == expected
+    }
+}
+
+fn walk_dir_recursive(dir: &Dir, prefix: &str, results: &mut Vec<String>) -> Result<(), String> {
+    if let Ok(entries) = dir.entries() {
         for entry in entries.flatten() {
-            let Ok(path) = workspace.resolve_existing(entry.path()) else {
+            let Ok(file_type) = entry.file_type() else {
                 continue;
             };
             let name = entry.file_name().to_string_lossy().to_string();
@@ -254,8 +236,10 @@ fn walk_dir_recursive(
                 format!("{prefix}/{name}")
             };
             results.push(new_prefix.clone());
-            if path.is_dir() && visited.insert(path.clone()) {
-                walk_dir_recursive(&path, workspace, visited, &new_prefix, results)?;
+            if file_type.is_dir() {
+                if let Ok(child) = entry.open_dir() {
+                    walk_dir_recursive(&child, &new_prefix, results)?;
+                }
             }
         }
     }
@@ -302,6 +286,56 @@ mod tests {
             deep.iter().any(|p| p.contains("main.rs")),
             "**/*.rs => {deep:?}"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dot_prefix_does_not_suppress_matches() {
+        let dir = temp_tree();
+        let workspace = Workspace::new(&dir).unwrap();
+
+        let results = glob_match("./*.md", &workspace).unwrap();
+        assert_eq!(results, vec!["README.md"]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recursive_wildcards_visit_directories_for_each_pattern_state() {
+        let dir = temp_tree();
+        fs::create_dir_all(dir.join("deep/src")).unwrap();
+        fs::write(dir.join("deep/src/deep.rs"), "").unwrap();
+        let workspace = Workspace::new(&dir).unwrap();
+
+        let results = glob_match("**/*/*.rs", &workspace).unwrap();
+        assert!(
+            results.iter().any(|path| path == "deep/src/deep.rs"),
+            "{results:?}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn repeated_recursive_wildcards_do_not_duplicate_results() {
+        let dir = temp_tree();
+        let tool = GlobTool::new(Workspace::new(&dir).unwrap());
+
+        let output = tool.execute(r#"{"pattern":"**/**/main.rs"}"#).unwrap();
+        assert_eq!(output.matches("src/main.rs").count(), 1, "{output}");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn literal_components_use_windows_case_insensitive_lookup() {
+        let dir = temp_tree();
+        let workspace = Workspace::new(&dir).unwrap();
+
+        let results = glob_match("readme.md", &workspace).unwrap();
+        assert_eq!(results, vec!["readme.md"]);
+
         let _ = fs::remove_dir_all(dir);
     }
 
