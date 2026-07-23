@@ -51,17 +51,22 @@ impl Tool for GrepTool {
         .map_err(|e| format!("invalid pattern: {e}"))?;
 
         let search_path = self.workspace.resolve_existing(search_path)?;
-        let mut visited = HashSet::from([search_path.clone()]);
         let mut results = Vec::new();
-        search_dir(
-            &search_path,
-            &self.workspace,
-            &mut visited,
-            &re,
-            include,
-            "",
-            &mut results,
-        )?;
+        let relative = workspace_relative(&search_path, self.workspace.root())?;
+        if search_path.is_file() {
+            search_file(&search_path, &re, include, &relative, &mut results);
+        } else {
+            let mut visited = HashSet::from([search_path.clone()]);
+            search_dir(
+                &search_path,
+                &self.workspace,
+                &mut visited,
+                &re,
+                include,
+                &relative,
+                &mut results,
+            )?;
+        }
 
         if results.is_empty() {
             return Ok("No matches found.".into());
@@ -226,6 +231,37 @@ mod tests {
         let _ = fs::remove_dir_all(workspace);
     }
 
+    #[test]
+    fn subdirectory_search_reports_workspace_relative_paths() {
+        let workspace = temp_dir();
+        fs::create_dir(workspace.join("src")).unwrap();
+        fs::write(workspace.join("main.rs"), "unrelated").unwrap();
+        fs::write(workspace.join("src/main.rs"), "nested token").unwrap();
+        let tool = GrepTool::new(Workspace::new(&workspace).unwrap());
+
+        let out = tool
+            .execute(r#"{"pattern":"nested token","path":"src"}"#)
+            .unwrap();
+        assert!(out.contains("src/main.rs:1:nested token"), "{out}");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn searches_a_single_file_path() {
+        let workspace = temp_dir();
+        fs::create_dir(workspace.join("src")).unwrap();
+        fs::write(workspace.join("src/main.rs"), "single file token").unwrap();
+        let tool = GrepTool::new(Workspace::new(&workspace).unwrap());
+
+        let out = tool
+            .execute(r#"{"pattern":"single file token","path":"src/main.rs"}"#)
+            .unwrap();
+        assert!(out.contains("src/main.rs:1:single file token"), "{out}");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
     #[cfg(unix)]
     fn create_dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
         std::os::unix::fs::symlink(target, link).is_ok()
@@ -275,30 +311,55 @@ fn search_dir(
                     search_dir(&path, workspace, visited, re, include, &rel, results)?;
                 }
             } else if path.is_file() {
-                // Check include filter
-                if let Some(inc) = include {
-                    if !path
-                        .extension()
-                        .map(|e| e.to_string_lossy().as_ref() == inc.trim_start_matches('.'))
-                        .unwrap_or(false)
-                    {
-                        if !rel.contains(inc) {
-                            continue;
-                        }
-                    }
-                }
-
-                if let Ok(content) = fs::read_to_string(&path) {
-                    for (i, line) in content.lines().enumerate() {
-                        if re.is_match(line) {
-                            results.push((rel.clone(), i + 1, line.to_string()));
-                        }
-                    }
-                }
+                search_file(&path, re, include, &rel, results);
             }
         }
     }
     Ok(())
+}
+
+fn search_file(
+    path: &Path,
+    re: &SimpleRe,
+    include: Option<&str>,
+    relative: &str,
+    results: &mut Vec<(String, usize, String)>,
+) {
+    if let Some(inc) = include {
+        let extension_matches = path
+            .extension()
+            .map(|extension| extension.to_string_lossy().as_ref() == inc.trim_start_matches('.'))
+            .unwrap_or(false);
+        if !extension_matches && !relative.contains(inc) {
+            return;
+        }
+    }
+
+    if let Ok(content) = fs::read_to_string(path) {
+        for (index, line) in content.lines().enumerate() {
+            if re.is_match(line) {
+                results.push((relative.to_string(), index + 1, line.to_string()));
+            }
+        }
+    }
+}
+
+fn workspace_relative(path: &Path, root: &Path) -> Result<String, String> {
+    path.strip_prefix(root)
+        .map(|relative| {
+            relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .map_err(|_| {
+            format!(
+                "refusing to access '{}': outside the workspace ({})",
+                path.display(),
+                root.display()
+            )
+        })
 }
 
 struct SimpleRe {

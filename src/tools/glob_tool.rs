@@ -185,7 +185,7 @@ fn walk_pattern(
                     if is_last || path.is_dir() {
                         results.push(new_prefix);
                     }
-                    if !is_last && path.is_dir() {
+                    if !is_last && path.is_dir() && visited.insert(path.clone()) {
                         walk_pattern(
                             &path,
                             workspace,
@@ -218,15 +218,17 @@ fn walk_pattern(
             }
         } else if child.is_dir() {
             let child = workspace.resolve_existing(child)?;
-            walk_pattern(
-                &child,
-                workspace,
-                visited,
-                parts,
-                idx + 1,
-                new_prefix,
-                results,
-            )?;
+            if visited.insert(child.clone()) {
+                walk_pattern(
+                    &child,
+                    workspace,
+                    visited,
+                    parts,
+                    idx + 1,
+                    new_prefix,
+                    results,
+                )?;
+            }
         }
     }
 
@@ -409,6 +411,27 @@ mod tests {
             !results.iter().any(|path| path.starts_with('/')),
             "{results:?}"
         );
+
+        let _ = fs::remove_dir_all(workspace_dir);
+    }
+
+    #[test]
+    fn recursive_glob_does_not_follow_cycles_below_pattern_components() {
+        let workspace_dir = temp_tree();
+        let src = workspace_dir.join("src");
+        assert!(
+            create_dir_link(&src, &src.join("loop")),
+            "failed to create test link"
+        );
+
+        let workspace = Workspace::new(&workspace_dir).unwrap();
+        for pattern in ["src/**", "*/**"] {
+            let results = glob_match(pattern, &workspace).unwrap();
+            assert!(
+                !results.iter().any(|path| path.contains("loop/main.rs")),
+                "{pattern} => {results:?}"
+            );
+        }
 
         let _ = fs::remove_dir_all(workspace_dir);
     }
