@@ -141,7 +141,7 @@ impl Provider for AnthropicProvider {
             Some(cancel),
         )?;
         let raw = response_data.lock().unwrap().clone();
-        parse_anthropic_response(&raw)
+        parse_anthropic_streaming_response(&raw)
     }
 
     fn complete(
@@ -167,7 +167,7 @@ impl Provider for AnthropicProvider {
             body: Some(body),
         };
         let resp = http_client::request(&req)?;
-        parse_anthropic_response(&resp.body)
+        parse_anthropic_complete_response(&resp.body)
     }
 }
 
@@ -425,7 +425,157 @@ fn build_request_body(
     Ok(body)
 }
 
-fn parse_anthropic_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
+#[derive(Debug)]
+struct AnthropicResponse {
+    role: String,
+    content: Vec<AnthropicContentBlock>,
+    usage: AnthropicUsage,
+}
+
+#[derive(Debug)]
+enum AnthropicContentBlock {
+    Text(String),
+    ToolUse {
+        id: String,
+        name: String,
+        input: String,
+    },
+    Thinking(String),
+}
+
+#[derive(Debug, Default)]
+struct AnthropicUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+}
+
+fn parse_anthropic_complete_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
+    let val = json::parse(raw).map_err(|e| format!("Failed to parse Anthropic response: {e}"))?;
+    let response = parse_anthropic_response_value(&val)?;
+
+    let messages = response
+        .content
+        .into_iter()
+        .map(|block| Message {
+            role: response.role.clone(),
+            content: match block {
+                AnthropicContentBlock::Text(text) => Content::Text(text),
+                AnthropicContentBlock::ToolUse { id, name, input } => {
+                    Content::ToolUse(ToolUse { id, name, input })
+                }
+                AnthropicContentBlock::Thinking(thinking) => Content::Thinking(thinking),
+            },
+        })
+        .collect();
+    let usage = Usage {
+        input_tokens: response.usage.input_tokens,
+        output_tokens: response.usage.output_tokens,
+        cache_read: response.usage.cache_read_input_tokens,
+        cache_create: response.usage.cache_creation_input_tokens,
+    };
+
+    Ok((messages, usage))
+}
+
+fn parse_anthropic_response_value(val: &json::JsonValue) -> Result<AnthropicResponse, String> {
+    let obj = val
+        .as_object()
+        .ok_or_else(|| "Invalid Anthropic response: expected an object".to_string())?;
+
+    if obj.get("type").and_then(|v| v.as_str()) == Some("error") {
+        let error = obj.get("error");
+        let kind = error
+            .and_then(|e| e.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("api_error");
+        let message = error
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Anthropic returned an error response");
+        return Err(format!("Anthropic API error ({kind}): {message}"));
+    }
+
+    let role = obj
+        .get("role")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Invalid Anthropic response: missing role".to_string())?
+        .to_string();
+    let blocks = obj
+        .get("content")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "Invalid Anthropic response: missing content array".to_string())?;
+    let mut content = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let block_type = block
+            .get("type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Invalid Anthropic response: content block missing type".to_string())?;
+        match block_type {
+            "text" => {
+                let text = block.get("text").and_then(|v| v.as_str()).ok_or_else(|| {
+                    "Invalid Anthropic response: text block missing text".to_string()
+                })?;
+                content.push(AnthropicContentBlock::Text(text.to_string()));
+            }
+            "tool_use" => {
+                let id = block.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+                    "Invalid Anthropic response: tool_use block missing id".to_string()
+                })?;
+                let name = block.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+                    "Invalid Anthropic response: tool_use block missing name".to_string()
+                })?;
+                let input = block.get("input").ok_or_else(|| {
+                    "Invalid Anthropic response: tool_use block missing input".to_string()
+                })?;
+                content.push(AnthropicContentBlock::ToolUse {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    input: json::serialize(input),
+                });
+            }
+            "thinking" => {
+                let thinking = block
+                    .get("thinking")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        "Invalid Anthropic response: thinking block missing thinking".to_string()
+                    })?;
+                content.push(AnthropicContentBlock::Thinking(thinking.to_string()));
+            }
+            _ => {}
+        }
+    }
+
+    let usage = obj
+        .get("usage")
+        .ok_or_else(|| "Invalid Anthropic response: missing usage".to_string())?;
+    Ok(AnthropicResponse {
+        role,
+        content,
+        usage: AnthropicUsage {
+            input_tokens: usage
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| "Invalid Anthropic response: missing input_tokens".to_string())?,
+            output_tokens: usage
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| "Invalid Anthropic response: missing output_tokens".to_string())?,
+            cache_read_input_tokens: usage
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_creation_input_tokens: usage
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        },
+    })
+}
+
+fn parse_anthropic_streaming_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
     let mut messages: Vec<Message> = Vec::new();
     let mut usage = Usage::default();
     let mut current_tool_use: Option<ToolUse> = None;
@@ -594,7 +744,7 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"*.rs\\\"}\"}}\n",
             "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
         );
-        let (msgs, _usage) = parse_anthropic_response(raw).unwrap();
+        let (msgs, _usage) = parse_anthropic_streaming_response(raw).unwrap();
         assert_eq!(msgs.len(), 1);
         match &msgs[0].content {
             Content::ToolUse(tu) => {
@@ -616,7 +766,7 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pattern\\\":\\\"foo\\\"}\"}}\n",
             "data: {\"type\":\"content_block_stop\",\"index\":1}\n",
         );
-        let (msgs, _usage) = parse_anthropic_response(raw).unwrap();
+        let (msgs, _usage) = parse_anthropic_streaming_response(raw).unwrap();
         assert_eq!(msgs.len(), 2);
         match &msgs[0].content {
             Content::ToolUse(tu) => assert_eq!(tu.input, "{}"),
@@ -629,15 +779,81 @@ mod tests {
     }
 
     #[test]
-    fn test_non_streaming_tool_use_still_uses_content_block_input() {
-        // Non-streaming responses put the full input directly on content_block_start
-        // with no deltas at all — must still work.
+    fn test_streaming_tool_use_uses_content_block_input_without_deltas() {
         let raw = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"glob\",\"input\":{\"pattern\":\"*.rs\"}}}\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n";
-        let (msgs, _usage) = parse_anthropic_response(raw).unwrap();
+        let (msgs, _usage) = parse_anthropic_streaming_response(raw).unwrap();
         assert_eq!(msgs.len(), 1);
         match &msgs[0].content {
             Content::ToolUse(tu) => assert_eq!(tu.input, r#"{"pattern":"*.rs"}"#),
             _ => panic!("expected ToolUse content"),
         }
+    }
+
+    #[test]
+    fn test_complete_response_parses_text_for_non_streaming_callers() {
+        let raw = r#"{
+            "id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-6",
+            "content":[{"type":"text","text":"The compacted summary or print output."}],
+            "stop_reason":"end_turn","usage":{"input_tokens":12,"output_tokens":7}
+        }"#;
+        let (msgs, _usage) = parse_anthropic_complete_response(raw).unwrap();
+
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "assistant");
+        match &msgs[0].content {
+            Content::Text(text) => {
+                assert_eq!(text, "The compacted summary or print output.");
+            }
+            _ => panic!("expected Text content"),
+        }
+    }
+
+    #[test]
+    fn test_complete_response_parses_tool_use_input() {
+        let raw = r#"{
+            "type":"message","role":"assistant",
+            "content":[{"type":"tool_use","id":"toolu_1","name":"glob","input":{"pattern":"*.rs"}}],
+            "usage":{"input_tokens":18,"output_tokens":9}
+        }"#;
+        let (msgs, _usage) = parse_anthropic_complete_response(raw).unwrap();
+
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0].content {
+            Content::ToolUse(tool_use) => {
+                assert_eq!(tool_use.id, "toolu_1");
+                assert_eq!(tool_use.name, "glob");
+                assert_eq!(tool_use.input, r#"{"pattern":"*.rs"}"#);
+            }
+            _ => panic!("expected ToolUse content"),
+        }
+    }
+
+    #[test]
+    fn test_complete_response_parses_usage_including_cache_tokens() {
+        let raw = r#"{
+            "type":"message","role":"assistant","content":[],
+            "usage":{
+                "input_tokens":100,"output_tokens":25,
+                "cache_read_input_tokens":80,"cache_creation_input_tokens":10
+            }
+        }"#;
+        let (_msgs, usage) = parse_anthropic_complete_response(raw).unwrap();
+
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.cache_read, 80);
+        assert_eq!(usage.cache_create, 10);
+    }
+
+    #[test]
+    fn test_complete_response_returns_anthropic_api_error() {
+        let raw = r#"{
+            "type":"error",
+            "error":{"type":"invalid_request_error","message":"max_tokens: must be positive"}
+        }"#;
+        let err = parse_anthropic_complete_response(raw).unwrap_err();
+
+        assert!(err.contains("invalid_request_error"), "{err}");
+        assert!(err.contains("max_tokens: must be positive"), "{err}");
     }
 }

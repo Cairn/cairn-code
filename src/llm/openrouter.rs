@@ -261,7 +261,7 @@ mod tests {
                 assert_eq!(obj.get("model").and_then(|v| v.as_str()), Some("openai/gpt-4o"));
                 assert!(obj.get("messages").and_then(|v| v.as_array()).is_some());
                 let tools_arr = obj.get("tools").and_then(|v| v.as_array()).unwrap();
-                assert_eq!(tools_arr.len(), 13);
+                assert_eq!(tools_arr.len(), 14);
                 for (i, tool_val) in tools_arr.iter().enumerate() {
                     let tool_obj = tool_val.as_object().unwrap();
                     assert_eq!(tool_obj.get("type").and_then(|v| v.as_str()), Some("function"));
