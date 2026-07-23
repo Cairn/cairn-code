@@ -627,6 +627,45 @@ mod tests {
     }
 
     #[test]
+    fn reset_state_clears_agent_and_live_session_state() {
+        let mut agent = Agent::new(
+            Box::new(SharedMock {
+                stream_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                complete_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                last_stream_message_count: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            }),
+            "mock-model".into(),
+            crate::tools::registry::Registry::new(),
+            crate::config::Config::default(),
+        );
+        let mirror = crate::session::new_live_mirror();
+        agent.set_live_mirror(mirror.clone());
+        agent.set_state(
+            vec![text("user", "remember this")],
+            Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_read: 30,
+                cache_create: 40,
+            },
+        );
+        agent.last_input_tokens = 100;
+
+        agent.reset_state();
+
+        assert!(agent.messages().is_empty());
+        assert_eq!(agent.usage().input_tokens, 0);
+        assert_eq!(agent.usage().output_tokens, 0);
+        assert_eq!(agent.usage().cache_read, 0);
+        assert_eq!(agent.usage().cache_create, 0);
+        assert_eq!(agent.last_input_tokens, 0);
+        let snapshot = mirror.lock().unwrap();
+        assert!(snapshot.messages.is_empty());
+        assert_eq!(snapshot.tokens_in, 0);
+        assert_eq!(snapshot.tokens_out, 0);
+    }
+
+    #[test]
     fn proactive_compaction_runs_before_next_turn() {
         let stream_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let complete_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -785,4 +824,3 @@ mod tests {
         assert!(err.to_ascii_lowercase().contains("could not compact"), "{err}");
     }
 }
-
