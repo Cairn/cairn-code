@@ -106,6 +106,13 @@ impl Agent {
         self.sync_live_mirror();
     }
 
+    pub fn reset_state(&mut self) {
+        self.messages.clear();
+        self.usage = Usage::default();
+        self.last_input_tokens = 0;
+        self.sync_live_mirror();
+    }
+
     #[allow(dead_code)]
     pub fn messages(&self) -> &[llm::Message] {
         &self.messages

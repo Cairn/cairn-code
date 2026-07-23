@@ -1242,7 +1242,14 @@ impl Tui {
 
         match parts[0] {
             "/clear" => {
-                // Finish the previous session file first, then open a fresh id.
+                if !matches!(self.state, State::Idle) {
+                    self.output_lines.push(OutputLine {
+                        type_: "system".into(),
+                        content: "Wait for the current turn to finish before clearing.".into(),
+                        tool_name: String::new(), duration: String::new(),
+                    });
+                    return;
+                }
                 self.autosave_session(false);
                 self.output_lines.clear();
                 self.streaming_text.clear();
@@ -1251,6 +1258,21 @@ impl Tui {
                 self.current_session_id = None;
                 self.session_created_at = 0;
                 self.total_usage = llm::Usage::default();
+                if let Some(tx) = &self.agent_tx {
+                    let _ = tx.send("__clear__".to_string());
+                }
+                if let Some(mirror) = &self.live_mirror {
+                    if let Ok(mut g) = mirror.lock() {
+                        g.messages.clear();
+                        g.tokens_in = 0;
+                        g.tokens_out = 0;
+                    }
+                }
+                self.output_lines.push(OutputLine {
+                    type_: "system".into(),
+                    content: "Cleared conversation and session state.".into(),
+                    tool_name: String::new(), duration: String::new(),
+                });
             }
             "/thinking" => {
                 let arg = parts.get(1).map(|s| s.to_ascii_lowercase());
