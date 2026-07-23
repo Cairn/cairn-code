@@ -92,8 +92,6 @@ impl Agent {
         let provider = providers.remove(provider_name).ok_or_else(|| format!("Unknown provider: {provider_name}"))?;
         self.provider = provider;
         self.model = model.to_string();
-        self.messages.clear();
-        self.usage = Usage::default();
         self.last_input_tokens = 0;
         self.sync_live_mirror();
         Ok(())
@@ -594,6 +592,58 @@ mod tests {
         assert!(t.contains("assistant: hi"));
         assert!(t.contains("assistant [tool call]: grep("));
         assert!(t.contains("tool result: matches"));
+    }
+
+    #[test]
+    fn provider_and_model_switches_preserve_history_usage_and_live_mirror() {
+        let mut agent = Agent::new(
+            Box::new(crate::llm::ollama::OllamaProvider::new()),
+            "llama3.2".into(),
+            crate::tools::registry::Registry::new(),
+            crate::config::Config::default(),
+        );
+        let history = vec![
+            text("user", "inspect src/main.rs"),
+            tool_use("read", r#"{"path":"src/main.rs"}"#),
+            tool_result("fn main() {}"),
+            text("assistant", "done"),
+        ];
+        let usage = Usage {
+            input_tokens: 120,
+            output_tokens: 30,
+            cache_read: 10,
+            cache_create: 5,
+        };
+        let mirror = crate::session::new_live_mirror();
+        agent.set_live_mirror(mirror.clone());
+        agent.set_state(history, usage);
+
+        agent.switch_provider("openai", "gpt-5-mini").unwrap();
+
+        assert_eq!(agent.provider_name(), "openai");
+        assert_eq!(agent.model(), "gpt-5-mini");
+        assert_eq!(agent.messages().len(), 4);
+        assert!(matches!(&agent.messages()[0].content, Content::Text(t) if t == "inspect src/main.rs"));
+        assert!(matches!(&agent.messages()[1].content, Content::ToolUse(tu) if tu.name == "read"));
+        assert!(matches!(&agent.messages()[2].content, Content::ToolResult(tr) if tr.content == "fn main() {}"));
+        assert!(matches!(&agent.messages()[3].content, Content::Text(t) if t == "done"));
+        assert_eq!(agent.usage().input_tokens, 120);
+        assert_eq!(agent.usage().output_tokens, 30);
+        assert_eq!(agent.usage().cache_read, 10);
+        assert_eq!(agent.usage().cache_create, 5);
+
+        let snapshot = mirror.lock().unwrap();
+        assert_eq!(snapshot.messages.len(), 4);
+        assert_eq!(snapshot.tokens_in, 120);
+        assert_eq!(snapshot.tokens_out, 30);
+        drop(snapshot);
+
+        agent.switch_provider("openai", "gpt-4.1-mini").unwrap();
+
+        assert_eq!(agent.model(), "gpt-4.1-mini");
+        assert_eq!(agent.messages().len(), 4);
+        assert_eq!(agent.usage().input_tokens, 120);
+        assert_eq!(mirror.lock().unwrap().messages.len(), 4);
     }
 
     /// Live-exercises proactive compaction without a network call: first stream
