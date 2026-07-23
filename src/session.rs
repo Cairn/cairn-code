@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,11 +33,20 @@ pub struct Session {
     pub updated_at: u64,
 }
 
+static LAST_ID: AtomicU64 = AtomicU64::new(0);
+
 pub fn new_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos();
+        .as_nanos() as u64;
+    let nanos = LAST_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            Some(nanos.max(last.saturating_add(1)))
+        })
+        .unwrap_or_default()
+        .saturating_add(1)
+        .max(nanos);
     format!("{:016x}", nanos)
 }
 
