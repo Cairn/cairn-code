@@ -180,6 +180,7 @@ pub fn sessions_dir() -> String {
     PathBuf::from(home).join(".config/cairn-code/sessions").to_string_lossy().to_string()
 }
 
+#[cfg_attr(test, allow(dead_code))]
 pub fn save_config(provider: &str, model: &str, api_key: Option<&str>) -> Result<(), String> {
     use crate::json::JsonValue;
     let path = config_path();
@@ -204,6 +205,11 @@ pub fn save_config(provider: &str, model: &str, api_key: Option<&str>) -> Result
     }
     let output = crate::json::serialize(&JsonValue::Object(obj));
     std::fs::write(&path, &output).map_err(|e| e.to_string())
+}
+
+/// Persist a provider credential without changing the selected provider or model.
+pub fn save_api_key(provider: &str, api_key: &str) -> Result<(), String> {
+    keyring_set(provider, api_key)
 }
 
 /// Persist only the TUI theme preference, leaving other config keys intact.
