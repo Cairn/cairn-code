@@ -326,6 +326,13 @@ impl Agent {
         result
     }
 
+    fn dispatch_tool(&self, tu: &llm::ToolUse) -> Result<String, String> {
+        match self.tools.get(&tu.name) {
+            Some(tool) => tool.execute(&tu.input),
+            None => Err(format!("Unknown tool: {}", tu.name)),
+        }
+    }
+
     /// Applies the deny/ask/auto_allow policy to a tool call and, if
     /// permitted, executes it. This is the single authorization path shared
     /// by the interactive TUI loop and print (`--print`) mode, so a tool
@@ -355,10 +362,7 @@ impl Agent {
         }
 
         if !needs_ask || always_allowed {
-            return match self.tools.get(&tu.name) {
-                Some(tool) => tool.execute(&tu.input),
-                None => Err(format!("Unknown tool: {}", tu.name)),
-            };
+            return self.dispatch_tool(tu);
         }
 
         let Some((tx, cancel, perm_rx)) = interactive else {
@@ -385,11 +389,9 @@ impl Agent {
             "always_allow" => {
                 self.config.auto_allow.push(tu.name.clone());
                 let _ = crate::config::save_full_config(&self.config);
-                self.tools.get(&tu.name).map(|t| t.execute(&tu.input)).unwrap_or(Err(format!("Unknown tool: {}", tu.name)))
+                self.dispatch_tool(tu)
             }
-            "allow" => {
-                self.tools.get(&tu.name).map(|t| t.execute(&tu.input)).unwrap_or(Err(format!("Unknown tool: {}", tu.name)))
-            }
+            "allow" => self.dispatch_tool(tu),
             _ => Err(format!("Permission denied by user for tool '{}'", tu.name)),
         }
     }
