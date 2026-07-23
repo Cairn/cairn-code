@@ -3900,60 +3900,33 @@ mod completion_tests {
 
 fn char_width(c: char) -> usize {
     let cp = c as u32;
-    if cp < 0x1100 {
-        1
-    } else if cp <= 0x115F {
-        2
-    } else if cp >= 0x2329 && cp <= 0x232A {
-        2
-    } else if cp >= 0x2E80 && cp <= 0x303E {
-        2
-    } else if cp >= 0x3040 && cp <= 0x3096 {
-        2
-    } else if cp >= 0x3099 && cp <= 0x30FF {
-        2
-    } else if cp >= 0x3105 && cp <= 0x312F {
-        2
-    } else if cp >= 0x3131 && cp <= 0x318E {
-        2
-    } else if cp >= 0x3190 && cp <= 0x31E3 {
-        2
-    } else if cp >= 0x31F0 && cp <= 0x321E {
-        2
-    } else if cp >= 0x3220 && cp <= 0x3247 {
-        2
-    } else if cp >= 0x3250 && cp <= 0x4DBF {
-        2
-    } else if cp >= 0x4E00 && cp <= 0xA4CF {
-        2
-    } else if cp >= 0xA960 && cp <= 0xA97C {
-        2
-    } else if cp >= 0xAC00 && cp <= 0xD7A3 {
-        2
-    } else if cp >= 0xF900 && cp <= 0xFAFF {
-        2
-    } else if cp >= 0xFE10 && cp <= 0xFE19 {
-        2
-    } else if cp >= 0xFE30 && cp <= 0xFE6F {
-        2
-    } else if cp >= 0xFF01 && cp <= 0xFF60 {
-        2
-    } else if cp >= 0xFFE0 && cp <= 0xFFE6 {
-        2
-    } else if cp >= 0x1B000 && cp <= 0x1B0FF {
-        2
-    } else if cp >= 0x1B100 && cp <= 0x1B12F {
-        2
-    } else if cp >= 0x1F200 && cp <= 0x1F2FF {
-        2
-    } else if cp >= 0x20000 && cp <= 0x2FFFD {
-        2
-    } else if cp >= 0x30000 && cp <= 0x3FFFD {
-        2
-    } else if cp >= 0x2600 && cp <= 0x26FF {
-        2
-    } else {
-        1
+    match cp {
+        0x1100..=0x115F
+        | 0x2329..=0x232A
+        | 0x2600..=0x26FF
+        | 0x2E80..=0x303E
+        | 0x3040..=0x3096
+        | 0x3099..=0x30FF
+        | 0x3105..=0x312F
+        | 0x3131..=0x318E
+        | 0x3190..=0x31E3
+        | 0x31F0..=0x321E
+        | 0x3220..=0x3247
+        | 0x3250..=0x4DBF
+        | 0x4E00..=0xA4CF
+        | 0xA960..=0xA97C
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE10..=0xFE19
+        | 0xFE30..=0xFE6F
+        | 0xFF01..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1B000..=0x1B0FF
+        | 0x1B100..=0x1B12F
+        | 0x1F200..=0x1F2FF
+        | 0x20000..=0x2FFFD
+        | 0x30000..=0x3FFFD => 2,
+        _ => 1,
     }
 }
 
@@ -3998,7 +3971,7 @@ fn total_wrapped(lines: &[Line], width: usize) -> usize {
             if line_w == 0 {
                 1
             } else {
-                (line_w + w - 1) / w
+                line_w.div_ceil(w)
             }
         })
         .sum()

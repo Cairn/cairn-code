@@ -262,7 +262,7 @@ fn request_once(req: &HttpRequest) -> Result<HttpResponse, RequestError> {
         .unwrap_or(0);
     let body = raw.get(split_at..).unwrap_or(&raw).to_string();
 
-    if status < 200 || status >= 300 {
+    if !(200..300).contains(&status) {
         return Err(RequestError::Status(status, body));
     }
 
@@ -344,7 +344,7 @@ fn request_get_once(url: &str, headers: &[(String, String)]) -> Result<HttpRespo
         .map(parse_status_line)
         .unwrap_or(0);
     let body = raw.get(split_at..).unwrap_or(&raw).to_string();
-    if status < 200 || status >= 300 {
+    if !(200..300).contains(&status) {
         return Err(RequestError::Status(status, body));
     }
     Ok(HttpResponse { body })
