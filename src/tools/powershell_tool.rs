@@ -1,6 +1,8 @@
 //! Native PowerShell tool. Prefer this on Windows instead of shelling through
 //! bash/git-bash style commands. Resolves `pwsh` first, then Windows PowerShell 5.1.
 
+use std::collections::VecDeque;
+use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -65,30 +67,46 @@ impl Tool for PowerShellTool {
             .spawn()
             .map_err(|e| format!("powershell exec error ({bin}): {e}"))?;
 
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        loop {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(timeout_ms))
+            .ok_or_else(|| format!("timeout too large: {timeout_ms}ms"))?;
+
+        // Drain both streams concurrently instead of waiting for exit first:
+        // a command that writes more than a pipe buffer holds would otherwise
+        // block on output forever, since nothing reads it until the process
+        // exits, and get killed as a false-positive timeout.
+        let stdout_handle = drain_bounded(
+            child.stdout.take().expect("stdout is piped"),
+            HEAD_CHARS,
+            TAIL_CHARS,
+        );
+        let stderr_handle = drain_bounded(
+            child.stderr.take().expect("stderr is piped"),
+            HEAD_CHARS,
+            TAIL_CHARS,
+        );
+
+        let status = loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) => break status,
                 Ok(None) => {
                     if Instant::now() >= deadline {
                         let _ = child.kill();
                         let _ = child.wait();
+                        let _ = stdout_handle.join();
+                        let _ = stderr_handle.join();
                         return Err(format!("powershell timed out after {timeout_ms}ms"));
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 Err(e) => return Err(format!("powershell exec error: {e}")),
             }
-        }
+        };
+        let code = status.code().unwrap_or(-1);
+        let ok = status.success();
 
-        let output = child
-            .wait_with_output()
-            .map_err(|e| format!("powershell exec error: {e}"))?;
-        let code = output.status.code().unwrap_or(-1);
-        let ok = output.status.success();
-
-        let stdout = normalize_cli_output(&String::from_utf8_lossy(&output.stdout));
-        let stderr = normalize_cli_output(&String::from_utf8_lossy(&output.stderr));
+        let stdout = normalize_cli_output(&stdout_handle.join().unwrap_or_default());
+        let stderr = normalize_cli_output(&stderr_handle.join().unwrap_or_default());
 
         let mut body = String::new();
         if !stdout.is_empty() {
@@ -117,6 +135,77 @@ impl Tool for PowerShellTool {
             Err(format!("exit code {code}\n{result}"))
         }
     }
+}
+
+/// Keeps only the first `head_max` and a rolling window of the last
+/// `tail_max` chars seen, so memory use stays bounded no matter how much a
+/// runaway command prints.
+struct BoundedCollector {
+    head: String,
+    head_len: usize,
+    head_max: usize,
+    tail: VecDeque<char>,
+    tail_max: usize,
+    total_chars: usize,
+}
+
+impl BoundedCollector {
+    fn new(head_max: usize, tail_max: usize) -> Self {
+        BoundedCollector {
+            head: String::new(),
+            head_len: 0,
+            head_max,
+            tail: VecDeque::new(),
+            tail_max,
+            total_chars: 0,
+        }
+    }
+
+    fn push_str(&mut self, s: &str) {
+        for c in s.chars() {
+            self.total_chars += 1;
+            if self.head_len < self.head_max {
+                self.head.push(c);
+                self.head_len += 1;
+            } else {
+                if self.tail.len() >= self.tail_max {
+                    self.tail.pop_front();
+                }
+                self.tail.push_back(c);
+            }
+        }
+    }
+
+    fn finish(self) -> String {
+        let tail_len = self.tail.len();
+        let tail_str: String = self.tail.into_iter().collect();
+        if self.total_chars <= self.head_len + tail_len {
+            format!("{}{}", self.head, tail_str)
+        } else {
+            let omitted = self.total_chars - self.head_len - tail_len;
+            format!("{}\n... [{omitted} chars truncated] ...\n{}", self.head, tail_str)
+        }
+    }
+}
+
+/// Reads `reader` to EOF on a background thread so it can never block the
+/// child process waiting for us to notice it should be killed.
+fn drain_bounded<R: Read + Send + 'static>(
+    mut reader: R,
+    head_max: usize,
+    tail_max: usize,
+) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut collector = BoundedCollector::new(head_max, tail_max);
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => collector.push_str(&String::from_utf8_lossy(&buf[..n])),
+            }
+        }
+        collector.finish()
+    })
 }
 
 /// Prefer PowerShell 7+ (`pwsh`), then Windows PowerShell 5.1 (`powershell`).
@@ -211,21 +300,17 @@ mod tests {
     #[test]
     fn echo_or_missing_binary() {
         let input = r#"{"command":"Write-Output 'hi-from-ps'"}"#;
-        match PowerShellTool.execute(input) {
-            Ok(out) => {
-                assert!(out.to_ascii_lowercase().contains("hi-from-ps"), "{out}");
-                assert!(out.contains("(exit code 0)"), "{out}");
-            }
-            Err(e) => {
-                assert!(
-                    e.contains("no PowerShell")
-                        || e.contains("no pwsh")
-                        || e.contains("powershell exec")
-                        || e.contains("exit code"),
-                    "unexpected: {e}"
-                );
-            }
+        if resolve_powershell().is_err() {
+            let err = PowerShellTool.execute(input).unwrap_err();
+            assert!(
+                err.contains("no PowerShell") || err.contains("no pwsh"),
+                "unexpected: {err}"
+            );
+            return;
         }
+        let out = PowerShellTool.execute(input).unwrap();
+        assert!(out.to_ascii_lowercase().contains("hi-from-ps"), "{out}");
+        assert!(out.contains("(exit code 0)"), "{out}");
     }
 
     #[test]
@@ -245,5 +330,37 @@ mod tests {
         }
         let (bin, _) = resolve_powershell().expect("Windows should have powershell");
         assert!(bin == "pwsh" || bin == "powershell", "{bin}");
+    }
+
+    /// Regression test for the deadlock this tool used to hit: reading
+    /// stdout only after the process exited meant a command writing more
+    /// than a pipe buffer would block forever on output, never exit, and
+    /// get killed as a false-positive timeout. Generous timeout here to
+    /// prove it completes at all, not to test timing.
+    #[test]
+    fn large_output_does_not_deadlock() {
+        if resolve_powershell().is_err() {
+            return;
+        }
+        let input = r#"{"command":"1..20000 | ForEach-Object { \"line $_ of output padding to grow past a pipe buffer\" }","timeout":20000}"#;
+        let out = PowerShellTool.execute(input).unwrap();
+        assert!(out.contains("(exit code 0)"), "{out}");
+    }
+
+    #[test]
+    fn bounded_collector_keeps_head_and_tail_under_memory_cap() {
+        let mut c = BoundedCollector::new(5, 5);
+        c.push_str(&"a".repeat(5000));
+        let out = c.finish();
+        assert!(out.contains("truncated"));
+        assert!(out.starts_with("aaaaa"));
+        assert!(out.ends_with("aaaaa"));
+    }
+
+    #[test]
+    fn bounded_collector_no_truncation_when_under_cap() {
+        let mut c = BoundedCollector::new(100, 100);
+        c.push_str("short output");
+        assert_eq!(c.finish(), "short output");
     }
 }
