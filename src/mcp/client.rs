@@ -15,6 +15,7 @@ use crate::json::{self, JsonValue};
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const INIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct RemoteTool {
@@ -213,8 +214,19 @@ impl McpClient {
             ("method".into(), JsonValue::String(method.into())),
             ("params".into(), params),
         ]));
-        self.write_message(&msg)?;
-        wait_response(&rx, timeout, &self.server_name, method)
+        if let Err(e) = self.write_message(&msg) {
+            if let Ok(mut map) = self.pending.lock() {
+                map.remove(&id);
+            }
+            return Err(e);
+        }
+        let response = wait_response(&rx, timeout, &self.server_name, method);
+        if response.is_err() {
+            if let Ok(mut map) = self.pending.lock() {
+                map.remove(&id);
+            }
+        }
+        response
     }
 
     fn notify(&mut self, method: &str, params: JsonValue) -> Result<(), String> {
@@ -246,9 +258,26 @@ impl Drop for McpClient {
     fn drop(&mut self) {
         // Close stdin so the server sees EOF and can exit cleanly.
         self.stdin.take();
-        let _ = self.child.wait();
+        if wait_for_exit(&mut self.child, SHUTDOWN_GRACE) {
+            return;
+        }
+
+        // Never block indefinitely on a server that ignores EOF.
         let _ = self.child.kill();
+        let _ = wait_for_exit(&mut self.child, SHUTDOWN_GRACE);
     }
+}
+
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 fn wait_response(
@@ -383,10 +412,59 @@ fn flatten_content(content: Option<&JsonValue>) -> String {
 mod tests {
     use super::*;
 
+    fn pending_response(
+        id: u64,
+    ) -> (
+        Arc<Mutex<HashMap<u64, Pending>>>,
+        Receiver<Result<JsonValue, String>>,
+    ) {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel();
+        pending.lock().unwrap().insert(id, Pending { tx });
+        (pending, rx)
+    }
+
     #[test]
     fn flatten_text_blocks() {
         let raw = r#"{"content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}]}"#;
         let v = json::parse(raw).unwrap();
         assert_eq!(flatten_content(v.get("content")), "hello\nworld");
+    }
+
+    #[test]
+    fn read_loop_correlates_ndjson_response() {
+        let (pending, rx) = pending_response(7);
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n";
+
+        read_loop(&input[..], pending.clone(), "test");
+
+        let result = wait_response(&rx, Duration::from_secs(1), "test", "tools/list").unwrap();
+        assert_eq!(result.get("ok").and_then(JsonValue::as_bool), Some(true));
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_loop_correlates_content_length_response() {
+        let (pending, rx) = pending_response(9);
+        let body = r#"{"jsonrpc":"2.0","id":"9","result":"done"}"#;
+        let input = format!("Content-Length: {}\r\n\r\n{body}", body.len());
+
+        read_loop(input.as_bytes(), pending, "test");
+
+        let result = wait_response(&rx, Duration::from_secs(1), "test", "tools/call").unwrap();
+        assert_eq!(result.as_str(), Some("done"));
+    }
+
+    #[test]
+    fn wait_response_reports_timeout_and_disconnect() {
+        let (tx, rx) = mpsc::channel();
+        let timeout = wait_response(&rx, Duration::from_millis(1), "slow", "initialize")
+            .unwrap_err();
+        assert!(timeout.contains("timed out"), "{timeout}");
+
+        drop(tx);
+        let disconnected =
+            wait_response(&rx, Duration::from_secs(1), "gone", "tools/list").unwrap_err();
+        assert!(disconnected.contains("reader disconnected"), "{disconnected}");
     }
 }

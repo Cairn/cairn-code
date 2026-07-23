@@ -1,4 +1,5 @@
 use std::io::{self, stdout, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -155,6 +156,12 @@ pub struct Tui {
     pending_select: Option<SelectDump>,
     /// Wall clock for the current in-flight thinking stream (for duration labels).
     thinking_started: Option<Instant>,
+    /// Startup snapshot shared with the agent's skill tool.
+    skills: Vec<crate::skills::Skill>,
+    skills_dir: PathBuf,
+    /// Startup MCP configuration and the file it was loaded from.
+    mcp_config: crate::mcp::McpConfig,
+    config_path: PathBuf,
 }
 
 impl Tui {
@@ -252,7 +259,24 @@ impl Tui {
             mouse_capture: true,
             pending_select: None,
             thinking_started: None,
+            skills: Vec::new(),
+            skills_dir: crate::skills::default_skills_dir(),
+            mcp_config: crate::mcp::McpConfig::default(),
+            config_path: crate::config::config_path(),
         }
+    }
+
+    pub fn set_extensibility_inventory(
+        &mut self,
+        skills: Vec<crate::skills::Skill>,
+        skills_dir: PathBuf,
+        mcp_config: crate::mcp::McpConfig,
+        config_path: PathBuf,
+    ) {
+        self.skills = skills;
+        self.skills_dir = skills_dir;
+        self.mcp_config = mcp_config;
+        self.config_path = config_path;
     }
 
     pub fn set_live_mirror(&mut self, mirror: session::LiveMirror) {
@@ -1591,29 +1615,23 @@ impl Tui {
                 });
             }
             "/skills" => {
-                let cfg = crate::config::Config::load();
-                if let Some(ref d) = cfg.skills_dir {
-                    std::env::set_var("CAIRN_SKILLS_DIR", d);
-                }
-                let list = crate::skills::load_skills();
-                let dir = cfg
-                    .skills_dir
-                    .as_ref()
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(crate::skills::default_skills_dir);
-                if list.is_empty() {
+                if self.skills.is_empty() {
                     self.output_lines.push(OutputLine {
                         type_: "system".into(),
                         content: format!(
                             "No skills found. Add packs as {}/<name>/SKILL.md (or set CAIRN_SKILLS_DIR).",
-                            dir.display()
+                            self.skills_dir.display()
                         ),
                         tool_name: String::new(),
                         duration: String::new(),
                     });
                 } else {
-                    let mut body = format!("Skills ({}) from {}:\n", list.len(), dir.display());
-                    for s in &list {
+                    let mut body = format!(
+                        "Skills ({}) from {}:\n",
+                        self.skills.len(),
+                        self.skills_dir.display()
+                    );
+                    for s in &self.skills {
                         body.push_str(&format!("  {} — {}\n", s.name, s.description));
                     }
                     body.push_str("Load in-chat with the skill tool: {\"name\":\"...\"}");
@@ -1626,28 +1644,27 @@ impl Tui {
                 }
             }
             "/mcp" => {
-                let cfg = crate::config::Config::load();
-                if cfg.mcp.servers.is_empty() {
+                if self.mcp_config.servers.is_empty() {
                     self.output_lines.push(OutputLine {
                         type_: "system".into(),
                         content: format!(
                             "No MCP servers in config. Add mcp.servers (or mcpServers) to {}.",
-                            crate::config::config_path().display()
+                            self.config_path.display()
                         ),
                         tool_name: String::new(),
                         duration: String::new(),
                     });
                 } else {
                     let mut body = String::from("Configured MCP servers:\n");
-                    let mut names: Vec<_> = cfg.mcp.servers.keys().cloned().collect();
+                    let mut names: Vec<_> = self.mcp_config.servers.keys().cloned().collect();
                     names.sort();
                     for n in names {
-                        let s = &cfg.mcp.servers[&n];
+                        let s = &self.mcp_config.servers[&n];
                         let state = if s.disabled { "disabled" } else { "enabled" };
                         let args_str = if s.args.is_empty() {
                             String::new()
                         } else {
-                            format!(" {}", crate::redact::redact_secrets(&s.args.join(" ")))
+                            format!(" <{} argument(s) hidden>", s.args.len())
                         };
                         body.push_str(&format!("  {n} [{state}] — {}{args_str}\n", s.command));
                     }
@@ -3825,6 +3842,86 @@ mod provider_privacy_tests {
             rx.try_recv().is_err(),
             "cancellation must not leave a stale command queued"
         );
+    }
+}
+
+#[cfg(test)]
+mod extensibility_command_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn test_tui() -> Tui {
+        Tui::new("test", "model", "provider", ".")
+    }
+
+    #[test]
+    fn skills_command_uses_runtime_inventory() {
+        let mut tui = test_tui();
+        let skill = crate::skills::Skill {
+            name: "runtime-skill".into(),
+            description: "Loaded at startup".into(),
+            content: "instructions".into(),
+            path: PathBuf::from("/runtime/skills/runtime-skill/SKILL.md"),
+        };
+        tui.set_extensibility_inventory(
+            vec![skill],
+            PathBuf::from("/runtime/skills"),
+            crate::mcp::McpConfig::default(),
+            PathBuf::from("/project/.cairn/config.json"),
+        );
+
+        tui.handle_command("/skills");
+
+        let output = &tui.output_lines.last().unwrap().content;
+        assert!(
+            output.contains("runtime-skill — Loaded at startup"),
+            "{output}"
+        );
+        assert!(output.contains("/runtime/skills"), "{output}");
+    }
+
+    #[test]
+    fn mcp_command_hides_arguments() {
+        let mut tui = test_tui();
+        let mut mcp = crate::mcp::McpConfig::default();
+        mcp.servers.insert(
+            "docs".into(),
+            crate::mcp::McpServerConfig {
+                command: "npx".into(),
+                args: vec!["--token".into(), "secret-value".into()],
+                env: HashMap::new(),
+                disabled: false,
+            },
+        );
+        tui.set_extensibility_inventory(
+            Vec::new(),
+            PathBuf::from("/runtime/skills"),
+            mcp,
+            PathBuf::from("/project/.cairn/config.json"),
+        );
+
+        tui.handle_command("/mcp");
+
+        let output = &tui.output_lines.last().unwrap().content;
+        assert!(output.contains("docs [enabled] — npx <2 argument(s) hidden>"));
+        assert!(!output.contains("--token"));
+        assert!(!output.contains("secret-value"));
+    }
+
+    #[test]
+    fn mcp_empty_state_uses_active_config_path() {
+        let mut tui = test_tui();
+        tui.set_extensibility_inventory(
+            Vec::new(),
+            PathBuf::from("/runtime/skills"),
+            crate::mcp::McpConfig::default(),
+            PathBuf::from("/project/.cairn/config.json"),
+        );
+
+        tui.handle_command("/mcp");
+
+        let output = &tui.output_lines.last().unwrap().content;
+        assert!(output.contains("/project/.cairn/config.json"), "{output}");
     }
 }
 

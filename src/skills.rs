@@ -280,6 +280,16 @@ mod tests {
     fn test_split_frontmatter_strict_boundaries() {
         assert_eq!(split_frontmatter("---text\nfoo\n---").0, None);
         assert_eq!(split_frontmatter("  ---\nfoo\n---").0, None);
+        let invalid_close = "---\nname: foo\n--- trailing\nbody text";
+        assert_eq!(
+            split_frontmatter(invalid_close),
+            (None, invalid_close.to_string())
+        );
+        let inline_close = "---\nname: foo\ntext---\nbody text";
+        assert_eq!(
+            split_frontmatter(inline_close),
+            (None, inline_close.to_string())
+        );
         let (front, body) = split_frontmatter("---\nname: foo\n---\nbody text");
         assert_eq!(front.unwrap(), "name: foo");
         assert_eq!(body, "body text");

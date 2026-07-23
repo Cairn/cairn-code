@@ -24,6 +24,8 @@ pub struct Config {
     pub skills_dir: Option<String>,
     /// MCP stdio servers (external tools).
     pub mcp: crate::mcp::McpConfig,
+    /// Configuration file selected by `Config::load` (or the default user path).
+    pub active_path: PathBuf,
 }
 
 impl Default for Config {
@@ -43,6 +45,7 @@ impl Default for Config {
             show_suggestions: false,
             skills_dir: None,
             mcp: crate::mcp::McpConfig::default(),
+            active_path: config_path(),
         }
     }
 }
@@ -59,7 +62,8 @@ impl Config {
         for path in &paths {
             if path.exists() {
                 if let Ok(content) = fs::read_to_string(path) {
-                    if let Ok(cfg) = parse_config(&content) {
+                    if let Ok(mut cfg) = parse_config(&content) {
+                        cfg.active_path = path.clone();
                         return cfg;
                     }
                 }

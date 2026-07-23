@@ -33,11 +33,16 @@ impl McpConfig {
             .cloned()
             .unwrap_or_else(|| crate::json::JsonValue::Object(obj.clone()));
         let Some(servers) = servers_val.as_object() else {
+            cfg.warnings
+                .push("MCP 'servers' must be an object; no servers loaded".to_string());
             return cfg;
         };
         for (name, v) in servers {
             // Skip non-object entries (e.g. if bare map mixed with other keys)
             let Some(sobj) = v.as_object() else {
+                cfg.warnings.push(format!(
+                    "MCP server {name:?}: configuration must be an object; skipped"
+                ));
                 continue;
             };
             let command = sobj
@@ -151,5 +156,24 @@ mod tests {
             mcp_tool_name("my-server", "list.files"),
             "mcp_my_server_list_files"
         );
+    }
+
+    #[test]
+    fn malformed_servers_are_skipped_with_warnings() {
+        let raw = r#"{
+            "servers": {
+                "missing-command": {},
+                "bad-type": {"command": "server", "type": "http"},
+                "not-an-object": true
+            }
+        }"#;
+        let v = json::parse(raw).unwrap();
+        let cfg = McpConfig::from_json_obj(v.as_object().unwrap());
+
+        assert!(cfg.servers.is_empty());
+        assert_eq!(cfg.warnings.len(), 3);
+        assert!(cfg.warnings.iter().any(|w| w.contains("missing or empty")));
+        assert!(cfg.warnings.iter().any(|w| w.contains("unsupported transport")));
+        assert!(cfg.warnings.iter().any(|w| w.contains("must be an object")));
     }
 }

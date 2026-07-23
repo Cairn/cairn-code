@@ -81,8 +81,12 @@ fn main() {
     if let Some(dir) = cfg.skills_dir.clone() {
         std::env::set_var("CAIRN_SKILLS_DIR", dir);
     }
+    let skills_dir = skills::default_skills_dir();
     let skills = skills::load_skills();
     let skills_for_agent = skills.clone();
+    let skills_for_tui = skills.clone();
+    let mcp_for_tui = cfg.mcp.clone();
+    let active_config_path = cfg.active_path.clone();
     let (tool_registry, mcp_runtime) = tools::registry::build_registry(skills, &cfg.mcp);
     let mcp_warnings = mcp_runtime.warnings.clone();
     let mcp_tool_count = mcp_runtime.tool_names.len();
@@ -253,6 +257,12 @@ fn main() {
     config::hydrate_env_from_keyring();
 
     let mut tui = tui::Tui::new(version, &p_model_for_print, &provider_name_str, &work_dir);
+    tui.set_extensibility_inventory(
+        skills_for_tui,
+        skills_dir.clone(),
+        mcp_for_tui,
+        active_config_path,
+    );
     tui.set_theme_name(&theme_name);
     tui.set_show_thinking(show_thinking);
     tui.set_show_suggestions(show_suggestions);
@@ -267,7 +277,7 @@ fn main() {
             type_: "system".into(),
             content: format!(
                 "Loaded {skill_count} skill(s) from {}. Use the skill tool or /skills.",
-                skills::default_skills_dir().display()
+                skills_dir.display()
             ),
             tool_name: String::new(),
             duration: String::new(),
