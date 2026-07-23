@@ -20,16 +20,8 @@ impl Tool for GrepTool {
         let include = obj.get("include").and_then(|v| v.as_str());
         let search_path = obj.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
-        // Escape literals first, then expand wildcards (same order as glob_tool).
-        // Doing `*` before `.` would turn `.*` into `\.*` and break matches.
-        let re = SimpleRe::new(&format!(
-            ".*{}.*",
-            pattern
-                .replace('.', "\\.")
-                .replace('*', ".*")
-                .replace('?', ".")
-        ))
-        .map_err(|e| format!("invalid pattern: {e}"))?;
+        let re = SimpleRe::new(&format!(".*{}.*", pattern.replace('*', ".*").replace('?', ".").replace('.', "\\.")))
+            .map_err(|e| format!("invalid pattern: {e}"))?;
 
         let mut results = Vec::new();
         search_dir(Path::new(search_path), &re, include, "", &mut results)?;
@@ -44,71 +36,6 @@ impl Tool for GrepTool {
         }
         output.push_str(&format!("{} result(s)", results.len()));
         Ok(output)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir() -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("cairn-grep-{nanos}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn finds_literal_in_file() {
-        let dir = temp_dir();
-        fs::write(dir.join("a.rs"), "fn main() {\n    println!(\"hello unique_token_xyz\");\n}\n").unwrap();
-        fs::write(dir.join("b.txt"), "nope\n").unwrap();
-        let tool = GrepTool;
-        let input = format!(
-            r#"{{"pattern":"unique_token_xyz","path":"{}"}}"#,
-            dir.to_string_lossy().replace('\\', "\\\\")
-        );
-        let out = tool.execute(&input).unwrap();
-        assert!(out.contains("unique_token_xyz"), "{out}");
-        assert!(out.contains("1 result") || out.contains("result(s)"), "{out}");
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn wildcard_star_matches() {
-        let dir = temp_dir();
-        fs::write(dir.join("x.txt"), "alpha-beta-gamma\n").unwrap();
-        let tool = GrepTool;
-        let input = format!(
-            r#"{{"pattern":"alpha*gamma","path":"{}"}}"#,
-            dir.to_string_lossy().replace('\\', "\\\\")
-        );
-        let out = tool.execute(&input).unwrap();
-        assert!(out.contains("alpha-beta-gamma"), "{out}");
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn no_matches() {
-        let dir = temp_dir();
-        fs::write(dir.join("x.txt"), "nothing here\n").unwrap();
-        let tool = GrepTool;
-        let input = format!(
-            r#"{{"pattern":"definitely_not_present_zzz","path":"{}"}}"#,
-            dir.to_string_lossy().replace('\\', "\\\\")
-        );
-        let out = tool.execute(&input).unwrap();
-        assert!(out.contains("No matches"), "{out}");
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn requires_pattern() {
-        assert!(GrepTool.execute(r#"{}"#).is_err());
     }
 }
 

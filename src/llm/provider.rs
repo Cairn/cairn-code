@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 
 #[derive(Debug, Clone)]
 pub struct ToolUse {
@@ -42,7 +41,6 @@ pub struct ModelInfo {
     pub max_ctx: u64,
 }
 
-#[derive(Debug, Clone)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -79,7 +77,6 @@ pub trait Provider: Send {
         model: &str,
         max_tokens: usize,
         on_chunk: StreamingCallback,
-        cancel: &AtomicBool,
     ) -> Result<(Vec<Message>, Usage), String>;
     fn complete(
         &self,
@@ -91,36 +88,20 @@ pub trait Provider: Send {
     ) -> Result<(Vec<Message>, Usage), String>;
 }
 
-/// Actionable message when a provider requires an API key that is missing.
-pub fn missing_api_key(env_var: &str) -> String {
-    format!(
-        "{env_var} is not set. Export it in your shell, or save a key via the provider picker (/provider)."
-    )
-}
-
 pub fn default_providers() -> HashMap<String, Box<dyn Provider>> {
     let mut map: HashMap<String, Box<dyn Provider>> = HashMap::new();
     map.insert("anthropic".into(), Box::new(crate::llm::anthropic::AnthropicProvider::new()));
-    let openai = match crate::config::config_get_api_key("openai") {
-        Some(key) => crate::llm::openai::OpenAIProvider::new().with_api_key(&key),
-        None => crate::llm::openai::OpenAIProvider::new(),
+    map.insert("openai".into(), Box::new(crate::llm::openai::OpenAIProvider::new()));
+    let opencode = match crate::config::config_get_api_key("opencode") {
+        Some(key) => crate::llm::opencode::OpenCodeProvider::new().with_api_key(&key),
+        None => crate::llm::opencode::OpenCodeProvider::new(),
     };
-    map.insert("openai".into(), Box::new(openai));
+    map.insert("opencode".into(), Box::new(opencode));
     let openrouter = match crate::config::config_get_api_key("openrouter") {
         Some(key) => crate::llm::openrouter::OpenRouterProvider::new().with_api_key(&key),
         None => crate::llm::openrouter::OpenRouterProvider::new(),
     };
     map.insert("openrouter".into(), Box::new(openrouter));
-    let opengateway = match crate::config::config_get_api_key("opengateway") {
-        Some(key) => crate::llm::opengateway::OpenGatewayProvider::new().with_api_key(&key),
-        None => crate::llm::opengateway::OpenGatewayProvider::new(),
-    };
-    map.insert("opengateway".into(), Box::new(opengateway));
-    let xai = match crate::config::config_get_api_key("xai") {
-        Some(key) => crate::llm::xai::XaiProvider::new().with_api_key(&key),
-        None => crate::llm::xai::XaiProvider::new(),
-    };
-    map.insert("xai".into(), Box::new(xai));
     map.insert("ollama".into(), Box::new(crate::llm::ollama::OllamaProvider::new()));
     map
 }

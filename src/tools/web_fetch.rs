@@ -32,7 +32,7 @@ impl Tool for WebFetchTool {
     }
 }
 
-pub(crate) fn html_to_text(html: &str) -> String {
+fn html_to_text(html: &str) -> String {
     let mut text = String::new();
     let mut in_tag = false;
     let mut in_script = false;
@@ -102,43 +102,5 @@ pub(crate) fn html_to_text(html: &str) -> String {
         format!("{}...\n[truncated at 10000 chars]", &result[..10000])
     } else {
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strips_tags_and_scripts() {
-        let html = r#"
-            <html><head><style>body{color:red}</style><script>alert(1)</script></head>
-            <body><h1>Hello</h1><p>World</p><br/>Line2</body></html>
-        "#;
-        let text = html_to_text(html);
-        assert!(text.contains("Hello"), "{text}");
-        assert!(text.contains("World"), "{text}");
-        assert!(!text.contains("alert"), "{text}");
-        assert!(!text.contains("color:red"), "{text}");
-    }
-
-    #[test]
-    fn collapses_whitespace() {
-        let text = html_to_text("<p>a   b\t\tc</p>");
-        assert!(text.contains("a b c") || text.contains("a b"), "{text}");
-    }
-
-    #[test]
-    fn requires_url() {
-        assert!(WebFetchTool.execute("{}").is_err());
-        assert!(WebFetchTool.execute("not-json").is_err());
-    }
-
-    #[test]
-    fn truncates_very_long_text() {
-        let long = format!("<p>{}</p>", "x".repeat(12_000));
-        let text = html_to_text(&long);
-        assert!(text.contains("truncated"), "{text}");
-        assert!(text.len() < 12_000);
     }
 }

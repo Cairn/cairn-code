@@ -5,47 +5,29 @@
 - [x] Add comprehensive test suite — currently only 14 tests, need coverage for: UI spinner lifecycle, session replay, streaming drain, tool execution, error recovery, all tool implementations
 
 ## Priority: High
-- [x] ~~Add OpenCode provider support~~ — removed (OpenCode Zen free API is not acceptable to use)
-- [x] Improve error messages — actionable auth/rate-limit/network/context errors in `http_client.rs` plus clearer missing-API-key messages
-- [x] Add file edit tool safety — workspace-path confinement in `file_edit`/`file_write` (`tools/workspace.rs`), `Tool::needs_permission()` gates execution, shell `timeout` enforced, in-process `file_undo` stack for edit/write
+- [ ] Fix middleware.test.ts audit log failures — 3 tests fail with "Cannot use a closed database" in middleware.test.ts (note: this is Synapse CRM, reference for pattern)
+- [x] Add OpenCode provider support — opencode.go exists but needs integration testing
+- [ ] Improve error messages — surface actionable errors when API calls fail (rate limits, auth errors, network issues)
+- [ ] Add file edit tool safety — validate paths, prevent writes outside workspace, add undo support
 
 ## Priority: Medium
-- [x] Add configuration file support (~/.config/cairn-code/config.json) — model selection, API keys, defaults
-- [x] Store API keys in the OS keyring instead of plaintext in config.json (with one-time migration of existing plaintext keys)
-- [x] Improve session management — listing/save/resume/delete (`/sessions`, `/save`, `/resume`, `/delete [id]`)
-- [x] Add syntax highlighting for code blocks in output — syntect (`default-fancy`) in `markdown.rs`
-- [x] Recovery switch after LLM failure — TUI offers Switch model / Switch provider / Dismiss (no silent multi-provider fallback)
-- [x] Add cost tracking per session — token usage, estimated cost (`cost.rs`, `/cost`)
-- [x] Add HTTP retry-with-backoff (429/503/529) and a stream idle-timeout watchdog (`http_client.rs`)
-- [x] Thread cancellation through the streaming path and tool-execution loop (`agent.rs`, `Provider::stream_complete`), not just once per turn
+- [ ] Add configuration file support (~/.cairn/config.toml) — model selection, API keys, defaults
+- [ ] Improve session management — session listing, switching, deletion from CLI
+- [ ] Add syntax highlighting for code blocks in output
+- [ ] Support multiple AI providers simultaneously — fallback between providers
+- [ ] Add cost tracking per session — token usage, estimated cost
 
 ## Priority: Low
-- [ ] Add plugin/extension system — custom tools via Python (spawn/script or MCP-style; not Lua/WASM guest runtimes)
-- [x] TUI theme customization — dark themes from zero + fixed dark Dune; `/theme` picker
-- [x] Add completions/suggestions for commands — Tab slash completion (`slash_completions` in `tui.rs`)
-- [x] Notification sounds on turn done / permission / recovery (`notify.rs`; mute with `CAIRN_SOUND=0`)
-- [x] Grayed-out next-task composer hints (Claude Code-style; Tab/→ to accept)
+- [ ] Add plugin/extension system — custom tools via Lua or WASM
+- [ ] TUI theme customization — colors, styles, layout preferences
+- [ ] Add completions/suggestions for commands
 - [ ] Performance optimization — reduce memory allocations in hot paths
 - [ ] Add benchmark tests for streaming throughput
-
-## Larger items noted from a zero-parity audit (not started)
-zero (`~/source/repos/zero`) is a much larger, mature agent CLI (~167k lines vs
-cairn-code's ~6k). These are gaps confirmed against it that are each a
-standalone system, not a small port:
-- [x] Context/history compaction — proactive, reactive (context-limit retry), `/compact`, and `run_simple`
-- Session fork/lineage/rewind/checkpointing
-- Parallel execution of read-only tool calls
-- LSP integration (diagnostics, go-to-definition)
-- OS-level sandboxing for shell/tool execution
-- [x] OAuth login flows for providers — xAI device-code (`/auth login xai`), keyring token store, refresh_token grant
-- [x] Session autosave with full agent transcript (tools included) + resume rebuild
-- Model registry with live pricing/context-window/vision metadata
-- Three-way config layering (user/project/env), currently first-match-wins
-- [x] Output/log secret redaction — `redact.rs` on debug dumps, error text, sensitive headers
-- Provider catalog expansion beyond the current 6 (anthropic/openai/openrouter/opengateway/xai/ollama)
 
 ## Standing Rules
 - Never force push
 - Never push without reason (every commit must have purpose)
-- Always run `cargo build` and `cargo test` before committing
+- Always use `git -C /home/z/my-project/cairn-code`
+- Always commit as `SuperDuperZed`
+- Always run `go build ./...` and `go test ./...` before committing
 - Always push to `origin/main`

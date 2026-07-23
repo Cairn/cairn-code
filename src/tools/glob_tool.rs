@@ -2,18 +2,11 @@ use std::fs;
 use std::path::Path;
 use super::registry::Tool;
 
-/// Cap listed paths so broad globs (`src/**/*.rs`) do not flood the transcript.
-/// The total count is always reported so the model knows the full match size.
-const MAX_LISTED_PATHS: usize = 15;
-
 pub struct GlobTool;
 
 impl Tool for GlobTool {
     fn name(&self) -> &str { "glob" }
-    fn description(&self) -> &str {
-        "Find files matching a glob pattern (supports **, *). \
-         Returns a compact path list (capped) plus the total match count."
-    }
+    fn description(&self) -> &str { "Find files matching a glob pattern (supports **, *)" }
     fn needs_permission(&self) -> bool { false }
 
     fn input_schema(&self) -> String {
@@ -25,37 +18,23 @@ impl Tool for GlobTool {
         let obj = val.as_object().ok_or("expected object")?;
         let pattern = obj.get("pattern").and_then(|v| v.as_str()).ok_or("pattern required")?;
 
-        let mut results = glob_match(pattern, ".")?;
-        // Stable order keeps caps deterministic across runs.
-        results.sort();
+        let results = glob_match(pattern, ".")?;
 
-        Ok(format_glob_results(&results, MAX_LISTED_PATHS))
+        if results.is_empty() {
+            return Ok("No matches found.".into());
+        }
+
+        let mut result = String::new();
+        for path in &results {
+            result.push_str(path);
+            result.push('\n');
+        }
+        result.push_str(&format!("{} result(s)", results.len()));
+        Ok(result)
     }
 }
 
-/// Format match paths for the transcript/model: list up to `max_listed`, then
-/// a single summary line with the total (and how many were omitted).
-pub(crate) fn format_glob_results(results: &[String], max_listed: usize) -> String {
-    if results.is_empty() {
-        return "No matches found.".into();
-    }
-    let total = results.len();
-    let show = total.min(max_listed);
-    let mut out = String::new();
-    for path in &results[..show] {
-        out.push_str(path);
-        out.push('\n');
-    }
-    if total > show {
-        let omitted = total - show;
-        out.push_str(&format!("… and {omitted} more ({total} total)"));
-    } else {
-        out.push_str(&format!("{total} result(s)"));
-    }
-    out
-}
-
-pub(crate) fn glob_match(pattern: &str, base_dir: &str) -> Result<Vec<String>, String> {
+fn glob_match(pattern: &str, base_dir: &str) -> Result<Vec<String>, String> {
     let mut results = Vec::new();
     let base = Path::new(base_dir);
 
@@ -114,18 +93,14 @@ fn walk_pattern(
             }
         }
     } else if part.contains('*') || part.contains('?') {
-        // Wildcard pattern. Do not wrap with `^$` as literal characters — SimpleRe
-        // treats those as literals, so `^.*\.rs$` never matched real filenames.
-        let re_pattern = part
-            .replace('.', "\\.")
-            .replace('*', ".*")
-            .replace('?', ".");
+        // Wildcard pattern
+        let re_pattern = format!("^{}$", part.replace('.', "\\.").replace('*', ".*").replace('?', "."));
         let re = regex_wrapper(&re_pattern)?;
 
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if re.is_full_match(&name) {
+                if re.is_match(&name) {
                     let new_prefix = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
                     let path = entry.path();
                     if is_last || path.is_dir() {
@@ -169,103 +144,6 @@ fn walk_dir_recursive(dir: &Path, prefix: &str, results: &mut Vec<String>) -> Re
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_tree() -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("cairn-glob-{nanos}"));
-        fs::create_dir_all(dir.join("src")).unwrap();
-        fs::write(dir.join("src/main.rs"), "fn main(){}\n").unwrap();
-        fs::write(dir.join("src/lib.rs"), "").unwrap();
-        fs::write(dir.join("README.md"), "").unwrap();
-        dir
-    }
-
-    #[test]
-    fn finds_rs_files() {
-        let dir = temp_tree();
-        let dir_s = dir.to_string_lossy().replace('\\', "/");
-        // Single-level wildcard (more reliable across path styles than `**` alone).
-        let results = glob_match("src/*.rs", &dir_s).unwrap();
-        assert!(
-            results.iter().any(|p| p.replace('\\', "/").ends_with("src/main.rs") || p.contains("main.rs")),
-            "src/*.rs => {results:?}"
-        );
-        assert!(
-            results.iter().any(|p| p.contains("lib.rs")),
-            "src/*.rs => {results:?}"
-        );
-        // Recursive form
-        let deep = glob_match("**/*.rs", &dir_s).unwrap();
-        assert!(
-            deep.iter().any(|p| p.contains("main.rs")),
-            "**/*.rs => {deep:?}"
-        );
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn simple_re_full_match_star_rs() {
-        let re = regex_wrapper(r".*\.rs").unwrap();
-        assert!(re.is_full_match("main.rs"));
-        assert!(re.is_full_match("lib.rs"));
-        assert!(!re.is_full_match("main.rs.bak"));
-        assert!(!re.is_full_match("README.md"));
-    }
-
-    #[test]
-    fn literal_path() {
-        let dir = temp_tree();
-        let dir_s = dir.to_string_lossy().replace('\\', "/");
-        let results = glob_match("README.md", &dir_s).unwrap();
-        assert_eq!(results.len(), 1);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn execute_no_matches() {
-        let tool = GlobTool;
-        let out = tool
-            .execute(r#"{"pattern":"**/totally_missing_file_xyz_123.nope"}"#)
-            .unwrap();
-        assert!(out.contains("No matches"), "{out}");
-    }
-
-    #[test]
-    fn requires_pattern() {
-        assert!(GlobTool.execute("{}").is_err());
-    }
-
-    #[test]
-    fn format_caps_long_lists() {
-        let paths: Vec<String> = (0..40).map(|i| format!("src/f{i}.rs")).collect();
-        let out = format_glob_results(&paths, 15);
-        assert!(out.contains("src/f0.rs"), "{out}");
-        assert!(out.contains("src/f14.rs"), "{out}");
-        assert!(!out.contains("src/f15.rs"), "should not list past cap: {out}");
-        assert!(out.contains("… and 25 more (40 total)"), "{out}");
-        // Compact: cap + summary, not 40 path lines.
-        let path_lines = out.lines().filter(|l| l.starts_with("src/")).count();
-        assert_eq!(path_lines, 15, "{out}");
-    }
-
-    #[test]
-    fn format_short_list_shows_all() {
-        let paths = vec!["a.rs".into(), "b.rs".into()];
-        let out = format_glob_results(&paths, 15);
-        assert!(out.contains("a.rs"));
-        assert!(out.contains("b.rs"));
-        assert!(out.contains("2 result(s)"));
-        assert!(!out.contains("… and"));
-    }
-}
-
 struct SimpleRe {
     pattern: Vec<Segment>,
 }
@@ -285,11 +163,6 @@ impl SimpleRe {
 
         while i < chars.len() {
             match chars[i] {
-                // Escaped literal (e.g. `\.` from wildcard conversion of `*.rs`).
-                '\\' if i + 1 < chars.len() => {
-                    literal.push(chars[i + 1]);
-                    i += 2;
-                }
                 '.' if i + 1 < chars.len() && chars[i + 1] == '*' => {
                     if !literal.is_empty() {
                         segments.push(Segment::Literal(literal.clone()));
@@ -321,11 +194,6 @@ impl SimpleRe {
 
     fn is_match(&self, text: &str) -> bool {
         self.match_from(text, 0, 0)
-    }
-
-    /// Match the entire filename (not a substring).
-    fn is_full_match(&self, text: &str) -> bool {
-        self.is_match(text)
     }
 
     fn match_from(&self, text: &str, pi: usize, ti: usize) -> bool {

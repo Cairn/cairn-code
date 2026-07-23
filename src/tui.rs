@@ -1,28 +1,19 @@
-use std::io::stdout;
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ratatui::{
     Frame,
-    crossterm::{
-        event::{
-            DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-            MouseEventKind,
-        },
-        execute,
-    },
-    layout::{Constraint, Direction, Layout, Position},
-    style::Modifier,
-    text::{Line, Span, Text},
+    layout::Position,
     widgets::{Paragraph, Wrap},
+    style::{Style, Color, Modifier},
+    text::{Span, Line, Text},
 };
 
 use crate::llm;
 use crate::session;
 use crate::agent::AgentEvent;
-use crate::theme::{self, Theme};
 
 pub struct OutputLine {
     pub type_: String,
@@ -36,13 +27,7 @@ enum State {
     Running,
 }
 
-// Same frames as charmbracelet MiniDot (Grok Build / zero).
 const SPINNER_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-// MiniDot FPS is time.Second/12 (~83ms). Faster ticks look like flicker; slower feels sticky.
-const SPINNER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 12);
-// Cap full-frame redraws while the agent runs. Zero coalesces stream text to ~16ms
-// (60fps); without this, token-rate dirty redraws thrash the terminal around the spinner.
-const MIN_FRAME: Duration = Duration::from_millis(16);
 
 pub struct Tui {
     output_lines: Vec<OutputLine>,
@@ -72,10 +57,8 @@ pub struct Tui {
     confirm_remove_provider: Option<String>,
     confirm_remove_sel: usize,
     awaiting_api_key: bool,
-    /// After successful OAuth or API key entry from the provider picker, open the model list.
-    /// Auth comes first so live model catalogs (xAI, Anthropic, …) can load.
-    pending_model_after_auth: bool,
-    /// Provider name to capture an API key for (e.g. "openrouter", "opengateway").
+    pending_openrouter_setup: bool,
+    /// Provider name to capture an API key for (e.g. "openrouter", "opencode", "openai").
     /// When Some, the awaiting_api_key flow stores the key under this provider.
     api_key_target: Option<String>,
     show_command_picker: bool,
@@ -83,8 +66,6 @@ pub struct Tui {
     cmd_picker_filtered: Vec<String>,
     cmd_picker_sel: usize,
     show_session_picker: bool,
-    /// When true, Enter on the session picker deletes instead of resuming.
-    session_picker_delete: bool,
     picker_sessions: Vec<session::SessionSummary>,
     picker_session_sel: usize,
     picker_session_scrl: usize,
@@ -96,41 +77,6 @@ pub struct Tui {
     perm_tool_name: String,
     perm_tool_input: String,
     perm_selection: usize,
-    /// After an LLM/provider failure: offer Switch model / Switch provider / Dismiss.
-    show_recovery_prompt: bool,
-    recovery_selection: usize,
-    theme: Theme,
-    show_theme_picker: bool,
-    theme_picker_list: Vec<Theme>,
-    theme_picker_sel: usize,
-    /// Theme name before opening the picker (restored on Esc).
-    theme_before_picker: Option<String>,
-    /// Claude Code-style exit: first Ctrl+C on empty idle prompt arms this;
-    /// second Ctrl+C exits. Disarmed by any other key or action.
-    ctrl_c_exit_armed: bool,
-    /// Transcript vertical offset (videre-style `rowoff`): first visible wrapped
-    /// line of the body. When `transcript_follow` is true, view sticks to bottom.
-    transcript_rowoff: usize,
-    /// When true, keep the transcript pinned to the latest content (auto-scroll).
-    transcript_follow: bool,
-    /// Last body pane height / content height from render (for page sizes).
-    last_body_h: usize,
-    last_body_wrapped: usize,
-    /// Active session id for autosave / resume (None until first save or resume).
-    current_session_id: Option<String>,
-    /// created_at for the active session (preserved across autosaves).
-    session_created_at: u64,
-    /// Full agent transcript (tools included) for session files.
-    live_mirror: Option<session::LiveMirror>,
-    /// When true, the next `Done` event is a finished agent turn (play sound + refresh hint).
-    expect_turn_notify: bool,
-    /// Grayed-out ready-to-send prompt shown when the composer is empty (Tab/→ accepts).
-    idle_suggestion: Option<String>,
-    /// When true, stream + keep full thinking blocks. When false (default), only
-    /// a short "Thought for …" marker is kept after each think phase.
-    show_thinking: bool,
-    /// Wall clock for the current in-flight thinking stream (for duration labels).
-    thinking_started: Option<Instant>,
 }
 
 impl Tui {
@@ -161,19 +107,13 @@ impl Tui {
             confirm_remove_provider: None,
             confirm_remove_sel: 0,
             awaiting_api_key: false,
-            pending_model_after_auth: false,
+            pending_openrouter_setup: false,
             api_key_target: None,
             show_command_picker: false,
-            cmd_picker_list: vec![
-                "/auth".into(), "/clear".into(), "/compact".into(), "/cost".into(), "/delete".into(),
-                "/exit".into(), "/help".into(), "/model".into(), "/provider".into(), "/quit".into(),
-                "/q".into(), "/resume".into(), "/save".into(), "/sessions".into(), "/theme".into(),
-                "/thinking".into(),
-            ],
+            cmd_picker_list: vec!["/clear".into(), "/cost".into(), "/exit".into(), "/help".into(), "/model".into(), "/provider".into(), "/quit".into(), "/q".into(), "/resume".into(), "/save".into(), "/sessions".into()],
             cmd_picker_filtered: Vec::new(),
             cmd_picker_sel: 0,
             show_session_picker: false,
-            session_picker_delete: false,
             picker_sessions: Vec::new(),
             picker_session_sel: 0,
             picker_session_scrl: 0,
@@ -185,42 +125,7 @@ impl Tui {
             perm_tool_name: String::new(),
             perm_tool_input: String::new(),
             perm_selection: 0,
-            show_recovery_prompt: false,
-            recovery_selection: 0,
-            theme: theme::default_theme(),
-            show_theme_picker: false,
-            theme_picker_list: theme::all_themes(),
-            theme_picker_sel: 0,
-            theme_before_picker: None,
-            ctrl_c_exit_armed: false,
-            transcript_rowoff: 0,
-            transcript_follow: true,
-            last_body_h: 0,
-            last_body_wrapped: 0,
-            current_session_id: None,
-            session_created_at: 0,
-            live_mirror: None,
-            expect_turn_notify: false,
-            idle_suggestion: Some(default_empty_suggestion().into()),
-            show_thinking: false,
-            thinking_started: None,
         }
-    }
-
-    pub fn set_live_mirror(&mut self, mirror: session::LiveMirror) {
-        self.live_mirror = Some(mirror);
-    }
-
-    pub fn set_theme_name(&mut self, name: &str) {
-        self.theme = theme::lookup(name);
-        self.theme_picker_list = theme::all_themes();
-        self.theme_picker_sel = self.theme_picker_list.iter()
-            .position(|t| t.name == self.theme.name)
-            .unwrap_or(0);
-    }
-
-    pub fn set_show_thinking(&mut self, show: bool) {
-        self.show_thinking = show;
     }
 
     pub fn set_agent_tx(&mut self, tx: mpsc::Sender<String>) {
@@ -238,13 +143,11 @@ impl Tui {
     pub fn run(&mut self, rx: mpsc::Receiver<AgentEvent>) -> Result<(), String> {
         let mut terminal = ratatui::init();
         terminal.clear().map_err(|e| e.to_string())?;
-        // Mouse wheel scroll works on Windows / macOS / Linux terminals that
-        // support it (same idea as videre's cross-platform input layer).
-        let _ = execute!(stdout(), EnableMouseCapture);
 
         let mut result = Ok(());
         let mut last_spinner_update = std::time::Instant::now();
         let mut last_draw = std::time::Instant::now();
+        const MIN_FRAME: std::time::Duration = std::time::Duration::from_micros(1_000_000 / 240);
         let mut needs_rebuild = false;
         self.dirty = true;
 
@@ -255,12 +158,7 @@ impl Tui {
                     got_event = true;
                     match event {
                         AgentEvent::Text(t) => { self.streaming_text.push_str(&t); }
-                        AgentEvent::Thinking(t) => {
-                            if self.thinking_started.is_none() {
-                                self.thinking_started = Some(Instant::now());
-                            }
-                            self.stream_thinking.push_str(&t);
-                        }
+                        AgentEvent::Thinking(t) => { self.stream_thinking.push_str(&t); }
                         AgentEvent::ToolUse(name, input) => {
                             self.flush_streaming();
                             self.output_lines.push(OutputLine {
@@ -274,21 +172,9 @@ impl Tui {
                         }
                         AgentEvent::Error(e) => {
                             self.flush_streaming();
-                            let is_llm = e.starts_with("LLM error:");
                             self.output_lines.push(OutputLine {
-                                type_: "error".into(),
-                                content: crate::redact::redact_secrets(&e),
-                                tool_name: String::new(),
-                                duration: String::new(),
+                                type_: "error".into(), content: e, tool_name: String::new(), duration: String::new(),
                             });
-                            // Offer a manual model/provider switch after LLM failures only
-                            // (not for compact/session errors). Never silent multi-provider fallback.
-                            if is_llm {
-                                self.show_recovery_prompt = true;
-                                self.recovery_selection = 0;
-                                crate::notify::play(crate::notify::Kind::Attention);
-                                self.refresh_idle_suggestion();
-                            }
                         }
                         AgentEvent::PermissionRequest(name, input) => {
                             self.flush_streaming();
@@ -296,63 +182,14 @@ impl Tui {
                             self.perm_tool_name = name;
                             self.perm_tool_input = input;
                             self.perm_selection = 0;
-                            crate::notify::play(crate::notify::Kind::Attention);
-                            self.refresh_idle_suggestion();
                         }
                         AgentEvent::TurnEnd(u) => {
                             self.total_usage.input_tokens += u.input_tokens;
                             self.total_usage.output_tokens += u.output_tokens;
                         }
-                        AgentEvent::Compacted(n) => {
-                            self.flush_streaming();
-                            self.output_lines.push(OutputLine {
-                                type_: "system".into(),
-                                content: format!("Compacted {n} earlier messages into a summary."),
-                                tool_name: String::new(),
-                                duration: String::new(),
-                            });
-                        }
                         AgentEvent::Done => {
                             self.flush_streaming();
                             self.state = State::Idle;
-                            // Autosave after each finished turn (not only manual /save).
-                            self.autosave_session(false);
-                            if self.expect_turn_notify {
-                                self.expect_turn_notify = false;
-                                // Permission/recovery already beeped Attention; skip double tone.
-                                if !self.show_permission_prompt && !self.show_recovery_prompt {
-                                    crate::notify::play(crate::notify::Kind::Done);
-                                }
-                            }
-                            self.refresh_idle_suggestion();
-                            if self.pending_model_after_auth {
-                                if crate::config::has_usable_credential(&self.provider) {
-                                    // Signed in — now pick a model (live catalog available).
-                                    self.pending_model_after_auth = false;
-                                    self.output_lines.push(OutputLine {
-                                        type_: "system".into(),
-                                        content: format!(
-                                            "Signed in to {}. Choose a model.",
-                                            self.provider
-                                        ),
-                                        tool_name: String::new(),
-                                        duration: String::new(),
-                                    });
-                                    self.open_model_picker();
-                                } else {
-                                    // OAuth failed; keep pending so API key still continues to model picker.
-                                    self.output_lines.push(OutputLine {
-                                        type_: "system".into(),
-                                        content: format!(
-                                            "OAuth for {} did not complete. Paste an API key below, or run `/auth login {}` again.",
-                                            self.provider, self.provider
-                                        ),
-                                        tool_name: String::new(),
-                                        duration: String::new(),
-                                    });
-                                    self.begin_api_key_prompt(&self.provider.clone());
-                                }
-                            }
                         }
                     }
                 }
@@ -361,18 +198,14 @@ impl Tui {
 
             if matches!(self.state, State::Idle) {
                 match ratatui::crossterm::event::read() {
-                    Ok(Event::Key(key)) => {
+                    Ok(ratatui::crossterm::event::Event::Key(key)) => {
                         if !self.handle_key(key) {
                             break 'outer;
                         } else {
                             self.dirty = true;
                         }
                     }
-                    Ok(Event::Mouse(m)) => {
-                        self.handle_mouse(m.kind);
-                        self.dirty = true;
-                    }
-                    Ok(Event::Resize(_, _)) => {
+                    Ok(ratatui::crossterm::event::Event::Resize(_, _)) => {
                         needs_rebuild = true;
                         self.dirty = true;
                     }
@@ -383,46 +216,19 @@ impl Tui {
                     _ => {}
                 }
             } else {
-                // Advance the MiniDot frame on its own clock (not on every stream dirty).
-                // Re-issuing a tick every event-loop lap is what makes the glyph flash.
-                if last_spinner_update.elapsed() >= SPINNER_INTERVAL {
+                let event_avail = ratatui::crossterm::event::poll(Duration::from_millis(1)).unwrap_or(false);
+                if event_avail {
+                    if let Ok(ratatui::crossterm::event::Event::Key(key)) = ratatui::crossterm::event::read() {
+                        if key.kind == ratatui::crossterm::event::KeyEventKind::Press {
+                            self.handle_key(key);
+                            self.dirty = true;
+                        }
+                    }
+                }
+                if last_spinner_update.elapsed() >= Duration::from_millis(80) {
                     self.spinner_idx = self.spinner_idx.wrapping_add(1);
                     last_spinner_update = std::time::Instant::now();
                     self.dirty = true;
-                }
-
-                // Sleep until the next useful wake. Cap at MIN_FRAME so stream
-                // chunks in mpsc still drain at ~60fps without a 1ms busy-poll.
-                let until_spinner = SPINNER_INTERVAL
-                    .checked_sub(last_spinner_update.elapsed())
-                    .unwrap_or(Duration::ZERO);
-                let poll_for = if self.dirty {
-                    MIN_FRAME
-                        .checked_sub(last_draw.elapsed())
-                        .unwrap_or(Duration::ZERO)
-                } else {
-                    until_spinner.min(MIN_FRAME)
-                };
-                let event_avail =
-                    ratatui::crossterm::event::poll(poll_for).unwrap_or(false);
-                if event_avail {
-                    match ratatui::crossterm::event::read() {
-                        Ok(Event::Key(key)) => {
-                            if key.kind == KeyEventKind::Press {
-                                self.handle_key(key);
-                                self.dirty = true;
-                            }
-                        }
-                        Ok(Event::Mouse(m)) => {
-                            self.handle_mouse(m.kind);
-                            self.dirty = true;
-                        }
-                        Ok(Event::Resize(_, _)) => {
-                            needs_rebuild = true;
-                            self.dirty = true;
-                        }
-                        _ => {}
-                    }
                 }
             }
 
@@ -432,11 +238,8 @@ impl Tui {
             }
 
             if self.dirty {
-                // While Running, coalesce stream-driven dirties to ~60fps so token
-                // rate cannot thrash the terminal around the spinner. Idle always
-                // paints immediately so keystrokes stay snappy.
-                if matches!(self.state, State::Running) && last_draw.elapsed() < MIN_FRAME {
-                    continue;
+                if let Some(sleep) = MIN_FRAME.checked_sub(last_draw.elapsed()) {
+                    std::thread::sleep(sleep);
                 }
                 if let Err(e) = terminal.draw(|f| self.render(f)) {
                     result = Err(format!("Render error: {e}"));
@@ -447,131 +250,15 @@ impl Tui {
             }
         }
 
-        // Persist conversation on clean exit so the last session is not lost.
-        self.autosave_session(false);
-        let _ = execute!(stdout(), DisableMouseCapture);
         ratatui::restore();
         result
     }
 
-    fn handle_mouse(&mut self, kind: MouseEventKind) {
-        // Ignore mouse while list pickers own the chrome (wheel should not fight them).
-        // Slash ghost completion is inline, so scrolling still works while typing `/…`.
-        if self.show_model_picker
-            || self.show_provider_picker
-            || self.show_theme_picker
-            || self.show_session_picker
-        {
-            return;
-        }
-        match kind {
-            MouseEventKind::ScrollUp => self.scroll_transcript(-3),
-            MouseEventKind::ScrollDown => self.scroll_transcript(3),
-            _ => {}
-        }
-    }
-
-    /// Scroll the transcript by `delta` wrapped lines (negative = up / older).
-    /// Mirrors videre's rowoff model: free scroll until the bottom, then re-follow.
-    fn scroll_transcript(&mut self, delta: isize) {
-        let max_off = self
-            .last_body_wrapped
-            .saturating_sub(self.last_body_h.max(1));
-        if max_off == 0 {
-            self.transcript_rowoff = 0;
-            self.transcript_follow = true;
-            return;
-        }
-        let cur = if self.transcript_follow {
-            max_off
-        } else {
-            self.transcript_rowoff.min(max_off)
-        };
-        let next = if delta < 0 {
-            cur.saturating_sub((-delta) as usize)
-        } else {
-            cur.saturating_add(delta as usize).min(max_off)
-        };
-        self.transcript_rowoff = next;
-        self.transcript_follow = next >= max_off;
-    }
-
-    fn scroll_page(&mut self, down: bool) {
-        let page = self.last_body_h.max(1).saturating_sub(1);
-        self.scroll_transcript(if down { page as isize } else { -(page as isize) });
-    }
-
-    fn scroll_half_page(&mut self, down: bool) {
-        // videre: half = screen_rows / 2
-        let half = (self.last_body_h.max(1) / 2).max(1);
-        self.scroll_transcript(if down { half as isize } else { -(half as isize) });
-    }
-
     fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) -> bool {
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers, KeyEventKind};
+
         if key.kind != KeyEventKind::Press {
             return true;
-        }
-
-        let is_ctrl_c = matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
-            && key.modifiers.contains(KeyModifiers::CONTROL);
-        // Claude Code: any key other than Ctrl+C disarms the "press again to exit" arm.
-        if !is_ctrl_c {
-            self.ctrl_c_exit_armed = false;
-        }
-        if is_ctrl_c {
-            return self.handle_ctrl_c();
-        }
-
-        // Transcript scroll (videre-style Page / Ctrl-U/D + arrows with Ctrl).
-        // Skip when a picker owns navigation keys.
-        let picker_nav = self.show_model_picker
-            || self.show_provider_picker
-            || self.show_theme_picker
-            || self.show_session_picker
-            || self.show_command_picker
-            || self.show_permission_prompt
-            || self.confirm_remove_provider.is_some();
-        if !picker_nav {
-            match key.code {
-                KeyCode::PageUp => {
-                    self.scroll_page(false);
-                    return true;
-                }
-                KeyCode::PageDown => {
-                    self.scroll_page(true);
-                    return true;
-                }
-                KeyCode::Char('u') | KeyCode::Char('U')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    self.scroll_half_page(false);
-                    return true;
-                }
-                KeyCode::Char('d') | KeyCode::Char('D')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    self.scroll_half_page(true);
-                    return true;
-                }
-                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.scroll_transcript(-1);
-                    return true;
-                }
-                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.scroll_transcript(1);
-                    return true;
-                }
-                KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.transcript_follow = false;
-                    self.transcript_rowoff = 0;
-                    return true;
-                }
-                KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.transcript_follow = true;
-                    return true;
-                }
-                _ => {}
-            }
         }
 
         if self.show_permission_prompt {
@@ -592,49 +279,11 @@ impl Tui {
                     if let Some(tx) = &self.perm_tx {
                         let _ = tx.send(selected.to_string());
                     }
-                    self.refresh_idle_suggestion();
                 }
                 KeyCode::Esc => {
                     self.show_permission_prompt = false;
                     if let Some(tx) = &self.perm_tx {
                         let _ = tx.send("deny".to_string());
-                    }
-                    self.refresh_idle_suggestion();
-                }
-                _ => {}
-            }
-            return true;
-        }
-
-        if self.show_recovery_prompt {
-            match key.code {
-                KeyCode::Left => {
-                    self.recovery_selection = self.recovery_selection.saturating_sub(1);
-                }
-                KeyCode::Right => {
-                    if self.recovery_selection < 2 {
-                        self.recovery_selection += 1;
-                    }
-                }
-                KeyCode::Char('m') | KeyCode::Char('M') => {
-                    self.show_recovery_prompt = false;
-                    self.open_model_picker();
-                }
-                KeyCode::Char('p') | KeyCode::Char('P') => {
-                    self.show_recovery_prompt = false;
-                    self.open_provider_picker();
-                }
-                KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Esc => {
-                    self.show_recovery_prompt = false;
-                    self.refresh_idle_suggestion();
-                }
-                KeyCode::Enter => {
-                    let sel = self.recovery_selection;
-                    self.show_recovery_prompt = false;
-                    match sel {
-                        0 => self.open_model_picker(),
-                        1 => self.open_provider_picker(),
-                        _ => self.refresh_idle_suggestion(),
                     }
                 }
                 _ => {}
@@ -647,6 +296,9 @@ impl Tui {
                 KeyCode::Left => { self.confirm_remove_sel = 0; }
                 KeyCode::Right => { self.confirm_remove_sel = 1; }
                 KeyCode::Esc => { self.confirm_remove_provider = None; }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.confirm_remove_provider = None;
+                }
                 KeyCode::Enter => {
                     let remove = self.confirm_remove_sel == 1;
                     self.confirm_remove_provider = None;
@@ -668,7 +320,7 @@ impl Tui {
                             tool_name: String::new(), duration: String::new(),
                         });
                         self.provider_picker_keys = self.provider_picker_list.iter()
-                            .map(|n| crate::config::has_usable_credential(n)).collect();
+                            .map(|n| crate::config::config_has_api_key(n)).collect();
                     }
                 }
                 _ => {}
@@ -682,18 +334,8 @@ impl Tui {
                     if self.picker_session_sel > 0 { self.picker_session_sel -= 1; }
                     return true;
                 }
-                if self.show_theme_picker {
-                    if self.theme_picker_sel > 0 {
-                        self.theme_picker_sel -= 1;
-                        self.theme = self.theme_picker_list[self.theme_picker_sel].clone();
-                    }
-                    return true;
-                }
-                // Cycle slash ghost candidates without a multi-line picker.
-                if !self.cmd_picker_filtered.is_empty() {
-                    if self.cmd_picker_sel > 0 {
-                        self.cmd_picker_sel -= 1;
-                    }
+                if self.show_command_picker {
+                    if self.cmd_picker_sel > 0 { self.cmd_picker_sel -= 1; }
                     return true;
                 }
                 if self.show_provider_picker {
@@ -716,17 +358,8 @@ impl Tui {
                     if self.picker_session_sel + 1 < self.picker_sessions.len() { self.picker_session_sel += 1; }
                     return true;
                 }
-                if self.show_theme_picker {
-                    if self.theme_picker_sel + 1 < self.theme_picker_list.len() {
-                        self.theme_picker_sel += 1;
-                        self.theme = self.theme_picker_list[self.theme_picker_sel].clone();
-                    }
-                    return true;
-                }
-                if !self.cmd_picker_filtered.is_empty() {
-                    if self.cmd_picker_sel + 1 < self.cmd_picker_filtered.len() {
-                        self.cmd_picker_sel += 1;
-                    }
+                if self.show_command_picker {
+                    if self.cmd_picker_sel + 1 < self.cmd_picker_filtered.len() { self.cmd_picker_sel += 1; }
                     return true;
                 }
                 if self.show_provider_picker {
@@ -756,84 +389,29 @@ impl Tui {
                 true
             }
             KeyCode::Right => {
-                // Right arrow at end: accept slash ghost, else empty-composer idle hint.
-                if self.cursor >= self.input_buf.len() && !self.awaiting_api_key {
-                    if let Some(cmd) = self.selected_slash_completion() {
-                        if slash_ghost_suffix(&self.input_buf, cmd).is_some() {
-                            let cmd = cmd.to_string();
-                            self.apply_slash_completion(&cmd);
-                            return true;
-                        }
-                    }
-                    if self.input_buf.is_empty() {
-                        if let Some(hint) = self.idle_suggestion.clone() {
-                            self.input_buf = hint;
-                            self.cursor = self.input_buf.len();
-                            self.idle_suggestion = None;
-                            return true;
-                        }
-                    }
-                }
-                if self.cursor < self.input_buf.len() {
-                    self.cursor += 1;
-                }
+                if self.cursor < self.input_buf.len() { self.cursor += 1; }
                 true
             }
             KeyCode::Tab => {
-                // Empty composer: accept grayed ready-to-send prompt.
-                if self.input_buf.is_empty()
-                    && !self.awaiting_api_key
-                    && !self.show_model_picker
-                    && !self.show_provider_picker
-                    && !self.show_theme_picker
-                    && !self.show_session_picker
-                {
-                    if let Some(hint) = self.idle_suggestion.clone() {
-                        self.input_buf = hint;
-                        self.cursor = self.input_buf.len();
-                        self.idle_suggestion = None;
-                        return true;
-                    }
-                }
-                // Slash ghost: Tab fills the selected completion (then next-arg candidates).
-                if self.input_buf.starts_with('/') {
-                    self.update_cmd_picker();
-                }
-                if let Some(cmd) = self.selected_slash_completion().map(|s| s.to_string()) {
-                    self.apply_slash_completion(&cmd);
+                if self.show_command_picker && !self.cmd_picker_filtered.is_empty() {
+                    let cmd = &self.cmd_picker_filtered[self.cmd_picker_sel];
+                    self.input_buf = cmd.clone();
+                    self.cursor = cmd.len();
+                    self.show_command_picker = false;
+                    self.cmd_picker_filtered.clear();
                 }
                 true
             }
             KeyCode::Esc => {
                 if self.awaiting_api_key {
                     self.awaiting_api_key = false;
-                    self.pending_model_after_auth = false;
-                    self.api_key_target = None;
+                    self.pending_openrouter_setup = false;
                     self.input_buf.clear();
                     self.cursor = 0;
-                    self.output_lines.push(OutputLine {
-                        type_: "system".into(),
-                        content: "API key entry cancelled.".into(),
-                        tool_name: String::new(),
-                        duration: String::new(),
-                    });
-                } else if self.show_command_picker || !self.cmd_picker_filtered.is_empty() {
-                    self.show_command_picker = false;
-                    self.cmd_picker_filtered.clear();
-                    self.cmd_picker_sel = 0;
-                }
+                } else if self.show_command_picker { self.show_command_picker = false; }
                 else if self.show_provider_picker { self.show_provider_picker = false; }
                 else if self.show_model_picker { self.show_model_picker = false; }
-                else if self.show_session_picker {
-                    self.show_session_picker = false;
-                    self.session_picker_delete = false;
-                }
-                else if self.show_theme_picker {
-                    self.show_theme_picker = false;
-                    if let Some(prev) = self.theme_before_picker.take() {
-                        self.theme = theme::lookup(&prev);
-                    }
-                }
+                else if self.show_session_picker { self.show_session_picker = false; }
                 else if matches!(self.state, State::Running) {
                     if let Some(flag) = &self.cancel_flag {
                         flag.store(true, Ordering::Relaxed);
@@ -848,12 +426,14 @@ impl Tui {
                 true
             }
             KeyCode::Enter => {
-                // Enter always submits the typed buffer (Tab/Right accept the ghost first).
-                // Clear any leftover slash-completion state so it does not steal focus.
-                if self.show_command_picker || !self.cmd_picker_filtered.is_empty() {
+                if self.show_command_picker && !self.cmd_picker_filtered.is_empty() {
+                    let cmd = self.cmd_picker_filtered[self.cmd_picker_sel].clone();
                     self.show_command_picker = false;
                     self.cmd_picker_filtered.clear();
-                    self.cmd_picker_sel = 0;
+                    self.input_buf.clear();
+                    self.cursor = 0;
+                    self.handle_command(&cmd);
+                    return true;
                 }
                 if self.show_provider_picker {
                     if self.provider_picker_sel < self.provider_picker_list.len() {
@@ -862,108 +442,89 @@ impl Tui {
                         if let Some(p) = providers.get(&name) {
                             let default_model = p.default_model().to_string();
                             self.provider = name.clone();
-                            // Provisional default until the user picks from the model list.
-                            self.model = if name == "openrouter" {
-                                "gpt-5-mini".to_string()
+                            self.picker_models = p.available_models();
+                            if name == "openrouter" {
+                                self.model = "gpt-5-mini".to_string();
+                                self.show_provider_picker = false;
+                                self.show_model_picker = true;
+                                self.picker_sel = self.picker_models.iter().position(|m| m.id == "gpt-5-mini").unwrap_or(0);
+                                self.picker_scrl = 0;
+                                self.pending_openrouter_setup = true;
                             } else {
-                                default_model
-                            };
-                            self.show_provider_picker = false;
-                            // Auth first (browser OAuth or API key), then model list.
-                            // Live catalogs need credentials; model-before-login was backwards.
-                            if crate::config::needs_credential(&name) {
-                                self.pending_model_after_auth = true;
-                                if crate::oauth::supports_oauth(&name) {
-                                    self.begin_oauth_login(&name, true);
-                                } else {
-                                    self.begin_api_key_prompt(&name);
-                                }
-                            } else {
-                                self.open_model_picker();
-                            }
-                        } else {
-                            self.show_provider_picker = false;
+                                self.model = default_model;
+                                self.show_provider_picker = false;
+                        let _ = crate::config::save_config(&self.provider, &self.model, None);
+                        self.output_lines.push(OutputLine {
+                            type_: "system".into(), content: format!("Provider set to: {}", self.provider),
+                            tool_name: String::new(), duration: String::new(),
+                        });
+                        if let Some(tx) = &self.agent_tx {
+                            let _ = tx.send(format!("__switch__:{name}:{}", self.model));
                         }
-                    } else {
-                        self.show_provider_picker = false;
-                    }
+                            }
+                        } else { self.show_provider_picker = false; }
+                    } else { self.show_provider_picker = false; }
                     return true;
                 }
                 if self.show_model_picker {
                     if self.picker_sel < self.picker_models.len() {
                         self.model = self.picker_models[self.picker_sel].id.clone();
                         self.show_model_picker = false;
-                        self.finish_provider_model_selection(None);
-                    } else {
-                        self.show_model_picker = false;
-                    }
+                        if self.pending_openrouter_setup {
+                            self.pending_openrouter_setup = false;
+                            if std::env::var("OPENROUTER_API_KEY").is_ok() || crate::config::config_has_api_key("openrouter") {
+                                let _ = crate::config::save_config(&self.provider, &self.model, None);
+                                self.output_lines.push(OutputLine {
+                                    type_: "system".into(), content: format!("Provider set to: {}\nModel set to: {}", self.provider, self.model),
+                                    tool_name: String::new(), duration: String::new(),
+                                });
+                                if let Some(tx) = &self.agent_tx {
+                                    let _ = tx.send(format!("__switch__:openrouter:{}", self.model));
+                                }
+                            } else {
+                                self.awaiting_api_key = true;
+                                self.input_buf.clear();
+                                self.cursor = 0;
+                                self.output_lines.push(OutputLine {
+                                    type_: "system".into(), content: "Enter your OpenRouter API key:".into(),
+                                    tool_name: String::new(), duration: String::new(),
+                                });
+                            }
+                        } else {
+                            let _ = crate::config::save_config(&self.provider, &self.model, None);
+                            self.output_lines.push(OutputLine {
+                                type_: "system".into(), content: format!("Model set to: {}", self.model),
+                                tool_name: String::new(), duration: String::new(),
+                            });
+                        }
+                    } else { self.show_model_picker = false; }
                     return true;
                 }
 
                 if self.show_session_picker {
                     if self.picker_session_sel < self.picker_sessions.len() {
                         let id = self.picker_sessions[self.picker_session_sel].id.clone();
-                        let deleting = self.session_picker_delete;
                         self.show_session_picker = false;
-                        self.session_picker_delete = false;
-                        if deleting {
-                            self.delete_session(&id);
-                        } else {
-                            self.resume_session(&id);
-                        }
+                        self.resume_session(&id);
                     } else {
                         self.show_session_picker = false;
-                        self.session_picker_delete = false;
                     }
-                    return true;
-                }
-
-                if self.show_theme_picker {
-                    if self.theme_picker_sel < self.theme_picker_list.len() {
-                        self.theme = self.theme_picker_list[self.theme_picker_sel].clone();
-                        let name = self.theme.name.to_string();
-                        let label = self.theme.label.to_string();
-                        let _ = crate::config::save_theme(&name);
-                        self.output_lines.push(OutputLine {
-                            type_: "system".into(),
-                            content: format!("Theme set to: {label} ({name})"),
-                            tool_name: String::new(),
-                            duration: String::new(),
-                        });
-                    }
-                    self.show_theme_picker = false;
-                    self.theme_before_picker = None;
                     return true;
                 }
 
                 if self.awaiting_api_key {
                     let key = self.input_buf.trim().to_string();
-                    self.input_buf.clear();
-                    self.cursor = 0;
-                    if key.is_empty() {
-                        return true;
-                    }
+                    self.input_buf.clear(); self.cursor = 0;
+                    if key.is_empty() { return true; }
                     self.awaiting_api_key = false;
-                    let target = self.api_key_target.take().unwrap_or_else(|| self.provider.clone());
-                    if self.pending_model_after_auth {
-                        // Provider switch path: save key, then open model list (live catalog).
-                        self.pending_model_after_auth = false;
-                        self.provider = target.clone();
-                        crate::config::apply_key_to_env(&target, &key);
-                        let _ = crate::config::save_config(&target, &self.model, Some(&key));
-                        let tail = crate::config::mask_secret_display(&key, 4);
-                        self.output_lines.push(OutputLine {
-                            type_: "system".into(),
-                            content: format!(
-                                "API key saved for {target} ({tail}). Choose a model."
-                            ),
-                            tool_name: String::new(),
-                            duration: String::new(),
-                        });
-                        self.open_model_picker();
-                    } else {
-                        // `/auth key` or similar: save and apply without forcing the model picker.
-                        self.finish_provider_model_selection(Some((target, key)));
+                    std::env::set_var("OPENROUTER_API_KEY", &key);
+                    let _ = crate::config::save_config(&self.provider, &self.model, Some(&key));
+                    self.output_lines.push(OutputLine {
+                        type_: "system".into(), content: "OpenRouter API key set.".into(),
+                        tool_name: String::new(), duration: String::new(),
+                    });
+                    if let Some(tx) = &self.agent_tx {
+                        let _ = tx.send(format!("__switch__:openrouter:{}", self.model));
                     }
                     return true;
                 }
@@ -978,11 +539,6 @@ impl Tui {
 
                 self.history.push(input.clone());
                 self.hist_idx = self.history.len();
-                self.show_recovery_prompt = false;
-                // New turn: pin transcript to bottom (follow latest output).
-                self.transcript_follow = true;
-                self.expect_turn_notify = true;
-                self.idle_suggestion = None;
                 self.output_lines.push(OutputLine {
                     type_: "user".into(), content: input.clone(),
                     tool_name: String::new(), duration: String::new(),
@@ -998,9 +554,6 @@ impl Tui {
                     self.input_buf.remove(self.cursor - 1);
                     self.cursor -= 1;
                     self.update_cmd_picker();
-                    if self.input_buf.is_empty() {
-                        self.refresh_idle_suggestion();
-                    }
                 }
                 true
             }
@@ -1026,20 +579,24 @@ impl Tui {
                 }
                 true
             }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.show_command_picker {
+                    self.show_command_picker = false;
+                } else if self.show_provider_picker {
+                    self.show_provider_picker = false;
+                } else if self.show_model_picker {
+                    self.show_model_picker = false;
+                } else {
+                    self.input_buf.clear();
+                    self.cursor = 0;
+                }
+                true
+            }
             KeyCode::Char(ch) => {
-                // Allow typing into the API-key prompt and the normal input
-                // (but not while a list picker is focused).
-                if self.awaiting_api_key
-                    || (!self.show_model_picker
-                        && !self.show_provider_picker
-                        && !self.show_theme_picker
-                        && !self.show_session_picker)
-                {
+                if !self.show_model_picker && !self.show_provider_picker && !self.awaiting_api_key {
                     self.input_buf.insert(self.cursor, ch);
                     self.cursor += ch.len_utf8();
-                    if !self.awaiting_api_key {
-                        self.update_cmd_picker();
-                    }
+                    self.update_cmd_picker();
                 }
                 true
             }
@@ -1053,47 +610,9 @@ impl Tui {
 
         match parts[0] {
             "/clear" => {
-                // Finish the previous session file first, then open a fresh id.
-                self.autosave_session(false);
                 self.output_lines.clear();
                 self.streaming_text.clear();
                 self.stream_thinking.clear();
-                self.thinking_started = None;
-                self.current_session_id = None;
-                self.session_created_at = 0;
-                self.total_usage = llm::Usage::default();
-            }
-            "/thinking" => {
-                let arg = parts.get(1).map(|s| s.to_ascii_lowercase());
-                self.show_thinking = match arg.as_deref() {
-                    Some("on" | "true" | "1" | "show") => true,
-                    Some("off" | "false" | "0" | "hide") => false,
-                    Some(other) => {
-                        self.output_lines.push(OutputLine {
-                            type_: "system".into(),
-                            content: format!(
-                                "Unknown /thinking option '{other}'. Use /thinking, /thinking on, or /thinking off."
-                            ),
-                            tool_name: String::new(),
-                            duration: String::new(),
-                        });
-                        return;
-                    }
-                    None => !self.show_thinking,
-                };
-                let _ = crate::config::save_show_thinking(self.show_thinking);
-                let state = if self.show_thinking { "on" } else { "off" };
-                let detail = if self.show_thinking {
-                    "Full thinking streams and is kept in the transcript."
-                } else {
-                    "Thinking is hidden; a short \"Thought for …\" line is kept (Claude Code default)."
-                };
-                self.output_lines.push(OutputLine {
-                    type_: "system".into(),
-                    content: format!("Thinking display: {state}. {detail}"),
-                    tool_name: String::new(),
-                    duration: String::new(),
-                });
             }
             "/model" => {
                 if parts.len() > 1 {
@@ -1104,7 +623,9 @@ impl Tui {
                         tool_name: String::new(), duration: String::new(),
                     });
                 } else {
-                    self.open_model_picker();
+                    self.show_model_picker = true;
+                    self.picker_sel = 0;
+                    self.picker_scrl = 0;
                 }
             }
             "/cost" => {
@@ -1120,162 +641,30 @@ impl Tui {
                 });
             }
             "/provider" => {
-                if parts.len() > 1 {
-                    let name = parts[1].to_ascii_lowercase();
-                    let providers = crate::llm::default_providers();
-                    if let Some(p) = providers.get(&name) {
-                        self.provider = name.clone();
-                        self.model = p.default_model().to_string();
-                        let _ = crate::config::save_config(&self.provider, &self.model, None);
-                        if crate::config::needs_credential(&name) {
-                            self.pending_model_after_auth = true;
-                            if crate::oauth::supports_oauth(&name) {
-                                self.begin_oauth_login(&name, true);
-                            } else {
-                                self.begin_api_key_prompt(&name);
-                            }
-                        } else {
-                            self.output_lines.push(OutputLine {
-                                type_: "system".into(),
-                                content: format!(
-                                    "Provider set to: {}\nModel set to: {}",
-                                    self.provider, self.model
-                                ),
-                                tool_name: String::new(),
-                                duration: String::new(),
-                            });
-                            if let Some(tx) = &self.agent_tx {
-                                let _ = tx.send(format!("__switch__:{}:{}", self.provider, self.model));
-                            }
-                            self.open_model_picker();
-                        }
-                    } else {
-                        self.output_lines.push(OutputLine {
-                            type_: "system".into(),
-                            content: format!("Unknown provider '{name}'. Use /provider to pick from the list."),
-                            tool_name: String::new(),
-                            duration: String::new(),
-                        });
-                    }
-                } else {
-                    self.open_provider_picker();
-                }
+                let providers = crate::llm::default_providers();
+                let mut names: Vec<String> = providers.into_keys().collect();
+                names.sort();
+                // Current provider first, matching render order so the
+                // selection index always points at the displayed row.
+                names.sort_by_key(|n| usize::from(*n != self.provider));
+                self.provider_picker_keys = names.iter()
+                    .map(|n| crate::config::config_has_api_key(n)).collect();
+                self.provider_picker_list = names;
+                self.provider_picker_sel = 0;
+                self.show_provider_picker = true;
             }
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /auth /clear /compact /cost /delete /exit /help /model /provider /resume /save /sessions /theme /thinking\n/thinking [on|off] — show full thinking (on) or short Thought-for lines only (off, default)\nTab completes slash commands; Tab/→ accepts the grayed ready-to-send prompt when empty\nSounds: done/attention beeps (CAIRN_SOUND=0 to mute)\nAfter an LLM error: Switch model (m) · Switch provider (p) · Dismiss (d/Esc)\nScroll: mouse wheel · PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End\n/provider xai — browser OAuth; /auth login xai; /auth key xai for API key".into(),
+                    content: "Commands: /clear /cost /exit /help /model /provider /resume /save /sessions".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
-            }
-            "/auth" => {
-                let sub = parts.get(1).copied().unwrap_or("status");
-                match sub {
-                    "login" => {
-                        let provider = parts.get(2).copied().unwrap_or("xai").to_ascii_lowercase();
-                        self.begin_oauth_login(&provider, false);
-                    }
-                    "key" => {
-                        // Escape hatch: paste API key instead of OAuth (xAI / others).
-                        let provider = parts.get(2).copied().unwrap_or("xai").to_ascii_lowercase();
-                        if crate::config::provider_requires_api_key(&provider) {
-                            self.begin_api_key_prompt(&provider);
-                        } else {
-                            self.output_lines.push(OutputLine {
-                                type_: "system".into(),
-                                content: format!("Provider '{provider}' does not use a cloud API key."),
-                                tool_name: String::new(), duration: String::new(),
-                            });
-                        }
-                    }
-                    "logout" => {
-                        let provider = parts.get(2).copied().unwrap_or("xai").to_ascii_lowercase();
-                        if let Some(tx) = &self.agent_tx {
-                            self.state = State::Running;
-                            let _ = tx.send(format!("__auth_logout__:{provider}"));
-                        }
-                    }
-                    "status" | _ => {
-                        if let Some(tx) = &self.agent_tx {
-                            self.state = State::Running;
-                            let _ = tx.send("__auth_status__".into());
-                        }
-                    }
-                }
-            }
-            "/theme" => {
-                if parts.get(1) == Some(&"list") {
-                    let names = theme::theme_names().join(", ");
-                    self.output_lines.push(OutputLine {
-                        type_: "system".into(),
-                        content: format!("Active theme: {}\nThemes: {names}", self.theme.name),
-                        tool_name: String::new(),
-                        duration: String::new(),
-                    });
-                } else if parts.len() > 1 {
-                    let name = parts[1..].join("-");
-                    let t = theme::lookup(&name);
-                    let applied = t.name.to_string();
-                    let label = t.label.to_string();
-                    self.theme = t;
-                    let _ = crate::config::save_theme(&applied);
-                    self.output_lines.push(OutputLine {
-                        type_: "system".into(),
-                        content: format!("Theme set to: {label} ({applied})"),
-                        tool_name: String::new(),
-                        duration: String::new(),
-                    });
-                } else {
-                    self.open_theme_picker();
-                }
-            }
-            "/compact" => {
-                if !matches!(self.state, State::Idle) {
-                    self.output_lines.push(OutputLine {
-                        type_: "system".into(),
-                        content: "Wait for the current turn to finish before compacting.".into(),
-                        tool_name: String::new(), duration: String::new(),
-                    });
-                } else if let Some(tx) = &self.agent_tx {
-                    self.state = State::Running;
-                    let _ = tx.send("__compact__".into());
-                }
             }
             "/save" => {
                 self.save_session();
             }
             "/sessions" => {
                 self.list_sessions();
-            }
-            "/delete" => {
-                if parts.len() > 1 {
-                    let query = parts[1..].join(" ");
-                    match session::resolve_id(&self.sessions_dir(), &query) {
-                        Ok(id) => self.delete_session(&id),
-                        Err(e) => {
-                            self.output_lines.push(OutputLine {
-                                type_: "error".into(),
-                                content: e,
-                                tool_name: String::new(), duration: String::new(),
-                            });
-                        }
-                    }
-                } else {
-                    let sessions = session::list(&self.sessions_dir()).unwrap_or_default();
-                    if sessions.is_empty() {
-                        self.output_lines.push(OutputLine {
-                            type_: "system".into(),
-                            content: "No saved sessions to delete.".into(),
-                            tool_name: String::new(), duration: String::new(),
-                        });
-                    } else {
-                        self.show_session_picker = true;
-                        self.session_picker_delete = true;
-                        self.picker_sessions = sessions;
-                        self.picker_session_sel = 0;
-                        self.picker_session_scrl = 0;
-                    }
-                }
             }
             "/resume" => {
                 let sessions = session::list(&self.sessions_dir()).unwrap_or_default();
@@ -1287,7 +676,6 @@ impl Tui {
                     });
                 } else {
                     self.show_session_picker = true;
-                    self.session_picker_delete = false;
                     self.picker_sessions = sessions;
                     self.picker_session_sel = 0;
                     self.picker_session_scrl = 0;
@@ -1310,375 +698,54 @@ impl Tui {
         crate::config::sessions_dir()
     }
 
-    fn open_model_picker(&mut self) {
-        let providers = crate::llm::default_providers();
-        if let Some(p) = providers.get(&self.provider) {
-            self.picker_models = p.available_models();
-        }
-        self.show_model_picker = true;
-        self.picker_sel = self.picker_models.iter().position(|m| m.id == self.model).unwrap_or(0);
-        let vh = self.picker_visible_height();
-        self.picker_scrl = self.picker_sel.saturating_sub(vh.saturating_sub(1));
-    }
-
-    fn open_provider_picker(&mut self) {
-        let providers = crate::llm::default_providers();
-        let mut names: Vec<String> = providers.into_keys().collect();
-        names.sort();
-        // Current provider first, matching render order so the
-        // selection index always points at the displayed row.
-        names.sort_by_key(|n| usize::from(*n != self.provider));
-        self.provider_picker_keys = names.iter()
-            .map(|n| crate::config::has_usable_credential(n)).collect();
-        self.provider_picker_list = names;
-        self.provider_picker_sel = 0;
-        self.show_provider_picker = true;
-    }
-
-    /// Claude Code Ctrl+C: interrupt running work; clear prompt when idle with
-    /// text; on empty idle prompt, arm exit then quit on a second press.
-    /// Returns `false` to exit the TUI.
-    fn handle_ctrl_c(&mut self) -> bool {
-        // Close overlays / cancel key entry first (same spirit as Esc).
-        if self.awaiting_api_key {
-            self.awaiting_api_key = false;
-            self.pending_model_after_auth = false;
-            self.api_key_target = None;
-            self.input_buf.clear();
-            self.cursor = 0;
-            self.ctrl_c_exit_armed = false;
-            self.output_lines.push(OutputLine {
-                type_: "system".into(),
-                content: "API key entry cancelled.".into(),
-                tool_name: String::new(),
-                duration: String::new(),
-            });
-            return true;
-        }
-        if self.confirm_remove_provider.is_some() {
-            self.confirm_remove_provider = None;
-            self.ctrl_c_exit_armed = false;
-            return true;
-        }
-        if self.show_command_picker {
-            self.show_command_picker = false;
-            self.ctrl_c_exit_armed = false;
-            return true;
-        }
-        if self.show_provider_picker {
-            self.show_provider_picker = false;
-            self.ctrl_c_exit_armed = false;
-            return true;
-        }
-        if self.show_model_picker {
-            self.show_model_picker = false;
-            self.ctrl_c_exit_armed = false;
-            return true;
-        }
-        if self.show_session_picker {
-            self.show_session_picker = false;
-            self.session_picker_delete = false;
-            self.ctrl_c_exit_armed = false;
-            return true;
-        }
-        if self.show_theme_picker {
-            self.show_theme_picker = false;
-            if let Some(prev) = self.theme_before_picker.take() {
-                self.theme = theme::lookup(&prev);
+    fn save_session(&mut self) {
+        let messages = self.output_lines.iter().filter_map(|l| {
+            if l.type_ == "user" {
+                Some(llm::Message { role: "user".into(), content: llm::Content::Text(l.content.clone()) })
+            } else if l.type_ == "text" {
+                Some(llm::Message { role: "assistant".into(), content: llm::Content::Text(l.content.clone()) })
+            } else {
+                None
             }
-            self.ctrl_c_exit_armed = false;
-            return true;
-        }
-        if self.show_recovery_prompt {
-            self.show_recovery_prompt = false;
-            self.ctrl_c_exit_armed = false;
-            return true;
-        }
-        if self.show_permission_prompt {
-            self.show_permission_prompt = false;
-            if let Some(tx) = &self.perm_tx {
-                let _ = tx.send("deny".to_string());
-            }
-            self.ctrl_c_exit_armed = false;
-            return true;
-        }
+        }).collect::<Vec<_>>();
 
-        // Interrupt a running agent turn.
-        if matches!(self.state, State::Running) {
-            if let Some(flag) = &self.cancel_flag {
-                flag.store(true, Ordering::Relaxed);
-            }
-            // Tell the agent loop as well (if it listens for "cancel").
-            if let Some(tx) = &self.agent_tx {
-                let _ = tx.send("cancel".into());
-            }
-            self.state = State::Idle;
-            self.flush_streaming();
-            self.ctrl_c_exit_armed = false;
-            self.output_lines.push(OutputLine {
-                type_: "system".into(),
-                content: "Interrupted.".into(),
-                tool_name: String::new(),
-                duration: String::new(),
-            });
-            return true;
-        }
-
-        // Idle: clear non-empty prompt (first action).
-        if !self.input_buf.is_empty() {
-            self.input_buf.clear();
-            self.cursor = 0;
-            self.show_command_picker = false;
-            self.cmd_picker_filtered.clear();
-            self.ctrl_c_exit_armed = false;
-            return true;
-        }
-
-        // Empty idle prompt: second Ctrl+C exits; first arms confirmation.
-        if self.ctrl_c_exit_armed {
-            return false;
-        }
-        self.ctrl_c_exit_armed = true;
-        self.output_lines.push(OutputLine {
-            type_: "system".into(),
-            content: "Press Ctrl+C again to exit".into(),
-            tool_name: String::new(),
-            duration: String::new(),
-        });
-        true
-    }
-
-    fn open_theme_picker(&mut self) {
-        self.theme_before_picker = Some(self.theme.name.to_string());
-        self.theme_picker_list = theme::all_themes();
-        self.theme_picker_sel = self.theme_picker_list.iter()
-            .position(|t| t.name == self.theme.name)
-            .unwrap_or(0);
-        // Live-preview current selection immediately
-        if let Some(t) = self.theme_picker_list.get(self.theme_picker_sel) {
-            self.theme = t.clone();
-        }
-        self.show_theme_picker = true;
-    }
-
-    fn begin_api_key_prompt(&mut self, provider: &str) {
-        self.awaiting_api_key = true;
-        self.api_key_target = Some(provider.to_string());
-        self.input_buf.clear();
-        self.cursor = 0;
-        let env = crate::config::env_var_name(provider).unwrap_or("API_KEY");
-        let oauth_hint = if crate::oauth::supports_oauth(provider) {
-            " Prefer browser login: Esc, then `/auth login xai`."
-        } else {
-            ""
-        };
-        self.output_lines.push(OutputLine {
-            type_: "system".into(),
-            content: format!(
-                "Enter API key for {provider} (saved to OS keyring, env {env}). Input is masked.{oauth_hint}"
-            ),
-            tool_name: String::new(),
-            duration: String::new(),
-        });
-    }
-
-    /// Start device-code OAuth (browser) for a provider, like zero / Grok Build.
-    /// When `then_model_picker` is true (provider path), successful login opens
-    /// the model list; on failure, falls back to API key paste then model list.
-    fn begin_oauth_login(&mut self, provider: &str, then_model_picker: bool) {
-        if !crate::oauth::supports_oauth(provider) {
-            self.output_lines.push(OutputLine {
-                type_: "system".into(),
-                content: format!(
-                    "OAuth login is not implemented for '{provider}'. Supported: xai. Use an API key via /auth key {provider}."
-                ),
-                tool_name: String::new(),
-                duration: String::new(),
-            });
-            return;
-        }
-        if !matches!(self.state, State::Idle) {
-            self.output_lines.push(OutputLine {
-                type_: "system".into(),
-                content: "Wait for the current turn to finish before logging in.".into(),
-                tool_name: String::new(),
-                duration: String::new(),
-            });
-            return;
-        }
-        let Some(tx) = &self.agent_tx else {
-            self.output_lines.push(OutputLine {
-                type_: "error".into(),
-                content: "Agent channel not ready; cannot start OAuth.".into(),
-                tool_name: String::new(),
-                duration: String::new(),
-            });
-            return;
-        };
-        self.pending_model_after_auth = then_model_picker;
-        self.state = State::Running;
-        self.output_lines.push(OutputLine {
-            type_: "system".into(),
-            content: "Starting xAI browser OAuth (device code)… A browser window should open. Approve the code shown next, or open the URL manually.".into(),
-            tool_name: String::new(),
-            duration: String::new(),
-        });
-        let _ = tx.send(format!("__auth_login__:{provider}"));
-    }
-
-    /// Finish provider/model selection, optionally saving a freshly entered key.
-    fn finish_provider_model_selection(&mut self, new_key: Option<(String, String)>) {
-        if let Some((provider, key)) = new_key {
-            crate::config::apply_key_to_env(&provider, &key);
-            let _ = crate::config::save_config(&provider, &self.model, Some(&key));
-            self.provider = provider;
-            let tail = crate::config::mask_secret_display(&key, 4);
-            self.output_lines.push(OutputLine {
-                type_: "system".into(),
-                content: format!(
-                    "API key saved for {} ({}). Provider set to: {}\nModel set to: {}",
-                    self.provider, tail, self.provider, self.model
-                ),
-                tool_name: String::new(),
-                duration: String::new(),
-            });
-        } else {
-            let _ = crate::config::save_config(&self.provider, &self.model, None);
-            self.output_lines.push(OutputLine {
-                type_: "system".into(),
-                content: format!("Provider set to: {}\nModel set to: {}", self.provider, self.model),
-                tool_name: String::new(),
-                duration: String::new(),
-            });
-        }
-        if let Some(tx) = &self.agent_tx {
-            let _ = tx.send(format!("__switch__:{}:{}", self.provider, self.model));
-        }
-    }
-
-    /// Prefer the agent's full transcript (tools included); fall back to TUI lines.
-    fn session_snapshot(&self) -> (Vec<llm::Message>, u64, u64) {
-        if let Some(mirror) = &self.live_mirror {
-            if let Ok(g) = mirror.lock() {
-                if !g.messages.is_empty() {
-                    return (g.messages.clone(), g.tokens_in, g.tokens_out);
-                }
-            }
-        }
-        let messages = self
-            .output_lines
-            .iter()
-            .filter_map(|l| {
-                if l.type_ == "user" {
-                    Some(llm::Message {
-                        role: "user".into(),
-                        content: llm::Content::Text(l.content.clone()),
-                    })
-                } else if l.type_ == "text" {
-                    Some(llm::Message {
-                        role: "assistant".into(),
-                        content: llm::Content::Text(l.content.clone()),
-                    })
-                } else if l.type_ == "tool_use" {
-                    Some(llm::Message {
-                        role: "assistant".into(),
-                        content: llm::Content::ToolUse(llm::ToolUse {
-                            id: String::new(),
-                            name: l.tool_name.clone(),
-                            input: l.content.clone(),
-                        }),
-                    })
-                } else if l.type_ == "tool_result" {
-                    Some(llm::Message {
-                        role: "user".into(),
-                        content: llm::Content::ToolResult(llm::ToolResult {
-                            tool_use_id: String::new(),
-                            content: l.content.clone(),
-                        }),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-        (
-            messages,
-            self.total_usage.input_tokens,
-            self.total_usage.output_tokens,
-        )
-    }
-
-    /// Save (or update) the current session. When `announce` is true, print a
-    /// system line (manual `/save`). Autosave stays quiet unless it fails.
-    fn autosave_session(&mut self, announce: bool) {
-        let (messages, tokens_in, tokens_out) = self.session_snapshot();
         if messages.is_empty() {
-            if announce {
-                self.output_lines.push(OutputLine {
-                    type_: "system".into(),
-                    content: "Nothing to save — no conversation yet.".into(),
-                    tool_name: String::new(),
-                    duration: String::new(),
-                });
-            }
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: "Nothing to save — no conversation yet.".into(),
+                tool_name: String::new(), duration: String::new(),
+            });
             return;
         }
 
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let id = self
-            .current_session_id
-            .clone()
-            .unwrap_or_else(session::new_id);
-        let created_at = if self.session_created_at > 0 {
-            self.session_created_at
-        } else {
-            now
-        };
-        let msg_count = messages.len();
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         let sess = session::Session {
-            id: id.clone(),
+            id: session::new_id(),
             model: self.model.clone(),
             provider: self.provider.clone(),
             messages,
-            tokens_in,
-            tokens_out,
-            created_at,
+            tokens_in: self.total_usage.input_tokens,
+            tokens_out: self.total_usage.output_tokens,
+            created_at: now,
             updated_at: now,
         };
         match session::save(&self.sessions_dir(), &sess) {
             Ok(()) => {
-                self.current_session_id = Some(id.clone());
-                self.session_created_at = created_at;
-                if announce {
-                    let short = if id.len() >= 8 { &id[..8] } else { id.as_str() };
-                    self.output_lines.push(OutputLine {
-                        type_: "system".into(),
-                        content: format!(
-                            "Session saved: {short} ({msg_count} msgs) → {}",
-                            self.sessions_dir()
-                        ),
-                        tool_name: String::new(),
-                        duration: String::new(),
-                    });
-                }
+                self.output_lines.push(OutputLine {
+                    type_: "system".into(),
+                    content: format!("Session saved: {} ({} msgs)", &sess.id[..8], self.output_lines.len()),
+                    tool_name: String::new(), duration: String::new(),
+                });
             }
             Err(e) => {
-                // Always surface write failures (including silent autosave).
                 self.output_lines.push(OutputLine {
                     type_: "error".into(),
                     content: format!("Failed to save session: {e}"),
-                    tool_name: String::new(),
-                    duration: String::new(),
+                    tool_name: String::new(), duration: String::new(),
                 });
             }
         }
-    }
-
-    fn save_session(&mut self) {
-        self.autosave_session(true);
     }
 
     fn list_sessions(&mut self) {
@@ -1711,89 +778,21 @@ impl Tui {
         });
     }
 
-    fn delete_session(&mut self, id: &str) {
-        let short = if id.len() >= 8 { &id[..8] } else { id };
-        match session::delete(&self.sessions_dir(), id) {
-            Ok(()) => {
-                self.output_lines.push(OutputLine {
-                    type_: "system".into(),
-                    content: format!("Deleted session {short}."),
-                    tool_name: String::new(), duration: String::new(),
-                });
-            }
-            Err(e) => {
-                self.output_lines.push(OutputLine {
-                    type_: "error".into(),
-                    content: format!("Failed to delete session: {e}"),
-                    tool_name: String::new(), duration: String::new(),
-                });
-            }
-        }
-    }
-
     fn resume_session(&mut self, id: &str) {
         match session::load(&self.sessions_dir(), id) {
             Ok(sess) => {
-                // Rebuild TUI transcript including tool calls/results for continuity.
                 let mut lines = Vec::new();
-                // Pair each tool_result with the preceding tool_use name so compact
-                // display rules still apply after /resume (results alone have no name).
-                let mut pending_tool_name = String::new();
                 for msg in &sess.messages {
-                    match &msg.content {
-                        llm::Content::Text(t) => {
-                            lines.push(OutputLine {
-                                type_: if msg.role == "user" {
-                                    "user".into()
-                                } else {
-                                    "text".into()
-                                },
-                                content: t.clone(),
-                                tool_name: String::new(),
-                                duration: String::new(),
-                            });
-                        }
-                        llm::Content::Thinking(t) => {
-                            if self.show_thinking {
-                                lines.push(OutputLine {
-                                    type_: "thinking".into(),
-                                    content: t.clone(),
-                                    tool_name: String::new(),
-                                    duration: String::new(),
-                                });
-                            } else if !t.trim().is_empty() {
-                                // Hidden mode: keep a Claude Code-style marker, not the body.
-                                lines.push(OutputLine {
-                                    type_: "thinking_summary".into(),
-                                    content: "Thought".into(),
-                                    tool_name: String::new(),
-                                    duration: String::new(),
-                                });
-                            }
-                        }
-                        llm::Content::ToolUse(tu) => {
-                            pending_tool_name = tu.name.clone();
-                            lines.push(OutputLine {
-                                type_: "tool_use".into(),
-                                content: tu.input.clone(),
-                                tool_name: tu.name.clone(),
-                                duration: String::new(),
-                            });
-                        }
-                        llm::Content::ToolResult(tr) => {
-                            let name = if pending_tool_name.is_empty() {
-                                "tool".into()
-                            } else {
-                                std::mem::take(&mut pending_tool_name)
-                            };
-                            lines.push(OutputLine {
-                                type_: "tool_result".into(),
-                                content: tr.content.clone(),
-                                tool_name: name,
-                                duration: String::new(),
-                            });
-                        }
-                    }
+                    let content = match &msg.content {
+                        llm::Content::Text(t) => t.clone(),
+                        llm::Content::Thinking(t) => t.clone(),
+                        _ => continue,
+                    };
+                    lines.push(OutputLine {
+                        type_: if msg.role == "user" { "user".into() } else { "text".into() },
+                        content,
+                        tool_name: String::new(), duration: String::new(),
+                    });
                 }
                 self.output_lines = lines;
                 self.total_usage = llm::Usage {
@@ -1802,41 +801,17 @@ impl Tui {
                     cache_read: 0,
                     cache_create: 0,
                 };
-                // Seed the live mirror so the next autosave keeps full history.
-                if let Some(mirror) = &self.live_mirror {
-                    if let Ok(mut g) = mirror.lock() {
-                        g.messages = sess.messages.clone();
-                        g.tokens_in = sess.tokens_in;
-                        g.tokens_out = sess.tokens_out;
-                    }
-                }
                 self.model = sess.model.clone();
                 self.provider = sess.provider.clone();
-                self.current_session_id = Some(sess.id.clone());
-                self.session_created_at = if sess.created_at > 0 {
-                    sess.created_at
-                } else {
-                    sess.updated_at
-                };
 
                 if let Some(tx) = &self.agent_tx {
                     let _ = tx.send(format!("__switch__:{}:{}", sess.provider, sess.model));
                     let _ = tx.send(format!("__load_session__:{}", sess.id));
                 }
-                let short = if sess.id.len() >= 8 {
-                    &sess.id[..8]
-                } else {
-                    sess.id.as_str()
-                };
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: format!(
-                        "Resumed session {short} (model: {}, messages: {})",
-                        sess.model,
-                        sess.messages.len()
-                    ),
-                    tool_name: String::new(),
-                    duration: String::new(),
+                    content: format!("Resumed session {} (model: {}, messages: {})", &sess.id[..8], sess.model, sess.messages.len()),
+                    tool_name: String::new(), duration: String::new(),
                 });
             }
             Err(e) => {
@@ -1849,17 +824,16 @@ impl Tui {
         }
     }
 
-    fn render(&mut self, f: &mut Frame) {
+    fn render(&self, f: &mut Frame) {
         let area = f.area();
-        let dim = self.theme.muted;
-        let bright = self.theme.accent;
-        let bold_dim = self.theme.faintest;
-        let orange = self.theme.accent;
-        let white = self.theme.ink;
-        let red = self.theme.red;
-        let green = self.theme.green;
-        let orange_fg = self.theme.accent_fg;
-        let selected = self.theme.selected;
+        let dim = Style::new().fg(Color::Indexed(245));
+        let bright = Style::new().fg(Color::Indexed(215)).add_modifier(Modifier::BOLD);
+        let bold_dim = Style::new().fg(Color::Indexed(240));
+        let orange = Style::new().fg(Color::Indexed(215)).add_modifier(Modifier::BOLD);
+        let white = Style::new().fg(Color::Indexed(252));
+        let red = Style::new().fg(Color::Indexed(196));
+        let green = Style::new().fg(Color::Indexed(78));
+        let orange_fg = Style::new().fg(Color::Indexed(215));
 
         let mut lines: Vec<Line> = Vec::new();
 
@@ -1913,128 +887,45 @@ impl Tui {
         for line in &self.output_lines {
             match line.type_.as_str() {
                 "user" => {
-                    // Use a different marker than the live composer (❯) so past turns
-                    // are not mistaken for a second prompt.
-                    lines.push(Line::from(vec![
-                        Span::styled("› ", orange),
-                        Span::raw(&line.content),
-                    ]));
+                    lines.push(Line::from(vec![Span::styled("❯ ", orange), Span::raw(&line.content)]));
                     lines.push(Line::from(""));
                 }
                 "text" => {
-                    lines.extend(crate::markdown::render(&line.content, &self.theme));
+                    lines.extend(crate::markdown::render(&line.content));
                 }
                 "tool_use" => {
-                    // One line: name + short arg hint (no multi-line JSON dump).
-                    let hint = compact_tool_arg_hint(&line.content);
-                    let label = if hint.is_empty() {
-                        line.tool_name.clone()
-                    } else {
-                        format!("{}  {}", line.tool_name, hint)
-                    };
+                    let inner = if line.content.len() > 80 { format!("\n  {}", line.content) } else { format!("({})", line.content) };
                     lines.push(Line::from(vec![
-                        Span::styled("● ", white),
-                        Span::styled(label, dim),
+                        Span::styled("● ", white), Span::raw(&line.tool_name), Span::styled(inner, dim),
                     ]));
                 }
                 "tool_result" => {
-                    let is_err = line.content.starts_with("Error:")
-                        || line.content.contains("exit code")
-                            && !line.content.contains("(exit code 0)");
+                    let content = if line.content.len() > 500 { format!("{}... [truncated]", &line.content[..500]) } else { line.content.clone() };
+                    let is_err = line.content.starts_with("Error:");
                     let color = if is_err { red } else { green };
-                    let dur = if line.duration.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", line.duration)
-                    };
-                    // Summary-first body. Agent still has the full tool payload.
-                    let kind = infer_tool_display_kind(&line.tool_name, &line.content);
-                    let display = compact_tool_result_display(kind, &line.content);
-                    let name = if line.tool_name == "tool" || line.tool_name.is_empty() {
-                        kind
-                    } else {
-                        line.tool_name.as_str()
-                    };
-                    let header = if display.lines().count() <= 1 && !display.is_empty() {
-                        // Fold single-line summaries onto the status row.
-                        format!("{name}{dur}  {display}")
-                    } else {
-                        format!("{name}{dur}")
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled("● ", color),
-                        Span::styled(header, dim),
-                    ]));
-                    if display.lines().count() > 1 {
-                        for part in display.split('\n') {
-                            if part.is_empty() {
-                                continue;
-                            }
-                            lines.push(Line::from(vec![
-                                Span::styled(format!("  {part}"), dim),
-                            ]));
-                        }
-                    }
+                    let dur = if line.duration.is_empty() { String::new() } else { format!(" ({})", line.duration) };
+                    lines.push(Line::from(vec![Span::styled("● ", color), Span::styled(format!("{}{dur}", line.tool_name), dim)]));
+                    lines.push(Line::from(vec![Span::styled(format!("  {content}"), dim)]));
                 }
-                "error" => {
-                    for (i, part) in line.content.split('\n').enumerate() {
-                        if i == 0 {
-                            lines.push(Line::from(vec![Span::styled(format!("● {part}"), red)]));
-                        } else {
-                            lines.push(Line::from(vec![Span::styled(format!("  {part}"), red)]));
-                        }
-                    }
-                }
-                "system" => {
-                    for part in line.content.split('\n') {
-                        lines.push(Line::from(vec![Span::styled(part, dim)]));
-                    }
-                }
-                "thinking" => {
-                    // Full preserved thinking (only written when show_thinking is on).
-                    lines.push(Line::from(vec![Span::styled("── Thinking ──", bold_dim)]));
-                    for part in line.content.split('\n') {
-                        lines.push(Line::from(vec![Span::styled(part, dim)]));
-                    }
-                }
-                "thinking_summary" => {
-                    // Claude Code default: short marker, no body.
-                    let label = if line.content.is_empty() {
-                        "Thought".to_string()
-                    } else {
-                        line.content.clone()
-                    };
-                    lines.push(Line::from(vec![Span::styled(format!("✦ {label}"), dim)]));
-                }
-                _ => {
-                    for part in line.content.split('\n') {
-                        lines.push(Line::from(Span::raw(part)));
-                    }
-                }
+                "error" => lines.push(Line::from(vec![Span::styled(format!("● {}", line.content), red)])),
+                "system" => lines.push(Line::from(vec![Span::styled(&line.content, dim)])),
+                _ => lines.push(Line::from(Span::raw(&line.content))),
             }
         }
 
-        // Streaming thinking: full body only when toggled on; off-mode uses spinner only.
-        if self.show_thinking && !self.stream_thinking.is_empty() {
+        // Streaming
+        if !self.stream_thinking.is_empty() {
             lines.push(Line::from(vec![Span::styled("── Thinking ──", bold_dim)]));
             for part in self.stream_thinking.split('\n') {
                 lines.push(Line::from(vec![Span::styled(part, dim)]));
             }
         }
         if !self.streaming_text.is_empty() {
-            lines.extend(crate::markdown::render(&self.streaming_text, &self.theme));
+            lines.extend(crate::markdown::render(&self.streaming_text));
         }
-        // Spinner while waiting / thinking without answer text. Skip when full
-        // thinking body is already on screen (show_thinking on).
-        let show_spin = matches!(self.state, State::Running)
-            && self.streaming_text.is_empty()
-            && !(self.show_thinking && !self.stream_thinking.is_empty());
-        if show_spin {
+        if matches!(self.state, State::Running) && self.streaming_text.is_empty() {
             let spin = SPINNER_CHARS[self.spinner_idx % SPINNER_CHARS.len()];
-            lines.push(Line::from(vec![
-                Span::styled(spin, orange),
-                Span::styled(" Thinking…", dim),
-            ]));
+            lines.push(Line::from(format!("{spin} Thinking…")));
         }
 
         // Usage
@@ -2044,21 +935,33 @@ impl Tui {
             ]));
         }
 
-        // Composer / pickers live in a fixed bottom chrome region so typing never
-        // steals viewport rows from the transcript above (single-scroll layout used to
-        // push the last LLM line off-screen as soon as the prompt grew).
-        let mut chrome: Vec<Line> = Vec::new();
-        // Cursor: (x offset within chrome width, logical line index in chrome).
+        // Prompt or pickers
         let mut cursor_pos: Option<(u16, usize)> = None;
-
-        if let Some(name) = &self.confirm_remove_provider {
-            chrome.push(Line::from(vec![
+        if self.show_command_picker {
+            let bg_orange = Style::new().bg(Color::Indexed(215)).fg(Color::Indexed(230));
+            let cursor = self.cursor.min(self.input_buf.len());
+            let (before, after) = self.input_buf.split_at(cursor);
+            lines.push(Line::from(vec![
+                Span::styled("❯ ", orange_fg),
+                Span::raw(before),
+                Span::styled("▋", orange_fg),
+                Span::raw(after),
+            ]));
+            for (i, cmd) in self.cmd_picker_filtered.iter().enumerate() {
+                let is_sel = i == self.cmd_picker_sel;
+                let prefix = if is_sel { "▸ " } else { "  " };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{prefix}{cmd}"), if is_sel { bg_orange } else { dim }),
+                ]));
+            }
+        } else if let Some(name) = &self.confirm_remove_provider {
+            lines.push(Line::from(vec![
                 Span::styled(format!("Remove saved API key for '{name}'?"), white),
             ]));
-            chrome.push(Line::from(vec![
+            lines.push(Line::from(vec![
                 Span::styled("This only deletes the key from the config file.", dim),
             ]));
-            chrome.push(Line::from(""));
+            lines.push(Line::from(""));
             let options = ["Cancel", "Remove"];
             let mut option_spans = Vec::new();
             for (i, opt) in options.iter().enumerate() {
@@ -2071,42 +974,40 @@ impl Tui {
                     if is_sel { orange_fg.add_modifier(Modifier::BOLD) } else { dim },
                 ));
             }
-            chrome.push(Line::from(option_spans));
-            chrome.push(Line::from(vec![
+            lines.push(Line::from(option_spans));
+            lines.push(Line::from(vec![
                 Span::styled("(← → navigate  Enter confirm  Esc cancel)", dim),
             ]));
         } else if self.show_provider_picker {
-            chrome.push(Line::from(vec![
-                Span::styled("── Provider ", orange),
+            let bg_orange = Style::new().bg(Color::Indexed(215)).fg(Color::Indexed(230));
+
+            lines.push(Line::from(vec![
+                Span::styled("── Provider ", orange_fg.add_modifier(Modifier::BOLD)),
                 Span::styled("(↑↓ navigate  Enter select  Del remove key  Esc cancel) ──", bold_dim),
             ]));
             for (i, name) in self.provider_picker_list.iter().enumerate() {
                 let is_sel = i == self.provider_picker_sel;
                 let is_cur = *name == self.provider;
                 let cur_mark = if is_cur { "  (current)" } else { "" };
-                let key_mark = if self.provider_picker_keys.get(i).copied().unwrap_or(false) {
-                    "  [signed in]"
-                } else if crate::oauth::supports_oauth(name) {
-                    "  [browser login]"
-                } else {
-                    ""
-                };
+                let key_mark = if self.provider_picker_keys.get(i).copied().unwrap_or(false) { "  [key saved]" } else { "" };
                 let prefix = if is_sel { "▸ " } else { "  " };
-                chrome.push(Line::from(vec![
-                    Span::styled(format!("{prefix}{name}{key_mark}{cur_mark}"), if is_sel { selected } else { dim }),
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{prefix}{name}{key_mark}{cur_mark}"), if is_sel { bg_orange } else { dim }),
                 ]));
             }
         } else if self.show_model_picker {
             let visible = self.picker_visible_height();
             let end = (self.picker_scrl + visible).min(self.picker_models.len());
             let num = self.picker_models.len();
+            let bg_orange = Style::new().bg(Color::Indexed(215)).fg(Color::Indexed(230));
+            let bold_dim = Style::new().fg(Color::Indexed(240));
 
-            chrome.push(Line::from(vec![
-                Span::styled("── Model ", orange),
+            lines.push(Line::from(vec![
+                Span::styled("── Model ", orange_fg.add_modifier(Modifier::BOLD)),
                 Span::styled("(↑↓ navigate  Enter select  Esc cancel) ──", bold_dim),
             ]));
             if num > visible {
-                chrome.push(Line::from(vec![Span::styled(format!("  … {}/{}  ↑↓ scroll", self.picker_sel + 1, num), dim)]));
+                lines.push(Line::from(vec![Span::styled(format!("  … {}/{}  ↑↓ scroll", self.picker_sel + 1, num), dim)]));
             }
             for i in self.picker_scrl..end {
                 let m = &self.picker_models[i];
@@ -2115,45 +1016,22 @@ impl Tui {
                 let ctx = if m.max_ctx > 0 { format!(" ({}K context)", m.max_ctx / 1000) } else { String::new() };
                 let check = if is_cur { "  ✓" } else { "" };
                 let prefix = if is_sel { "▸ " } else { "  " };
-                chrome.push(Line::from(vec![
-                    Span::styled(format!("{prefix}{}  {}{ctx}{check}", m.name, m.id), if is_sel { selected } else { dim }),
-                ]));
-            }
-        } else if self.show_theme_picker {
-            chrome.push(Line::from(vec![
-                Span::styled("── Theme ", orange),
-                Span::styled("(↑↓ live-preview  Enter apply  Esc cancel) ──", bold_dim),
-            ]));
-            for (i, t) in self.theme_picker_list.iter().enumerate() {
-                let is_sel = i == self.theme_picker_sel;
-                let is_cur = t.name == self.theme.name;
-                let cur_mark = if is_cur { "  ✓" } else { "" };
-                let prefix = if is_sel { "▸ " } else { "  " };
-                chrome.push(Line::from(vec![
-                    Span::styled(format!("{prefix}{} ({}){cur_mark}", t.label, t.name), if is_sel { selected } else { dim }),
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{prefix}{}  {}{ctx}{check}", m.name, m.id), if is_sel { bg_orange } else { dim }),
                 ]));
             }
         } else if self.show_session_picker {
             let visible = 10usize;
             let end = (self.picker_session_scrl + visible).min(self.picker_sessions.len());
             let num = self.picker_sessions.len();
+            let bg_orange = Style::new().bg(Color::Indexed(215)).fg(Color::Indexed(230));
 
-            let title = if self.session_picker_delete {
-                "── Delete Session "
-            } else {
-                "── Resume Session "
-            };
-            let hint = if self.session_picker_delete {
-                "(↑↓ navigate  Enter delete  Esc cancel) ──"
-            } else {
-                "(↑↓ navigate  Enter select  Esc cancel) ──"
-            };
-            chrome.push(Line::from(vec![
-                Span::styled(title, orange),
-                Span::styled(hint, bold_dim),
+            lines.push(Line::from(vec![
+                Span::styled("── Resume Session ", orange_fg.add_modifier(Modifier::BOLD)),
+                Span::styled("(↑↓ navigate  Enter select  Esc cancel) ──", bold_dim),
             ]));
             if num > visible {
-                chrome.push(Line::from(vec![Span::styled(format!("  … {}/{}  ↑↓ scroll", self.picker_session_sel + 1, num), dim)]));
+                lines.push(Line::from(vec![Span::styled(format!("  … {}/{}  ↑↓ scroll", self.picker_session_sel + 1, num), dim)]));
             }
             for i in self.picker_session_scrl..end {
                 let s = &self.picker_sessions[i];
@@ -2165,35 +1043,35 @@ impl Tui {
                     s.summary.clone()
                 };
                 let time_str = format_timestamp(s.updated_at);
-                chrome.push(Line::from(vec![
-                    Span::styled(format!("{prefix}{}  {}  {} msgs  {time_str}", &s.id[..8], s.model, s.msg_count), if is_sel { selected } else { dim }),
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{prefix}{}  {}  {} msgs  {time_str}", &s.id[..8], s.model, s.msg_count), if is_sel { bg_orange } else { dim }),
                 ]));
                 if !summary.is_empty() && is_sel {
-                    chrome.push(Line::from(vec![
-                        Span::styled(format!("   {summary}"), if is_sel { selected } else { dim }),
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("   {summary}"), if is_sel { bg_orange } else { dim }),
                     ]));
                 }
             }
         } else if self.show_permission_prompt {
             let cursor = self.cursor.min(self.input_buf.len());
             let (before, after) = self.input_buf.split_at(cursor);
-            let prompt_line_idx = chrome.len();
-            chrome.push(Line::from(vec![
+            let prompt_line_idx = lines.len();
+            lines.push(Line::from(vec![
                 Span::styled("❯ ", orange_fg),
                 Span::raw(before),
                 Span::styled("▋", orange_fg),
                 Span::raw(after),
             ]));
-            chrome.push(Line::from(""));
-            chrome.push(Line::from(vec![
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
                 Span::styled(format!("Tool '{}' wants to run:", self.perm_tool_name), white),
             ]));
             if !self.perm_tool_input.is_empty() {
-                chrome.push(Line::from(vec![
+                lines.push(Line::from(vec![
                     Span::styled(format!("  {}", self.perm_tool_input), dim),
                 ]));
             }
-            chrome.push(Line::from(""));
+            lines.push(Line::from(""));
             let options = ["Allow", "Always Allow", "Deny"];
             let mut option_spans = Vec::new();
             for (i, opt) in options.iter().enumerate() {
@@ -2206,255 +1084,54 @@ impl Tui {
                     if is_sel { orange_fg.add_modifier(Modifier::BOLD) } else { dim },
                 ));
             }
-            chrome.push(Line::from(option_spans));
-            chrome.push(Line::from(vec![
+            lines.push(Line::from(option_spans));
+            lines.push(Line::from(vec![
                 Span::styled("(← → navigate  Enter confirm  Esc deny)", dim),
             ]));
-            cursor_pos = Some((display_width("❯ ") as u16 + display_width(before) as u16, prompt_line_idx));
-        } else if self.show_recovery_prompt {
-            chrome.push(Line::from(vec![
-                Span::styled(
-                    format!("LLM failed ({}/{}). Switch and retry your request:", self.provider, self.model),
-                    white,
-                ),
+            cursor_pos = Some((area.x + display_width("❯ ") as u16 + display_width(before) as u16, prompt_line_idx));
+        } else if self.awaiting_api_key {
+            let cursor = self.cursor.min(self.input_buf.len());
+            let nchars = self.input_buf[..cursor].chars().count();
+            let ntotal = self.input_buf.chars().count();
+            let masked: Vec<char> = (0..ntotal).map(|_| '•').collect();
+            let before: String = masked.iter().take(nchars).collect();
+            let after: String = masked.iter().skip(nchars).collect();
+            lines.push(Line::from(vec![
+                Span::styled(format!("OpenRouter API key: {before}{after}"), orange_fg),
             ]));
-            chrome.push(Line::from(""));
-            let options = ["Switch model (m)", "Switch provider (p)", "Dismiss (d)"];
-            let mut option_spans = Vec::new();
-            for (i, opt) in options.iter().enumerate() {
-                if i > 0 { option_spans.push(Span::raw("  ")); }
-                let is_sel = i == self.recovery_selection;
-                let open = if is_sel { "[" } else { " " };
-                let close = if is_sel { "]" } else { " " };
-                option_spans.push(Span::styled(
-                    format!("{open}{opt}{close}"),
-                    if is_sel { orange_fg.add_modifier(Modifier::BOLD) } else { dim },
-                ));
-            }
-            chrome.push(Line::from(option_spans));
-            chrome.push(Line::from(vec![
-                Span::styled("(← → navigate  Enter confirm  Esc dismiss)", dim),
-            ]));
+            cursor_pos = Some((area.x + display_width("OpenRouter API key: ") as u16 + display_width(&before) as u16, lines.len() - 1));
+        } else {
             let cursor = self.cursor.min(self.input_buf.len());
             let (before, after) = self.input_buf.split_at(cursor);
-            let prompt_line_idx = chrome.len();
-            chrome.push(Line::from(vec![
+            lines.push(Line::from(vec![
                 Span::styled("❯ ", orange_fg),
                 Span::raw(before),
-                Span::styled("▋", orange_fg),
                 Span::raw(after),
             ]));
-            cursor_pos = Some((display_width("❯ ") as u16 + display_width(before) as u16, prompt_line_idx));
-        } else if self.awaiting_api_key {
-            let target = self.api_key_target.as_deref().unwrap_or(&self.provider);
-            let env_hint = crate::config::env_var_name(target).unwrap_or("API_KEY");
-            let label = format!("{target} API key ({env_hint}) > ");
-            let cursor_chars = self.input_buf[..self.cursor.min(self.input_buf.len())]
-                .chars()
-                .count();
-            let masked = crate::config::mask_secret_display(&self.input_buf, 4);
-            let masked_chars: Vec<char> = masked.chars().collect();
-            let before: String = masked_chars.iter().take(cursor_chars).collect();
-            let after: String = masked_chars.iter().skip(cursor_chars).collect();
-            chrome.push(Line::from(vec![
-                Span::styled(format!("{label}{before}"), orange_fg),
-                Span::styled("▋", orange_fg),
-                Span::styled(after, orange_fg),
-            ]));
-            chrome.push(Line::from(vec![
-                Span::styled(
-                    "Hidden as you type (last 4 characters shown). Enter to save  ·  Esc to cancel",
-                    dim,
-                ),
-            ]));
-            cursor_pos = Some((
-                display_width(&label) as u16 + display_width(&before) as u16,
-                0,
-            ));
-        } else {
-            let cursor = self.cursor.min(self.input_buf.len());
-            let (before, after) = self.input_buf.split_at(cursor);
-            // Grayed ready-to-send prompt when the composer is empty.
-            if self.input_buf.is_empty()
-                && matches!(self.state, State::Idle)
-                && !self.show_permission_prompt
-                && !self.show_recovery_prompt
-                && !self.awaiting_api_key
-            {
-                if let Some(hint) = &self.idle_suggestion {
-                    chrome.push(Line::from(vec![
-                        Span::styled("❯ ", orange_fg),
-                        Span::styled(hint.as_str(), bold_dim),
-                    ]));
-                    cursor_pos = Some((display_width("❯ ") as u16, 0));
-                } else {
-                    chrome.push(Line::from(vec![
-                        Span::styled("❯ ", orange_fg),
-                        Span::raw(before),
-                        Span::raw(after),
-                    ]));
-                    cursor_pos = Some((display_width("❯ ") as u16, 0));
-                }
-            } else {
-                // Inline slash ghost: `/e` shows gray `xit` after the caret (no dropdown).
-                let mut spans = vec![
-                    Span::styled("❯ ", orange_fg),
-                    Span::raw(before),
-                    Span::raw(after),
-                ];
-                if cursor >= self.input_buf.len() {
-                    if let Some(cmd) = self.selected_slash_completion() {
-                        if let Some(suffix) = slash_ghost_suffix(&self.input_buf, cmd) {
-                            spans.push(Span::styled(suffix, bold_dim));
-                        }
-                    }
-                }
-                chrome.push(Line::from(spans));
-                cursor_pos = Some((
-                    display_width("❯ ") as u16 + display_width(before) as u16,
-                    0,
-                ));
-            }
+            cursor_pos = Some((area.x + display_width("❯ ") as u16 + display_width(before) as u16, lines.len() - 1));
         }
 
-        let width = area.width as usize;
-        let body_wrapped = total_wrapped(&lines, width);
-        let chrome_wrapped = total_wrapped(&chrome, width).max(1);
-        // Keep room for transcript; cap chrome so pickers cannot hide all output.
-        let max_chrome = (area.height as usize)
-            .saturating_sub(3)
-            .min((area.height as usize).saturating_mul(2) / 3)
-            .max(1);
-        let chrome_h = chrome_wrapped.min(max_chrome) as u16;
-        let chrome_scroll = chrome_wrapped.saturating_sub(chrome_h as usize);
-        let term_h = area.height as usize;
+        let scroll = total_wrapped(&lines, area.width as usize).saturating_sub(area.height as usize);
 
-        // Short chats: sit the composer directly under the transcript (top of the
-        // window), not glued to the bottom with a huge empty gap that looks like a
-        // second orphaned prompt.
-        // Long chats: pin chrome to the bottom and scroll the transcript above.
-        let fits = body_wrapped.saturating_add(chrome_h as usize) <= term_h;
-        let (body_area, chrome_area) = if fits {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(body_wrapped.max(1) as u16),
-                    Constraint::Length(chrome_h),
-                    Constraint::Min(0),
-                ])
-                .split(area);
-            (chunks[0], chunks[1])
-        } else {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(1),
-                    Constraint::Length(chrome_h),
-                ])
-                .split(area);
-            (chunks[0], chunks[1])
-        };
-
-        // videre-style rowoff: free scroll when not following; pin to bottom when following.
-        let body_h = body_area.height as usize;
-        let max_off = body_wrapped.saturating_sub(body_h.max(1));
-        self.last_body_h = body_h;
-        self.last_body_wrapped = body_wrapped;
-        let body_scroll = if fits {
-            0
-        } else if self.transcript_follow {
-            self.transcript_rowoff = max_off;
-            max_off
-        } else {
-            let off = self.transcript_rowoff.min(max_off);
-            self.transcript_rowoff = off;
-            if off >= max_off {
-                self.transcript_follow = true;
-            }
-            off
-        };
-
-        f.render_widget(
-            Paragraph::new(Text::from(lines))
-                .wrap(Wrap { trim: false })
-                .scroll((body_scroll as u16, 0)),
-            body_area,
-        );
-        f.render_widget(
-            Paragraph::new(Text::from(chrome.clone()))
-                .wrap(Wrap { trim: false })
-                .scroll((chrome_scroll as u16, 0)),
-            chrome_area,
-        );
-
-        // Scroll position hint when not pinned to bottom (videre shows %).
-        if !fits && !self.transcript_follow && max_off > 0 {
-            let pct = (body_scroll * 100) / max_off;
-            let hint = format!(" ↑ {pct}% · PgUp/PgDn · wheel · Ctrl+U/D ");
-            let hx = body_area
-                .x
-                .saturating_add(body_area.width.saturating_sub(hint.len() as u16 + 1));
-            let hy = body_area.y;
-            if body_area.width > 8 {
-                f.render_widget(
-                    Paragraph::new(Span::styled(hint, dim)),
-                    ratatui::layout::Rect {
-                        x: hx,
-                        y: hy,
-                        width: body_area
-                            .width
-                            .saturating_sub(hx.saturating_sub(body_area.x))
-                            .min(40),
-                        height: 1,
-                    },
-                );
-            }
-        }
-
-        if let Some((x_off, line_idx)) = cursor_pos {
-            let line_idx = line_idx.min(chrome.len().saturating_sub(1));
-            let wrapped_before = total_wrapped(&chrome[..line_idx], width);
-            let y = (chrome_area.y as usize + wrapped_before).saturating_sub(chrome_scroll) as u16;
-            let y = y.min(chrome_area.y.saturating_add(chrome_area.height.saturating_sub(1)));
-            let x = chrome_area.x.saturating_add(x_off.min(chrome_area.width.saturating_sub(1)));
+        if let Some((x, line_idx)) = cursor_pos {
+            let wrapped_before = total_wrapped(&lines[..line_idx], area.width as usize);
+            let y = (area.y as usize + wrapped_before).saturating_sub(scroll) as u16;
             f.set_cursor_position(Position { x, y });
         }
+
+        f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }).scroll((scroll as u16, 0)), area);
     }
 
     fn flush_streaming(&mut self) {
-        if self.streaming_text.is_empty() && self.stream_thinking.is_empty() {
-            return;
-        }
-        // Finish the think phase before answer text so order matches Claude Code.
-        if !self.stream_thinking.is_empty() {
-            let elapsed = self.thinking_started.take().map(|t| t.elapsed());
-            if self.show_thinking {
+        if !self.streaming_text.is_empty() || !self.stream_thinking.is_empty() {
+            if !self.streaming_text.is_empty() {
                 self.output_lines.push(OutputLine {
-                    type_: "thinking".into(),
-                    content: self.stream_thinking.clone(),
-                    tool_name: String::new(),
-                    duration: String::new(),
-                });
-            } else {
-                self.output_lines.push(OutputLine {
-                    type_: "thinking_summary".into(),
-                    content: format_thought_label(elapsed),
-                    tool_name: String::new(),
-                    duration: String::new(),
+                    type_: "text".into(), content: self.streaming_text.clone(),
+                    tool_name: String::new(), duration: String::new(),
                 });
             }
-            self.stream_thinking.clear();
-        } else {
-            self.thinking_started = None;
-        }
-        if !self.streaming_text.is_empty() {
-            self.output_lines.push(OutputLine {
-                type_: "text".into(),
-                content: self.streaming_text.clone(),
-                tool_name: String::new(),
-                duration: String::new(),
-            });
             self.streaming_text.clear();
+            self.stream_thinking.clear();
         }
     }
 
@@ -2472,492 +1149,20 @@ impl Tui {
     }
 
     fn update_cmd_picker(&mut self) {
-        if self.awaiting_api_key || !self.input_buf.starts_with('/') {
+        if self.input_buf.starts_with('/') && !self.input_buf.is_empty() {
+            let filter = self.input_buf[1..].to_lowercase();
+            self.cmd_picker_filtered = self.cmd_picker_list.iter()
+                .filter(|c| c[1..].to_lowercase().starts_with(&filter))
+                .cloned()
+                .collect();
+            if self.cmd_picker_sel >= self.cmd_picker_filtered.len() {
+                self.cmd_picker_sel = self.cmd_picker_filtered.len().saturating_sub(1);
+            }
+            self.show_command_picker = !self.cmd_picker_filtered.is_empty();
+        } else {
             self.show_command_picker = false;
             self.cmd_picker_filtered.clear();
-            return;
         }
-
-        let models: Vec<String> = {
-            let providers = crate::llm::default_providers();
-            providers
-                .get(&self.provider)
-                .map(|p| p.available_models().into_iter().map(|m| m.id).collect())
-                .unwrap_or_default()
-        };
-        let mut provider_names: Vec<String> = crate::llm::default_providers().into_keys().collect();
-        provider_names.sort();
-        let themes: Vec<String> = theme::theme_names().iter().map(|s| (*s).to_string()).collect();
-        let sessions: Vec<String> = session::list(&self.sessions_dir())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| {
-                if s.id.len() >= 8 {
-                    s.id[..8].to_string()
-                } else {
-                    s.id
-                }
-            })
-            .collect();
-
-        self.cmd_picker_filtered = slash_completions(
-            &self.input_buf,
-            &self.cmd_picker_list,
-            &models,
-            &provider_names,
-            &themes,
-            &sessions,
-        );
-        if self.cmd_picker_sel >= self.cmd_picker_filtered.len() {
-            self.cmd_picker_sel = self.cmd_picker_filtered.len().saturating_sub(1);
-        }
-        // Keep flag for mouse/scroll guards; UI is ghost-only (no multi-line list).
-        self.show_command_picker = !self.cmd_picker_filtered.is_empty();
-    }
-
-    /// Selected slash completion string, if any.
-    fn selected_slash_completion(&self) -> Option<&str> {
-        self.cmd_picker_filtered.get(self.cmd_picker_sel).map(|s| s.as_str())
-    }
-
-    /// Refresh the grayed ready-to-send prompt in the empty composer.
-    fn refresh_idle_suggestion(&mut self) {
-        if !self.input_buf.is_empty() || !matches!(self.state, State::Idle) {
-            return;
-        }
-        // Permission/recovery own the chrome; no ghost prompt until they clear.
-        if self.show_permission_prompt || self.show_recovery_prompt {
-            self.idle_suggestion = None;
-            return;
-        }
-        self.idle_suggestion = Some(compute_idle_suggestion(&self.output_lines));
-    }
-
-    /// Insert a completion into the composer. Adds a trailing space when more
-    /// arguments are expected so the next Tab level can open immediately.
-    fn apply_slash_completion(&mut self, completion: &str) {
-        let text = if completion_wants_trailing_space(completion) {
-            format!("{completion} ")
-        } else {
-            completion.to_string()
-        };
-        self.input_buf = text;
-        self.cursor = self.input_buf.len();
-        self.update_cmd_picker();
-    }
-}
-
-/// Claude Code-style short label for a completed think phase.
-pub(crate) fn format_thought_label(elapsed: Option<Duration>) -> String {
-    let Some(d) = elapsed else {
-        return "Thought".into();
-    };
-    let secs = d.as_secs();
-    if secs == 0 {
-        // Sub-second thinks still get a readable marker.
-        let ms = d.as_millis();
-        if ms < 100 {
-            return "Thought briefly".into();
-        }
-        return "Thought for <1s".into();
-    }
-    if secs < 60 {
-        return format!("Thought for {secs}s");
-    }
-    let m = secs / 60;
-    let s = secs % 60;
-    if s == 0 {
-        format!("Thought for {m}m")
-    } else {
-        format!("Thought for {m}m {s}s")
-    }
-}
-
-/// Gray ghost text after the typed prefix: `/e` + `/exit` → `xit`.
-/// Returns `None` when the completion does not extend the current input.
-pub(crate) fn slash_ghost_suffix(input: &str, completion: &str) -> Option<String> {
-    if completion.len() <= input.len() {
-        return None;
-    }
-    if !completion
-        .to_ascii_lowercase()
-        .starts_with(&input.to_ascii_lowercase())
-    {
-        return None;
-    }
-    Some(completion[input.len()..].to_string())
-}
-
-fn default_empty_suggestion() -> &'static str {
-    "Give me an overview of this codebase and how it is organized"
-}
-
-/// Pick a short ready-to-send prompt from recent transcript context.
-/// Tab/→ inserts it into the composer as a real user message.
-pub(crate) fn compute_idle_suggestion(lines: &[OutputLine]) -> String {
-    // Walk recent transcript for a contextual ready prompt.
-    let mut last_user: Option<&str> = None;
-    let mut last_assistant: Option<&str> = None;
-    let mut last_tool: Option<&str> = None;
-    let mut saw_error = false;
-    for line in lines.iter().rev().take(40) {
-        match line.type_.as_str() {
-            "user" if last_user.is_none() => last_user = Some(line.content.as_str()),
-            "text" if last_assistant.is_none() => last_assistant = Some(line.content.as_str()),
-            "tool_use" if last_tool.is_none() => last_tool = Some(line.tool_name.as_str()),
-            "error" => saw_error = true,
-            _ => {}
-        }
-    }
-    if saw_error {
-        return "Retry the last step and fix any errors you hit".into();
-    }
-    if let Some(tool) = last_tool {
-        if tool == "shell" {
-            return "Summarize the command output and what we should do next".into();
-        }
-        if tool == "file_read" || tool == "grep" || tool == "glob" {
-            return format!("Based on the {tool} results, explain what you found and recommend next steps");
-        }
-        return format!("Summarize the {tool} results and continue with the next step");
-    }
-    if let Some(u) = last_user {
-        let lower = u.to_ascii_lowercase();
-        if lower.contains("test") {
-            return "Run the tests, fix any failures, and report the final result".into();
-        }
-        if lower.contains("commit") || lower.contains("push") {
-            return "Review the git status and diff, then commit and push if the changes look good".into();
-        }
-        if lower.contains("fix") || lower.contains("bug") {
-            return "Verify the fix works end-to-end and check for related regressions".into();
-        }
-        if lower.contains("refactor") {
-            return "Continue the refactor and keep behavior covered by tests".into();
-        }
-    }
-    if last_assistant.is_some() {
-        return "Continue with the next step from your previous plan".into();
-    }
-    default_empty_suggestion().into()
-}
-
-/// Commands that still need another argument after Tab.
-fn completion_wants_trailing_space(completion: &str) -> bool {
-    let c = completion.trim_end();
-    matches!(
-        c,
-        "/auth"
-            | "/auth login"
-            | "/auth logout"
-            | "/auth key"
-            | "/theme"
-            | "/model"
-            | "/provider"
-            | "/resume"
-            | "/delete"
-            | "/thinking"
-    )
-}
-
-/// Contextual slash-command completions for the composer.
-///
-/// Supports base commands, `/auth` subcommands + providers, `/theme` names,
-/// `/model` ids for the active provider, `/provider` names, and short session
-/// ids for `/resume` / `/delete`.
-pub(crate) fn slash_completions(
-    input: &str,
-    base_commands: &[String],
-    models: &[String],
-    providers: &[String],
-    themes: &[String],
-    session_ids: &[String],
-) -> Vec<String> {
-    if !input.starts_with('/') {
-        return Vec::new();
-    }
-    let ends_with_space = input.ends_with(' ') || input.ends_with('\t');
-    let parts: Vec<&str> = input.split_whitespace().collect();
-    if parts.is_empty() {
-        return base_commands.to_vec();
-    }
-
-    let cmd = parts[0].to_ascii_lowercase();
-
-    // Still typing the root command: `/mo` → `/model`
-    if parts.len() == 1 && !ends_with_space {
-        return base_commands
-            .iter()
-            .filter(|c| c.to_ascii_lowercase().starts_with(&cmd))
-            .cloned()
-            .collect();
-    }
-
-    let prefix_match = |candidates: &[String], typed: &str, format: &dyn Fn(&str) -> String| {
-        let typed = typed.to_ascii_lowercase();
-        let mut out: Vec<String> = candidates
-            .iter()
-            .filter(|c| c.to_ascii_lowercase().starts_with(&typed))
-            .map(|c| format(c))
-            .collect();
-        out.sort();
-        out.dedup();
-        out
-    };
-
-    match cmd.as_str() {
-        "/thinking" => {
-            let opts = ["on", "off"];
-            if parts.len() == 1 && ends_with_space {
-                return opts.iter().map(|s| format!("/thinking {s}")).collect();
-            }
-            if parts.len() == 2 && !ends_with_space {
-                let p = parts[1].to_ascii_lowercase();
-                return opts
-                    .iter()
-                    .filter(|s| s.starts_with(&p))
-                    .map(|s| format!("/thinking {s}"))
-                    .collect();
-            }
-            Vec::new()
-        }
-        "/auth" => {
-            let subs = ["login", "logout", "status", "key"];
-            if parts.len() == 1 && ends_with_space {
-                return subs.iter().map(|s| format!("/auth {s}")).collect();
-            }
-            if parts.len() == 2 && !ends_with_space {
-                let p = parts[1].to_ascii_lowercase();
-                return subs
-                    .iter()
-                    .filter(|s| s.starts_with(&p))
-                    .map(|s| format!("/auth {s}"))
-                    .collect();
-            }
-            if parts.len() >= 2 {
-                let action = parts[1].to_ascii_lowercase();
-                if matches!(action.as_str(), "login" | "logout" | "key") {
-                    if parts.len() == 2 && ends_with_space {
-                        return providers
-                            .iter()
-                            .map(|p| format!("/auth {action} {p}"))
-                            .collect();
-                    }
-                    if parts.len() == 3 && !ends_with_space {
-                        return prefix_match(providers, parts[2], &|p| {
-                            format!("/auth {action} {p}")
-                        });
-                    }
-                }
-            }
-            Vec::new()
-        }
-        "/theme" => {
-            if parts.len() == 1 && ends_with_space {
-                let mut v: Vec<String> = themes.iter().map(|t| format!("/theme {t}")).collect();
-                v.insert(0, "/theme list".into());
-                return v;
-            }
-            if parts.len() == 2 && !ends_with_space {
-                let mut v = prefix_match(themes, parts[1], &|t| format!("/theme {t}"));
-                if "list".starts_with(&parts[1].to_ascii_lowercase()) {
-                    v.insert(0, "/theme list".into());
-                }
-                v.dedup();
-                return v;
-            }
-            Vec::new()
-        }
-        "/model" => {
-            if parts.len() == 1 && ends_with_space {
-                return models.iter().map(|m| format!("/model {m}")).collect();
-            }
-            if parts.len() >= 2 && !ends_with_space {
-                let typed = parts[1..].join(" ");
-                return prefix_match(models, &typed, &|m| format!("/model {m}"));
-            }
-            Vec::new()
-        }
-        "/provider" => {
-            if parts.len() == 1 && ends_with_space {
-                return providers.iter().map(|p| format!("/provider {p}")).collect();
-            }
-            if parts.len() == 2 && !ends_with_space {
-                return prefix_match(providers, parts[1], &|p| format!("/provider {p}"));
-            }
-            Vec::new()
-        }
-        "/resume" | "/delete" => {
-            if parts.len() == 1 && ends_with_space {
-                return session_ids
-                    .iter()
-                    .map(|id| format!("{cmd} {id}"))
-                    .collect();
-            }
-            if parts.len() == 2 && !ends_with_space {
-                return prefix_match(session_ids, parts[1], &|id| format!("{cmd} {id}"));
-            }
-            Vec::new()
-        }
-        _ => Vec::new(),
-    }
-}
-
-#[cfg(test)]
-mod suggestion_tests {
-    use super::*;
-
-    fn line(type_: &str, content: &str, tool: &str) -> OutputLine {
-        OutputLine {
-            type_: type_.into(),
-            content: content.into(),
-            tool_name: tool.into(),
-            duration: String::new(),
-        }
-    }
-
-    #[test]
-    fn suggestion_from_recent_user_and_tools() {
-        let lines = vec![
-            line("user", "please run the tests", ""),
-            line("tool_use", r#"{"command":"cargo test"}"#, "shell"),
-            line("tool_result", "ok", "shell"),
-        ];
-        let s = compute_idle_suggestion(&lines);
-        assert!(
-            s.to_ascii_lowercase().contains("command output"),
-            "expected ready prompt about shell output, got {s}"
-        );
-        // Ready prompt, not a meta instruction to the user.
-        assert!(!s.to_ascii_lowercase().starts_with("inspect"));
-        assert!(!s.to_ascii_lowercase().starts_with("review"));
-        assert!(!s.to_ascii_lowercase().starts_with("try again"));
-    }
-
-    #[test]
-    fn suggestion_default_when_empty() {
-        let s = compute_idle_suggestion(&[]);
-        assert_eq!(s, default_empty_suggestion());
-        assert!(
-            s.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false),
-            "ready prompts should read as imperative agent requests"
-        );
-    }
-
-    #[test]
-    fn suggestion_after_error_is_sendable_retry() {
-        let lines = vec![line("error", "LLM error: boom", "")];
-        let s = compute_idle_suggestion(&lines);
-        assert!(s.to_ascii_lowercase().contains("retry"));
-        assert!(!s.contains("/provider"));
-    }
-}
-
-#[cfg(test)]
-mod completion_tests {
-    use super::*;
-
-    fn base() -> Vec<String> {
-        vec![
-            "/auth".into(),
-            "/clear".into(),
-            "/help".into(),
-            "/model".into(),
-            "/provider".into(),
-            "/resume".into(),
-            "/delete".into(),
-            "/theme".into(),
-            "/thinking".into(),
-        ]
-    }
-
-    #[test]
-    fn thought_label_formats_duration() {
-        assert_eq!(format_thought_label(None), "Thought");
-        assert_eq!(
-            format_thought_label(Some(Duration::from_millis(40))),
-            "Thought briefly"
-        );
-        assert_eq!(
-            format_thought_label(Some(Duration::from_secs(3))),
-            "Thought for 3s"
-        );
-        assert_eq!(
-            format_thought_label(Some(Duration::from_secs(65))),
-            "Thought for 1m 5s"
-        );
-    }
-
-    #[test]
-    fn completes_thinking_toggle() {
-        let c = slash_completions("/thin", &base(), &[], &[], &[], &[]);
-        assert_eq!(c, vec!["/thinking".to_string()]);
-        let c = slash_completions("/thinking ", &base(), &[], &[], &[], &[]);
-        assert!(c.iter().any(|x| x == "/thinking on"));
-        assert!(c.iter().any(|x| x == "/thinking off"));
-    }
-
-    #[test]
-    fn completes_root_command_prefix() {
-        let c = slash_completions("/mo", &base(), &[], &[], &[], &[]);
-        assert_eq!(c, vec!["/model".to_string()]);
-    }
-
-    #[test]
-    fn ghost_suffix_for_partial_command() {
-        assert_eq!(slash_ghost_suffix("/e", "/exit").as_deref(), Some("xit"));
-        assert_eq!(slash_ghost_suffix("/auth lo", "/auth login").as_deref(), Some("gin"));
-        assert_eq!(slash_ghost_suffix("/exit", "/exit"), None);
-        assert_eq!(slash_ghost_suffix("/z", "/exit"), None);
-    }
-
-    #[test]
-    fn completes_auth_subcommands() {
-        let c = slash_completions("/auth ", &base(), &[], &[], &[], &[]);
-        assert!(c.iter().any(|x| x == "/auth login"));
-        assert!(c.iter().any(|x| x == "/auth status"));
-        let c = slash_completions("/auth lo", &base(), &[], &[], &[], &[]);
-        assert_eq!(c, vec!["/auth login".to_string(), "/auth logout".to_string()]);
-    }
-
-    #[test]
-    fn completes_auth_login_provider() {
-        let providers = vec!["anthropic".into(), "xai".into()];
-        let c = slash_completions("/auth login ", &base(), &[], &providers, &[], &[]);
-        assert!(c.iter().any(|x| x == "/auth login xai"));
-        let c = slash_completions("/auth login x", &base(), &[], &providers, &[], &[]);
-        assert_eq!(c, vec!["/auth login xai".to_string()]);
-    }
-
-    #[test]
-    fn completes_models_and_themes() {
-        let models = vec!["grok-4.5:high".into(), "grok-4.3".into()];
-        let c = slash_completions("/model grok-4.5", &base(), &models, &[], &[], &[]);
-        assert_eq!(c, vec!["/model grok-4.5:high".to_string()]);
-        let themes = vec!["dark".into(), "dune".into()];
-        let c = slash_completions("/theme d", &base(), &[], &[], &themes, &[]);
-        assert!(c.iter().any(|x| x == "/theme dark"));
-        assert!(c.iter().any(|x| x == "/theme dune"));
-    }
-
-    #[test]
-    fn completes_session_ids_for_resume() {
-        let sessions = vec!["abcdef12".into(), "abcdef99".into(), "deadbeef".into()];
-        let c = slash_completions("/resume abc", &base(), &[], &[], &[], &sessions);
-        assert_eq!(
-            c,
-            vec![
-                "/resume abcdef12".to_string(),
-                "/resume abcdef99".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn trailing_space_helpers() {
-        assert!(completion_wants_trailing_space("/auth login"));
-        assert!(!completion_wants_trailing_space("/auth login xai"));
-        assert!(!completion_wants_trailing_space("/help"));
     }
 }
 
@@ -3001,12 +1206,7 @@ fn terminal_height() -> Option<usize> {
 }
 
 fn format_timestamp(ts: u64) -> String {
-    // `ts` is absolute unix seconds; show relative age.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let secs = now.saturating_sub(ts);
+    let secs = ts as i64;
     let days = secs / 86400;
     let hours = (secs % 86400) / 3600;
     let mins = (secs % 3600) / 60;
@@ -3014,10 +1214,8 @@ fn format_timestamp(ts: u64) -> String {
         format!("{days}d {hours}h ago")
     } else if hours > 0 {
         format!("{hours}h {mins}m ago")
-    } else if mins > 0 {
-        format!("{mins}m ago")
     } else {
-        "just now".into()
+        format!("{mins}m ago")
     }
 }
 
@@ -3027,212 +1225,6 @@ fn total_wrapped(lines: &[Line], width: usize) -> usize {
         let line_w: usize = l.spans.iter().map(|s| display_width(&s.content)).sum();
         if line_w == 0 { 1 } else { (line_w + w - 1) / w }
     }).sum()
-}
-
-/// Limit on-screen tool output by line count (head + tail) so long shell
-/// dumps stay readable and keep the trailing summary / exit code.
-fn truncate_display(s: &str, head_lines: usize, tail_lines: usize) -> String {
-    let lines: Vec<&str> = s.lines().collect();
-    if lines.len() <= head_lines + tail_lines {
-        return s.to_string();
-    }
-    let mut out = String::new();
-    for line in &lines[..head_lines] {
-        out.push_str(line);
-        out.push('\n');
-    }
-    let omitted = lines.len() - head_lines - tail_lines;
-    out.push_str(&format!("… ({omitted} lines omitted) …\n"));
-    for line in &lines[lines.len() - tail_lines..] {
-        out.push_str(line);
-        out.push('\n');
-    }
-    while out.ends_with('\n') {
-        out.pop();
-    }
-    out
-}
-
-/// One-line arg preview for tool_use rows (avoid dumping pretty JSON).
-fn compact_tool_arg_hint(input: &str) -> String {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    // Prefer a few common fields when the arg is a JSON object.
-    if let Ok(val) = crate::json::parse(trimmed) {
-        if let Some(obj) = val.as_object() {
-            for key in [
-                "pattern",
-                "file_path",
-                "path",
-                "command",
-                "query",
-                "url",
-                "old_string",
-                "args",
-            ] {
-                if let Some(v) = obj.get(key).and_then(|x| x.as_str()) {
-                    let v = v.replace('\n', " ");
-                    let shown: String = v.chars().take(64).collect();
-                    let ellipsis = if v.chars().count() > 64 { "…" } else { "" };
-                    return format!("{key}={shown}{ellipsis}");
-                }
-            }
-        }
-    }
-    let one_line = trimmed.replace('\n', " ");
-    let shown: String = one_line.chars().take(72).collect();
-    if one_line.chars().count() > 72 {
-        format!("{shown}…")
-    } else {
-        shown
-    }
-}
-
-/// Resolve display kind from stored name, or sniff content when name was lost
-/// (older resumes used a generic `"tool"` label).
-fn infer_tool_display_kind<'a>(tool_name: &'a str, content: &str) -> &'a str {
-    if tool_name != "tool" && !tool_name.is_empty() {
-        return tool_name;
-    }
-    if content.contains("(showing lines") {
-        return "file_read";
-    }
-    if content.contains("result(s)") || content.contains(" more (") && content.contains(" total)") {
-        return "glob";
-    }
-    if content.contains("(exit code") {
-        return "shell";
-    }
-    if content.lines().take(5).any(|l| l.contains(':') && !l.starts_with('{'))
-        && content.lines().count() > 3
-        && !content.contains("(showing lines")
-    {
-        // Heuristic: path:line:text style matches.
-        if content.lines().take(8).filter(|l| l.matches(':').count() >= 2).count() >= 2 {
-            return "grep";
-        }
-    }
-    tool_name
-}
-
-/// Summary-first transcript body for a tool result. Full payload stays with the agent.
-fn compact_tool_result_display(kind: &str, content: &str) -> String {
-    let content = content.trim();
-    if content.is_empty() {
-        return String::new();
-    }
-    match kind {
-        "file_read" => {
-            if let Some(summary) = content
-                .lines()
-                .rev()
-                .find(|l| l.contains("(showing lines"))
-            {
-                return summary.to_string();
-            }
-            let n = content.lines().filter(|l| !l.trim().is_empty()).count();
-            format!("({n} lines read)")
-        }
-        "glob" => {
-            if content.contains("No matches") {
-                return "No matches found.".into();
-            }
-            if let Some(summary) = content.lines().rev().find(|l| {
-                let t = l.trim();
-                t.contains("result(s)") || t.contains(" total)") || t.starts_with('…')
-            }) {
-                // Pull a clean count when the summary is "… and N more (M total)"
-                // or "M result(s)".
-                let s = summary.trim();
-                if let Some(rest) = s.strip_suffix(" result(s)") {
-                    if rest.chars().all(|c| c.is_ascii_digit()) {
-                        return format!("{rest} matches");
-                    }
-                }
-                if let Some(i) = s.rfind('(') {
-                    if let Some(j) = s.rfind(" total)") {
-                        if j > i {
-                            let n = s[i + 1..j].trim();
-                            if n.chars().all(|c| c.is_ascii_digit()) {
-                                return format!("{n} matches");
-                            }
-                        }
-                    }
-                }
-                return s.to_string();
-            }
-            let n = content.lines().filter(|l| !l.trim().is_empty()).count();
-            format!("{n} matches")
-        }
-        "grep" => {
-            let hits: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-            if hits.is_empty() {
-                return "No matches.".into();
-            }
-            if hits.len() == 1 {
-                return hits[0].chars().take(100).collect();
-            }
-            format!("{} matches", hits.len())
-        }
-        // Keep a little shell context so test summaries / exit codes remain visible.
-        "shell" => truncate_display(content, 2, 3),
-        _ => {
-            let n = content.lines().filter(|l| !l.trim().is_empty()).count();
-            if n <= 2 {
-                return content.to_string();
-            }
-            // One-line summary for unknown tools.
-            let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-            let first: String = first.chars().take(80).collect();
-            format!("{first}… ({n} lines)")
-        }
-    }
-}
-
-#[cfg(test)]
-mod tool_display_tests {
-    use super::*;
-
-    #[test]
-    fn compact_file_read_is_summary_only() {
-        let mut body = String::new();
-        for i in 151..=188 {
-            body.push_str(&format!("{i}:line {i}\n"));
-        }
-        body.push_str("\nREADME.md:151 (showing lines 151-188 of 188)");
-        let out = compact_tool_result_display("file_read", &body);
-        assert_eq!(out, "README.md:151 (showing lines 151-188 of 188)");
-        assert_eq!(out.lines().count(), 1);
-    }
-
-    #[test]
-    fn compact_glob_is_match_count() {
-        let mut body = String::new();
-        for i in 0..15 {
-            body.push_str(&format!("src/f{i}.rs\n"));
-        }
-        body.push_str("… and 24 more (39 total)");
-        let out = compact_tool_result_display("glob", &body);
-        assert_eq!(out, "39 matches");
-    }
-
-    #[test]
-    fn infer_kind_from_content_when_name_lost() {
-        let body = "1:x\n\nfoo.rs:1 (showing lines 1-1 of 10)";
-        assert_eq!(infer_tool_display_kind("tool", body), "file_read");
-        assert_eq!(
-            infer_tool_display_kind("tool", "a.rs\nb.rs\n2 result(s)"),
-            "glob"
-        );
-    }
-
-    #[test]
-    fn compact_tool_arg_hint_extracts_pattern() {
-        let h = compact_tool_arg_hint(r#"{"pattern":"src/**/*.rs"}"#);
-        assert!(h.contains("pattern=src/**/*.rs"), "{h}");
-    }
 }
 
 

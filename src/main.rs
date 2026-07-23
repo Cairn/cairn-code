@@ -8,10 +8,6 @@ mod agent;
 mod tools;
 mod tui;
 mod markdown;
-mod redact;
-mod theme;
-mod oauth;
-mod notify;
 
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +21,7 @@ use llm::provider;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let version = env!("CARGO_PKG_VERSION");
+    let version = "0.1.0";
     let mut is_print_mode = false;
     let mut initial_prompt: Option<String> = None;
 
@@ -33,14 +29,6 @@ fn main() {
     while i < args.len() {
         match args[i].as_str() {
             "-p" | "--print" => is_print_mode = true,
-            "-h" | "--help" => {
-                print_help(version);
-                return;
-            }
-            "-v" | "--version" => {
-                println!("cairn-code {version}");
-                return;
-            }
             arg if !arg.starts_with('-') => {
                 initial_prompt = Some(arg.to_string());
             }
@@ -58,7 +46,7 @@ fn main() {
         let model = if model_name.is_empty() { p.default_model().to_string() } else { model_name };
         (provider_name, model)
     } else {
-        ("anthropic".to_string(), "claude-sonnet-4-20250514".to_string())
+        ("opencode".to_string(), "deepseek-v4-flash-free".to_string())
     };
 
     let chosen_provider = providers.remove(&p_name).unwrap_or_else(|| {
@@ -78,17 +66,12 @@ fn main() {
     let (perm_tx, perm_rx) = mpsc::channel::<String>();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel2 = cancel.clone();
-    let live_mirror = session::new_live_mirror();
-    let live_mirror_agent = live_mirror.clone();
 
     let p_model_for_agent = p_model.clone();
     let p_model_for_print = p_model.clone();
-    let theme_name = cfg.theme.clone();
-    let show_thinking = cfg.show_thinking;
 
     thread::spawn(move || {
         let mut agent = Agent::new(chosen_provider, p_model_for_agent, tool_registry, cfg);
-        agent.set_live_mirror(live_mirror_agent);
         loop {
             match cmd_rx.recv() {
                 Ok(cmd) if cmd == "cancel" => {
@@ -115,69 +98,6 @@ fn main() {
                         }
                     }
                 }
-                Ok(cmd) if cmd == "__compact__" => {
-                    match agent.compact_now(&event_tx) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            let _ = event_tx.send(AgentEvent::Error(e));
-                        }
-                    }
-                    let _ = event_tx.send(AgentEvent::Done);
-                }
-                Ok(cmd) if cmd.starts_with("__auth_login__:") => {
-                    let provider = cmd.trim_start_matches("__auth_login__:").to_ascii_lowercase();
-                    let msg = if provider == "xai" {
-                        // Surface the user code before the blocking poll via a system-style error-free path:
-                        // request device code first, emit as text event, then poll.
-                        match crate::oauth::request_xai_device_code() {
-                            Ok(auth) => {
-                                let uri = if !auth.verification_uri_complete.is_empty() {
-                                    auth.verification_uri_complete.clone()
-                                } else {
-                                    auth.verification_uri.clone()
-                                };
-                                let notice = format!(
-                                    "xAI device login\n1. Open: {uri}\n2. Enter code: {}\nWaiting for approval…",
-                                    auth.user_code
-                                );
-                                let _ = event_tx.send(AgentEvent::Text(notice));
-                                crate::oauth::open_url(&uri);
-                                match crate::oauth::poll_xai_device_token(&auth) {
-                                    Ok(token) => {
-                                        match crate::oauth::save_token("xai", &token) {
-                                            Ok(()) => {
-                                                std::env::set_var("XAI_API_KEY", &token.access_token);
-                                                "xAI OAuth login saved to the OS keyring. You can select provider xai now.".to_string()
-                                            }
-                                            Err(e) => format!("Login succeeded but failed to save token: {e}"),
-                                        }
-                                    }
-                                    Err(e) => format!("xAI OAuth failed: {e}"),
-                                }
-                            }
-                            Err(e) => format!("xAI OAuth failed: {e}"),
-                        }
-                    } else {
-                        format!("OAuth login is not implemented for '{provider}'. Supported: xai")
-                    };
-                    let _ = event_tx.send(AgentEvent::Text(format!("\n{msg}\n")));
-                    let _ = event_tx.send(AgentEvent::Done);
-                }
-                Ok(cmd) if cmd.starts_with("__auth_logout__:") => {
-                    let provider = cmd.trim_start_matches("__auth_logout__:").to_ascii_lowercase();
-                    let msg = match crate::oauth::delete_token(&provider) {
-                        Ok(true) => format!("Removed OAuth login for {provider}."),
-                        Ok(false) => format!("No OAuth login stored for {provider}."),
-                        Err(e) => format!("Logout failed: {e}"),
-                    };
-                    let _ = event_tx.send(AgentEvent::Text(format!("\n{msg}\n")));
-                    let _ = event_tx.send(AgentEvent::Done);
-                }
-                Ok(cmd) if cmd == "__auth_status__" => {
-                    let lines = [crate::oauth::status_line("xai")];
-                    let _ = event_tx.send(AgentEvent::Text(format!("\n{}\n", lines.join("\n"))));
-                    let _ = event_tx.send(AgentEvent::Done);
-                }
                 Ok(prompt) => {
                     cancel2.store(false, Ordering::Relaxed);
                     let _ = agent.run(&prompt, event_tx.clone(), &cancel2, &perm_rx);
@@ -187,15 +107,16 @@ fn main() {
         }
     });
 
-    config::hydrate_env_from_keyring();
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        if let Some(key) = config::config_get_api_key("openrouter") {
+            std::env::set_var("OPENROUTER_API_KEY", key);
+        }
+    }
 
     let mut tui = tui::Tui::new(version, &p_model_for_print, &provider_name_str, &work_dir);
-    tui.set_theme_name(&theme_name);
-    tui.set_show_thinking(show_thinking);
     tui.set_agent_tx(cmd_tx.clone());
     tui.set_perm_tx(perm_tx);
     tui.set_cancel_flag(cancel);
-    tui.set_live_mirror(live_mirror);
     tui.set_picker_models(models);
 
     if is_print_mode {
@@ -259,25 +180,4 @@ fn main() {
     }
 
     let _ = tui.run(event_rx);
-}
-
-fn print_help(version: &str) {
-    println!("cairn-code {version}");
-    println!("An AI coding agent for your terminal.");
-    println!();
-    println!("USAGE:");
-    println!("    cairn-code [OPTIONS] [PROMPT]");
-    println!();
-    println!("OPTIONS:");
-    println!("    -p, --print       Run PROMPT once non-interactively, print the result, and exit");
-    println!("    -h, --help        Print this help message and exit");
-    println!("    -v, --version     Print version information and exit");
-    println!();
-    println!("ENV:");
-    println!("    CAIRN_PROVIDER    Override the configured default provider");
-    println!("    CAIRN_MODEL       Override the configured default model");
-    println!();
-    println!("With no PROMPT, cairn-code starts the interactive TUI.");
-    println!("With PROMPT but no -p, it starts the TUI and sends PROMPT as the first message.");
-    println!("With PROMPT and -p, it runs once non-interactively and exits.");
 }
