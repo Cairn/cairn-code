@@ -1,4 +1,10 @@
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, File, OpenOptions},
+};
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use super::registry::Tool;
 
@@ -19,6 +25,15 @@ impl Tool for MemoryTool {
             ))
             .unwrap_or(false)
     }
+    fn permission_key(&self, input: &str) -> String {
+        let action = crate::json::parse(input)
+            .ok()
+            .and_then(|value| value.get("action")?.as_str().map(str::to_owned));
+        match action.as_deref() {
+            Some(action @ ("save" | "delete")) => format!("memory:{action}"),
+            _ => self.name().to_string(),
+        }
+    }
 
     fn input_schema(&self) -> String {
         r#"{"type":"object","properties":{"action":{"type":"string","enum":["save","recall","list","delete","search"]},"key":{"type":"string"},"content":{"type":"string"},"query":{"type":"string"}},"required":["action"]}"#.into()
@@ -35,35 +50,37 @@ impl Tool for MemoryTool {
             "save" => {
                 let key = obj.get("key").and_then(|v| v.as_str()).ok_or("key required for save")?;
                 let content = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
-                let path = memory_path(&dir, key)?;
+                let root = open_memory_dir(&dir, true)?;
+                let name = memory_file_name(key)?;
                 let now = timestamp();
-                let (created, existing_content) = if path.exists() {
-                    if let Ok(existing) = fs::read_to_string(&path) {
+                let (created, existing_content) = match read_memory_file(&root, &name, key) {
+                    Ok(existing) => {
                         let c = parse_frontmatter(&existing);
                         (c.0, c.1)
-                    } else {
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         (now.clone(), String::new())
                     }
-                } else {
-                    (now.clone(), String::new())
+                    Err(_) => {
+                        (now.clone(), String::new())
+                    }
                 };
                 let body = if content.is_empty() { &existing_content } else { content };
                 let out = format!("---\nkey: {key}\ncreated_at: {created}\nupdated_at: {now}\n---\n\n{body}");
-                fs::write(&path, &out).map_err(|e| format!("write: {e}"))?;
+                let mut options = OpenOptions::new();
+                options.write(true).create(true).truncate(true);
+                let mut file = open_memory_file(&root, &name, key, &options)
+                    .map_err(|e| format!("write: {e}"))?;
+                file.write_all(out.as_bytes()).map_err(|e| format!("write: {e}"))?;
                 Ok(format!("Saved memory '{}'", key))
             }
             "recall" => {
                 let key = obj.get("key").and_then(|v| v.as_str()).ok_or("key required for recall")?;
-                validate_memory_key(key)?;
                 if !dir.exists() {
                     return Err(format!("Memory '{}' not found", key));
                 }
-                let path = memory_path(&dir, key)?;
-                if !path.exists() {
-                    return Err(format!("Memory '{}' not found", key));
-                }
-                let content = fs::read_to_string(&path).map_err(|e| format!("read: {e}"))?;
+                let root = open_memory_dir(&dir, false)?;
+                let content = read_memory(&root, key)?;
                 let (_, body) = parse_frontmatter(&content);
                 Ok(format!("---\n{}\n{}", key, body.trim()))
             }
@@ -73,17 +90,16 @@ impl Tool for MemoryTool {
                     return Ok("No memories found.".to_string());
                 }
                 let mut entries: Vec<String> = Vec::new();
-                let read_dir = fs::read_dir(&dir).map_err(|e| format!("read dir: {e}"))?;
-                for entry in read_dir {
+                let root = open_memory_dir(&dir, false)?;
+                for entry in root.entries().map_err(|e| format!("read dir: {e}"))? {
                     let entry = entry.map_err(|e| format!("entry: {e}"))?;
                     let name = entry.file_name().to_string_lossy().to_string();
                     if let Some(key) = name.strip_suffix(".md") {
-                        let path = match memory_path(&dir, key) {
-                            Ok(path) => path,
-                            Err(_) => continue,
-                        };
-                        if !query.is_empty() {
-                            if let Ok(content) = fs::read_to_string(path) {
+                        if memory_file_name(key).is_err() { continue; }
+                        if query.is_empty() {
+                            if validate_memory_file(&root, &name, key).is_err() { continue; }
+                        } else {
+                            if let Ok(content) = read_memory(&root, key) {
                                 if !content.contains(query) { continue; }
                             } else { continue; }
                         }
@@ -97,15 +113,19 @@ impl Tool for MemoryTool {
             }
             "delete" => {
                 let key = obj.get("key").and_then(|v| v.as_str()).ok_or("key required for delete")?;
-                validate_memory_key(key)?;
                 if !dir.exists() {
                     return Err(format!("Memory '{}' not found", key));
                 }
-                let path = memory_path(&dir, key)?;
-                if !path.exists() {
-                    return Err(format!("Memory '{}' not found", key));
-                }
-                fs::remove_file(&path).map_err(|e| format!("delete: {e}"))?;
+                let root = open_memory_dir(&dir, false)?;
+                let name = memory_file_name(key)?;
+                reject_symlink(&root, &name, key)?;
+                root.remove_file(&name).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        format!("Memory '{}' not found", key)
+                    } else {
+                        format!("delete: {e}")
+                    }
+                })?;
                 Ok(format!("Deleted memory '{}'", key))
             }
             "search" => {
@@ -115,16 +135,13 @@ impl Tool for MemoryTool {
                     return Ok("No memories match query.".to_string());
                 }
                 let mut results: Vec<(String, String)> = Vec::new();
-                let read_dir = fs::read_dir(&dir).map_err(|e| format!("read dir: {e}"))?;
-                for entry in read_dir {
+                let root = open_memory_dir(&dir, false)?;
+                for entry in root.entries().map_err(|e| format!("read dir: {e}"))? {
                     let entry = entry.map_err(|e| format!("entry: {e}"))?;
                     let name = entry.file_name().to_string_lossy().to_string();
                     if let Some(key) = name.strip_suffix(".md") {
-                        let path = match memory_path(&dir, key) {
-                            Ok(path) => path,
-                            Err(_) => continue,
-                        };
-                        if let Ok(content) = fs::read_to_string(path) {
+                        if memory_file_name(key).is_err() { continue; }
+                        if let Ok(content) = read_memory(&root, key) {
                             let (_, body) = parse_frontmatter(&content);
                             if body.contains(query) || key.contains(query) {
                                 let preview: String = body.chars().take(200).collect();
@@ -160,27 +177,89 @@ fn validate_memory_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn memory_path(dir: &Path, key: &str) -> Result<PathBuf, String> {
+fn memory_file_name(key: &str) -> Result<String, String> {
     validate_memory_key(key)?;
+    Ok(format!("{key}.md"))
+}
 
-    let root = dir.canonicalize().map_err(|e| format!("resolve memory directory: {e}"))?;
-    let path = root.join(format!("{key}.md"));
+fn open_memory_dir(dir: &Path, create: bool) -> Result<Dir, String> {
+    let parent_path = dir.parent().ok_or("memory directory has no parent")?;
+    let name = dir.file_name().ok_or("memory directory has no name")?;
+    if create && !parent_path.exists() {
+        fs::create_dir_all(parent_path).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    let parent = Dir::open_ambient_dir(parent_path, ambient_authority())
+        .map_err(|e| format!("open memory directory parent: {e}"))?;
+    if create {
+        match parent.create_dir(name) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("mkdir: {error}")),
+        }
+    }
+    parent.open_dir_nofollow(name).map_err(|e| format!("open memory directory: {e}"))
+}
 
-    match fs::symlink_metadata(&path) {
+fn reject_symlink(root: &Dir, name: &str, key: &str) -> Result<(), String> {
+    match root.symlink_metadata(name) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
                 return Err(format!("refusing to follow symlink for memory '{key}'"));
-            }
-            let resolved = path.canonicalize().map_err(|e| format!("resolve memory: {e}"))?;
-            if !resolved.starts_with(&root) {
-                return Err(format!("memory '{key}' resolves outside the memory directory"));
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("inspect memory path: {error}")),
     }
+    Ok(())
+}
 
-    Ok(path)
+fn open_memory_file(
+    root: &Dir,
+    name: &str,
+    key: &str,
+    options: &OpenOptions,
+) -> std::io::Result<File> {
+    let mut options = options.clone();
+    options.follow(FollowSymlinks::No);
+    root.open_with(name, &options).map_err(|error| {
+        if root.symlink_metadata(name)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("refusing to follow symlink for memory '{key}'"),
+            )
+        } else {
+            error
+        }
+    })
+}
+
+fn read_memory_file(root: &Dir, name: &str, key: &str) -> std::io::Result<String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    let mut file = open_memory_file(root, name, key, &options)?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+fn validate_memory_file(root: &Dir, name: &str, key: &str) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    open_memory_file(root, name, key, &options).map(|_| ())
+}
+
+fn read_memory(root: &Dir, key: &str) -> Result<String, String> {
+    let name = memory_file_name(key)?;
+    read_memory_file(root, &name, key).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!("Memory '{}' not found", key)
+        } else {
+            format!("read: {e}")
+        }
+    })
 }
 
 fn timestamp() -> String {
@@ -275,22 +354,20 @@ mod tests {
         let tool = MemoryTool;
         assert!(tool.needs_permission_for(r#"{"action":"save","key":"test"}"#));
         assert!(tool.needs_permission_for(r#"{"action":"delete","key":"test"}"#));
+        assert_eq!(tool.permission_key(r#"{"action":"save","key":"test"}"#), "memory:save");
+        assert_eq!(tool.permission_key(r#"{"action":"delete","key":"test"}"#), "memory:delete");
         assert!(!tool.needs_permission_for(r#"{"action":"recall","key":"test"}"#));
+        assert_eq!(tool.permission_key(r#"{"action":"recall","key":"test"}"#), "memory");
         assert!(!tool.needs_permission_for(r#"{"action":"list"}"#));
         assert!(!tool.needs_permission_for("invalid"));
     }
 
     #[test]
-    fn test_memory_path_rejects_unsafe_keys() {
-        let dir = temp_path("key-test");
-        fs::create_dir_all(&dir).unwrap();
-
+    fn test_memory_file_name_rejects_unsafe_keys() {
         for key in ["", "../secret", "..\\secret", "nested/key", "nested\\key", ".", "two words"] {
-            assert!(memory_path(&dir, key).is_err(), "accepted unsafe key: {key}");
+            assert!(memory_file_name(key).is_err(), "accepted unsafe key: {key}");
         }
-        assert!(memory_path(&dir, "safe-key_123").is_ok());
-
-        let _ = fs::remove_dir_all(dir);
+        assert_eq!(memory_file_name("safe-key_123").unwrap(), "safe-key_123.md");
     }
 
     #[cfg(unix)]
@@ -305,8 +382,29 @@ mod tests {
         fs::write(&outside, "secret").unwrap();
         symlink(&outside, dir.join("linked.md")).unwrap();
 
-        let error = memory_path(&dir, "linked").unwrap_err();
+        let root = open_memory_dir(&dir, false).unwrap();
+        let error = read_memory(&root, "linked").unwrap_err();
         assert!(error.contains("symlink"), "unexpected error: {error}");
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_directory_capability_blocks_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_path("symlink-swap-test");
+        let dir = base.join("memory");
+        let outside = base.join("outside.md");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&outside, "secret").unwrap();
+
+        let root = open_memory_dir(&dir, false).unwrap();
+        reject_symlink(&root, "linked.md", "linked").unwrap();
+        symlink(&outside, dir.join("linked.md")).unwrap();
+
+        assert!(read_memory_file(&root, "linked.md", "linked").is_err());
 
         let _ = fs::remove_dir_all(base);
     }
@@ -331,7 +429,8 @@ mod tests {
             .unwrap();
         assert!(status.success(), "failed to create test junction");
 
-        let error = memory_path(&dir, "linked").unwrap_err();
+        let root = open_memory_dir(&dir, false).unwrap();
+        let error = read_memory(&root, "linked").unwrap_err();
         assert!(
             error.contains("outside") || error.contains("symlink"),
             "unexpected error: {error}"
