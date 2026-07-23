@@ -18,8 +18,6 @@ pub struct LiveSnapshot {
 
 pub type LiveMirror = Arc<Mutex<LiveSnapshot>>;
 
-static LAST_SESSION_ID: AtomicU64 = AtomicU64::new(0);
-
 pub fn new_live_mirror() -> LiveMirror {
     Arc::new(Mutex::new(LiveSnapshot::default()))
 }
@@ -35,18 +33,18 @@ pub struct Session {
     pub updated_at: u64,
 }
 
+static ID_SEQ: AtomicU64 = AtomicU64::new(0);
+
 pub fn new_id() -> String {
-    let now = SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos() as u64;
-    let nanos = LAST_SESSION_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
-            Some(now.max(last.saturating_add(1)))
-        })
-        .map(|last| now.max(last.saturating_add(1)))
-        .unwrap_or(now);
-    format!("{:016x}", nanos)
+        .as_nanos();
+    // Clock resolution on some CI runners is coarser than back-to-back calls,
+    // so fold in a process-local counter to guarantee uniqueness even when
+    // two calls land on the same nanosecond.
+    let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{:016x}{:04x}", nanos, seq & 0xffff)
 }
 
 pub fn save(sessions_dir: &str, session: &Session) -> Result<(), String> {

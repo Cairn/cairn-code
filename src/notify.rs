@@ -4,6 +4,7 @@
 //! available. Disable with `CAIRN_SOUND=0` (or `false` / `off` / `no`).
 
 use std::io::{self, Write};
+#[cfg(any(windows, target_os = "macos"))]
 use std::process::{Command, Stdio};
 use std::thread;
 #[cfg(all(unix, not(target_os = "macos")))]
