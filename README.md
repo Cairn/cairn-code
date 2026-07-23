@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/banner.png" alt="Cairn Code" width="560">
+</p>
+
 # Cairn Code
 
 [![CI](https://github.com/Cairn/cairn-code/actions/workflows/ci.yml/badge.svg)](https://github.com/Cairn/cairn-code/actions/workflows/ci.yml)

@@ -1,33 +1,53 @@
+use super::registry::Tool;
+use super::workspace::Workspace;
+use cap_std::fs::Dir;
+#[cfg(test)]
 use std::fs;
 use std::path::Path;
-use super::registry::Tool;
 
 /// Cap listed paths so broad globs (`src/**/*.rs`) do not flood the transcript.
 /// The total count is always reported so the model knows the full match size.
 const MAX_LISTED_PATHS: usize = 15;
 
-pub struct GlobTool;
+pub struct GlobTool {
+    workspace: Workspace,
+}
+
+impl GlobTool {
+    pub fn new(workspace: Workspace) -> Self {
+        Self { workspace }
+    }
+}
 
 impl Tool for GlobTool {
-    fn name(&self) -> &str { "glob" }
+    fn name(&self) -> &str {
+        "glob"
+    }
     fn description(&self) -> &str {
         "Find files matching a glob pattern (supports **, *). \
          Returns a compact path list (capped) plus the total match count."
     }
-    fn needs_permission(&self) -> bool { false }
+    fn needs_permission(&self) -> bool {
+        false
+    }
 
     fn input_schema(&self) -> String {
-        r#"{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}"#.into()
+        r#"{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}"#
+            .into()
     }
 
     fn execute(&self, input: &str) -> Result<String, String> {
         let val = crate::json::parse(input).map_err(|e| format!("invalid input: {e}"))?;
         let obj = val.as_object().ok_or("expected object")?;
-        let pattern = obj.get("pattern").and_then(|v| v.as_str()).ok_or("pattern required")?;
+        let pattern = obj
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .ok_or("pattern required")?;
 
-        let mut results = glob_match(pattern, ".")?;
+        let mut results = glob_match(pattern, &self.workspace)?;
         // Stable order keeps caps deterministic across runs.
         results.sort();
+        results.dedup();
 
         Ok(format_glob_results(&results, MAX_LISTED_PATHS))
     }
@@ -55,30 +75,27 @@ pub(crate) fn format_glob_results(results: &[String], max_listed: usize) -> Stri
     out
 }
 
-pub(crate) fn glob_match(pattern: &str, base_dir: &str) -> Result<Vec<String>, String> {
-    let mut results = Vec::new();
-    let base = Path::new(base_dir);
-
-    // Split pattern into parts
-    let parts: Vec<&str> = pattern.split('/').collect();
-
-    // If pattern starts with **, we just need to match the rest
-    if parts.len() == 1 && !parts[0].contains('*') && !parts[0].contains('?') {
-        let path = base.join(parts[0]);
-        if path.exists() {
-            results.push(path.to_string_lossy().to_string());
-        }
-        return Ok(results);
+pub(crate) fn glob_match(pattern: &str, workspace: &Workspace) -> Result<Vec<String>, String> {
+    if Path::new(pattern).is_absolute() {
+        return Err(format!(
+            "refusing to access '{pattern}': outside the workspace"
+        ));
     }
 
-    walk_pattern(base, &parts, 0, String::new(), &mut results)?;
+    let pattern = workspace.relative_path(pattern)?;
+    let mut results = Vec::new();
+    let parts: Vec<String> = pattern
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    walk_pattern(workspace.dir(), &parts, 0, String::new(), &mut results)?;
 
     Ok(results)
 }
 
 fn walk_pattern(
-    dir: &Path,
-    parts: &[&str],
+    dir: &Dir,
+    parts: &[String],
     idx: usize,
     prefix: String,
     results: &mut Vec<String>,
@@ -87,7 +104,7 @@ fn walk_pattern(
         return Ok(());
     }
 
-    let part = parts[idx];
+    let part = &parts[idx];
     let is_last = idx == parts.len() - 1;
 
     if part == "**" {
@@ -103,13 +120,21 @@ fn walk_pattern(
         // ** followed by more pattern - try at current level and subdirs
         walk_pattern(dir, rest, 0, prefix.clone(), results)?;
 
-        if let Ok(entries) = fs::read_dir(dir) {
+        if let Ok(entries) = dir.entries() {
             for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    let new_prefix = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
-                    walk_pattern(&path, parts, idx, new_prefix, results)?;
+                    let new_prefix = if prefix.is_empty() {
+                        name
+                    } else {
+                        format!("{prefix}/{name}")
+                    };
+                    if let Ok(child) = entry.open_dir() {
+                        walk_pattern(&child, parts, idx, new_prefix, results)?;
+                    }
                 }
             }
         }
@@ -122,47 +147,99 @@ fn walk_pattern(
             .replace('?', ".");
         let re = regex_wrapper(&re_pattern)?;
 
-        if let Ok(entries) = fs::read_dir(dir) {
+        if let Ok(entries) = dir.entries() {
             for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
                 let name = entry.file_name().to_string_lossy().to_string();
                 if re.is_full_match(&name) {
-                    let new_prefix = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
-                    let path = entry.path();
-                    if is_last || path.is_dir() {
+                    let new_prefix = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{prefix}/{name}")
+                    };
+                    if is_last || file_type.is_dir() {
                         results.push(new_prefix);
                     }
-                    if !is_last && path.is_dir() {
-                        walk_pattern(&path, parts, idx + 1, if prefix.is_empty() { name } else { format!("{prefix}/{name}") }, results)?;
+                    if !is_last && file_type.is_dir() {
+                        if let Ok(child) = entry.open_dir() {
+                            walk_pattern(
+                                &child,
+                                parts,
+                                idx + 1,
+                                if prefix.is_empty() {
+                                    name
+                                } else {
+                                    format!("{prefix}/{name}")
+                                },
+                                results,
+                            )?;
+                        }
                     }
                 }
             }
         }
     } else {
         // Literal component
-        let child = dir.join(part);
-        let new_prefix = if prefix.is_empty() { part.to_string() } else { format!("{prefix}/{part}") };
+        let new_prefix = if prefix.is_empty() {
+            part.to_string()
+        } else {
+            format!("{prefix}/{part}")
+        };
 
-        if is_last {
-            if child.exists() {
-                results.push(new_prefix);
+        if let Ok(entries) = dir.entries() {
+            for entry in entries.flatten() {
+                if !names_equal(&entry.file_name(), part) {
+                    continue;
+                }
+                if is_last {
+                    results.push(new_prefix);
+                } else if entry
+                    .file_type()
+                    .map(|file_type| file_type.is_dir())
+                    .unwrap_or(false)
+                {
+                    if let Ok(child) = entry.open_dir() {
+                        walk_pattern(&child, parts, idx + 1, new_prefix, results)?;
+                    }
+                }
+                break;
             }
-        } else if child.is_dir() {
-            walk_pattern(&child, parts, idx + 1, new_prefix, results)?;
         }
     }
 
     Ok(())
 }
 
-fn walk_dir_recursive(dir: &Path, prefix: &str, results: &mut Vec<String>) -> Result<(), String> {
-    if let Ok(entries) = fs::read_dir(dir) {
+fn names_equal(actual: &std::ffi::OsStr, expected: &str) -> bool {
+    #[cfg(windows)]
+    {
+        actual.to_string_lossy().eq_ignore_ascii_case(expected)
+    }
+    #[cfg(not(windows))]
+    {
+        actual == expected
+    }
+}
+
+fn walk_dir_recursive(dir: &Dir, prefix: &str, results: &mut Vec<String>) -> Result<(), String> {
+    if let Ok(entries) = dir.entries() {
         for entry in entries.flatten() {
-            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             let name = entry.file_name().to_string_lossy().to_string();
-            let new_prefix = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
-            results.push(new_prefix);
-            if path.is_dir() {
-                walk_dir_recursive(&path, &format!("{prefix}/{name}"), results)?;
+            let new_prefix = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            results.push(new_prefix.clone());
+            if file_type.is_dir() {
+                if let Ok(child) = entry.open_dir() {
+                    walk_dir_recursive(&child, &new_prefix, results)?;
+                }
             }
         }
     }
@@ -190,11 +267,13 @@ mod tests {
     #[test]
     fn finds_rs_files() {
         let dir = temp_tree();
-        let dir_s = dir.to_string_lossy().replace('\\', "/");
+        let workspace = Workspace::new(&dir).unwrap();
         // Single-level wildcard (more reliable across path styles than `**` alone).
-        let results = glob_match("src/*.rs", &dir_s).unwrap();
+        let results = glob_match("src/*.rs", &workspace).unwrap();
         assert!(
-            results.iter().any(|p| p.replace('\\', "/").ends_with("src/main.rs") || p.contains("main.rs")),
+            results
+                .iter()
+                .any(|p| p.replace('\\', "/").ends_with("src/main.rs") || p.contains("main.rs")),
             "src/*.rs => {results:?}"
         );
         assert!(
@@ -202,11 +281,61 @@ mod tests {
             "src/*.rs => {results:?}"
         );
         // Recursive form
-        let deep = glob_match("**/*.rs", &dir_s).unwrap();
+        let deep = glob_match("**/*.rs", &workspace).unwrap();
         assert!(
             deep.iter().any(|p| p.contains("main.rs")),
             "**/*.rs => {deep:?}"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dot_prefix_does_not_suppress_matches() {
+        let dir = temp_tree();
+        let workspace = Workspace::new(&dir).unwrap();
+
+        let results = glob_match("./*.md", &workspace).unwrap();
+        assert_eq!(results, vec!["README.md"]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recursive_wildcards_visit_directories_for_each_pattern_state() {
+        let dir = temp_tree();
+        fs::create_dir_all(dir.join("deep/src")).unwrap();
+        fs::write(dir.join("deep/src/deep.rs"), "").unwrap();
+        let workspace = Workspace::new(&dir).unwrap();
+
+        let results = glob_match("**/*/*.rs", &workspace).unwrap();
+        assert!(
+            results.iter().any(|path| path == "deep/src/deep.rs"),
+            "{results:?}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn repeated_recursive_wildcards_do_not_duplicate_results() {
+        let dir = temp_tree();
+        let tool = GlobTool::new(Workspace::new(&dir).unwrap());
+
+        let output = tool.execute(r#"{"pattern":"**/**/main.rs"}"#).unwrap();
+        assert_eq!(output.matches("src/main.rs").count(), 1, "{output}");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn literal_components_use_windows_case_insensitive_lookup() {
+        let dir = temp_tree();
+        let workspace = Workspace::new(&dir).unwrap();
+
+        let results = glob_match("readme.md", &workspace).unwrap();
+        assert_eq!(results, vec!["readme.md"]);
+
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -222,15 +351,15 @@ mod tests {
     #[test]
     fn literal_path() {
         let dir = temp_tree();
-        let dir_s = dir.to_string_lossy().replace('\\', "/");
-        let results = glob_match("README.md", &dir_s).unwrap();
+        let workspace = Workspace::new(&dir).unwrap();
+        let results = glob_match("README.md", &workspace).unwrap();
         assert_eq!(results.len(), 1);
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn execute_no_matches() {
-        let tool = GlobTool;
+        let tool = GlobTool::new(Workspace::current().unwrap());
         let out = tool
             .execute(r#"{"pattern":"**/totally_missing_file_xyz_123.nope"}"#)
             .unwrap();
@@ -239,7 +368,134 @@ mod tests {
 
     #[test]
     fn requires_pattern() {
-        assert!(GlobTool.execute("{}").is_err());
+        let tool = GlobTool::new(Workspace::current().unwrap());
+        assert!(tool.execute("{}").is_err());
+    }
+
+    #[test]
+    fn rejects_absolute_and_parent_patterns() {
+        let dir = temp_tree();
+        let workspace = Workspace::new(&dir).unwrap();
+        let tool = GlobTool::new(workspace);
+        let absolute = format!(
+            r#"{{"pattern":"{}/*"}}"#,
+            dir.parent()
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "\\\\")
+        );
+
+        assert!(tool
+            .execute(&absolute)
+            .unwrap_err()
+            .contains("outside the workspace"));
+        assert!(tool
+            .execute(r#"{"pattern":"../*"}"#)
+            .unwrap_err()
+            .contains("outside the workspace"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recursive_glob_skips_directory_link_escape() {
+        let workspace_dir = temp_tree();
+        let outside = workspace_dir.parent().unwrap().join(format!(
+            "cairn-glob-outside-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "escaped secret").unwrap();
+        let link = workspace_dir.join("escape");
+
+        assert!(
+            create_dir_link(&outside, &link),
+            "failed to create test link"
+        );
+
+        let workspace = Workspace::new(&workspace_dir).unwrap();
+        let results = glob_match("**/*", &workspace).unwrap();
+        assert!(
+            !results.iter().any(|path| path.contains("secret.txt")),
+            "{results:?}"
+        );
+
+        let _ = fs::remove_dir_all(workspace_dir);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn recursive_glob_does_not_follow_link_cycles() {
+        let workspace_dir = temp_tree();
+        assert!(
+            create_dir_link(&workspace_dir, &workspace_dir.join("loop")),
+            "failed to create test link"
+        );
+
+        let workspace = Workspace::new(&workspace_dir).unwrap();
+        let results = glob_match("**", &workspace).unwrap();
+        assert!(results.iter().any(|path| path == "loop"), "{results:?}");
+        assert!(
+            !results.iter().any(|path| path.starts_with("loop/")),
+            "{results:?}"
+        );
+        assert!(
+            !results.iter().any(|path| path.starts_with('/')),
+            "{results:?}"
+        );
+
+        let _ = fs::remove_dir_all(workspace_dir);
+    }
+
+    #[test]
+    fn recursive_glob_does_not_follow_cycles_below_pattern_components() {
+        let workspace_dir = temp_tree();
+        let src = workspace_dir.join("src");
+        assert!(
+            create_dir_link(&src, &src.join("loop")),
+            "failed to create test link"
+        );
+
+        let workspace = Workspace::new(&workspace_dir).unwrap();
+        for pattern in ["src/**", "*/**"] {
+            let results = glob_match(pattern, &workspace).unwrap();
+            assert!(
+                !results.iter().any(|path| path.contains("loop/main.rs")),
+                "{pattern} => {results:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(workspace_dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accepts_native_windows_separators_and_rejects_backslash_parent() {
+        let dir = temp_tree();
+        let workspace = Workspace::new(&dir).unwrap();
+        assert!(!glob_match(r"src\*.rs", &workspace).unwrap().is_empty());
+        assert!(glob_match(r"..\*", &workspace)
+            .unwrap_err()
+            .contains("outside the workspace"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    fn create_dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn create_dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
 
     #[test]
@@ -248,7 +504,10 @@ mod tests {
         let out = format_glob_results(&paths, 15);
         assert!(out.contains("src/f0.rs"), "{out}");
         assert!(out.contains("src/f14.rs"), "{out}");
-        assert!(!out.contains("src/f15.rs"), "should not list past cap: {out}");
+        assert!(
+            !out.contains("src/f15.rs"),
+            "should not list past cap: {out}"
+        );
         assert!(out.contains("… and 25 more (40 total)"), "{out}");
         // Compact: cap + summary, not 40 path lines.
         let path_lines = out.lines().filter(|l| l.starts_with("src/")).count();
@@ -272,8 +531,8 @@ struct SimpleRe {
 
 enum Segment {
     Literal(String),
-    AnySeq,     // .*
-    AnyChar,    // .
+    AnySeq,  // .*
+    AnyChar, // .
 }
 
 impl SimpleRe {
