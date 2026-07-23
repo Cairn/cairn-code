@@ -1228,7 +1228,9 @@ impl Tui {
                 self.input_buf.clear(); self.cursor = 0;
                 if input.is_empty() { return true; }
 
-                if input.starts_with('/') { self.handle_command(&input); return true; }
+                if input.starts_with('/') {
+                    return self.handle_command(&input);
+                }
 
                 self.history.push(input.clone());
                 self.hist_idx = self.history.len();
@@ -1301,9 +1303,11 @@ impl Tui {
         }
     }
 
-    fn handle_command(&mut self, cmd: &str) {
+    fn handle_command(&mut self, cmd: &str) -> bool {
         let parts: Vec<&str> = cmd.split_whitespace().collect();
-        if parts.is_empty() { return; }
+        if parts.is_empty() {
+            return true;
+        }
 
         match parts[0] {
             "/clear" => {
@@ -1331,7 +1335,7 @@ impl Tui {
                             tool_name: String::new(),
                             duration: String::new(),
                         });
-                        return;
+                        return true;
                     }
                     None => !self.show_thinking,
                 };
@@ -1363,7 +1367,7 @@ impl Tui {
                             tool_name: String::new(),
                             duration: String::new(),
                         });
-                        return;
+                        return true;
                     }
                     None => !self.show_suggestions,
                 };
@@ -1396,7 +1400,7 @@ impl Tui {
                             tool_name: String::new(),
                             duration: String::new(),
                         });
-                        return;
+                        return true;
                     }
                     None => !self.mouse_capture,
                 };
@@ -1430,7 +1434,7 @@ impl Tui {
                             tool_name: String::new(),
                             duration: String::new(),
                         });
-                        return;
+                        return true;
                     }
                 };
                 self.pending_select = Some(kind);
@@ -1611,7 +1615,7 @@ impl Tui {
                 }
             }
             "/exit" | "/quit" | "/q" => {
-                std::process::exit(0);
+                return false;
             }
             _ => {
                 self.output_lines.push(OutputLine {
@@ -1621,6 +1625,7 @@ impl Tui {
                 });
             }
         }
+        true
     }
 
     fn sessions_dir(&self) -> String {
@@ -3518,6 +3523,26 @@ mod provider_privacy_tests {
         assert!(cancelled.load(Ordering::Relaxed));
         assert!(matches!(tui.state, State::Running));
         assert!(rx.try_recv().is_err(), "cancellation must not leave a stale command queued");
+    }
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn exit_commands_stop_the_event_loop() {
+        for command in ["/exit", "/quit", "/q"] {
+            let mut tui = Tui::new("test", "test-model", "test-provider", ".");
+            tui.input_buf = command.into();
+            tui.cursor = tui.input_buf.len();
+
+            assert!(
+                !tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                "{command} should request normal event-loop termination"
+            );
+        }
     }
 }
 
