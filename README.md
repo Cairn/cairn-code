@@ -74,6 +74,8 @@ can select provider, model, token/turn limits, and display preferences, but they
 cannot change tool permissions or credentials. Add a workspace's absolute path
 to the user-owned `trusted_workspaces` list before Cairn will load its `CAIRN.md`
 or `system_prompt_file`; project prompt files must resolve inside that workspace.
+Relative user-config prompt paths resolve from the user config directory, not
+from the current repository.
 
 ### Run
 

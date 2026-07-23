@@ -112,24 +112,26 @@ fn load_for_workspace(user_path: &Path, workspace: &Path) -> Config {
         .as_deref()
         .and_then(|content| crate::json::parse(content).ok())
         .and_then(|value| value.as_object().cloned())
-        .is_some_and(|obj| {
+        .and_then(|obj| {
             obj.get("system_prompt_file")
                 .and_then(|v| v.as_str())
-                .is_some()
+                .map(str::to_owned)
         });
 
     // The default CAIRN.md belongs to the repository, not the user. Do not load
     // it until the user has explicitly trusted this workspace.
-    if !user_selected_prompt {
-        cfg.system_prompt_file.clear();
-    }
+    cfg.system_prompt_file = user_selected_prompt
+        .as_deref()
+        .and_then(|prompt| resolve_user_prompt(user_path, prompt))
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
 
     let trusted = user_content
         .as_deref()
         .is_some_and(|content| workspace_is_trusted(content, workspace));
     let project_path = workspace.join(".cairn/config.json");
     let Some(project_content) = fs::read_to_string(project_path).ok() else {
-        if trusted && !user_selected_prompt {
+        if trusted && user_selected_prompt.is_none() {
             if let Some(path) = resolve_workspace_prompt(workspace, "CAIRN.md") {
                 cfg.system_prompt_file = path.to_string_lossy().into_owned();
             }
@@ -151,7 +153,7 @@ fn load_for_workspace(user_path: &Path, workspace: &Path) -> Config {
             if let Some(path) = resolve_workspace_prompt(workspace, prompt) {
                 cfg.system_prompt_file = path.to_string_lossy().into_owned();
             }
-        } else if !user_selected_prompt {
+        } else if user_selected_prompt.is_none() {
             if let Some(path) = resolve_workspace_prompt(workspace, "CAIRN.md") {
                 cfg.system_prompt_file = path.to_string_lossy().into_owned();
             }
@@ -159,6 +161,17 @@ fn load_for_workspace(user_path: &Path, workspace: &Path) -> Config {
     }
 
     cfg
+}
+
+fn resolve_user_prompt(user_path: &Path, prompt: &str) -> Option<PathBuf> {
+    let prompt = Path::new(prompt);
+    let candidate = if prompt.is_absolute() {
+        prompt.to_path_buf()
+    } else {
+        user_path.parent()?.join(prompt)
+    };
+    let candidate = fs::canonicalize(candidate).ok()?;
+    candidate.is_file().then_some(candidate)
 }
 
 fn apply_project_preferences(cfg: &mut Config, project: &HashMap<String, crate::json::JsonValue>) {
@@ -632,17 +645,16 @@ mod tests {
         let user_path = root.join("user-config.json");
         let user_prompt = root.join("user-prompt.md");
         fs::write(&user_prompt, "user-owned prompt").unwrap();
-        let user_prompt_json = user_prompt.to_string_lossy().replace('\\', "\\\\");
         fs::write(
             &user_path,
-            format!(r#"{{
-                "system_prompt_file": "{user_prompt_json}",
-                "permissions": {{
+            r#"{
+                "system_prompt_file": "user-prompt.md",
+                "permissions": {
                     "auto_allow": ["file_read"],
                     "ask": ["shell"],
                     "deny": ["git"]
-                }}
-            }}"#),
+                }
+            }"#,
         )
         .unwrap();
         fs::write(
@@ -663,6 +675,7 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("outside.md"), "untrusted prompt").unwrap();
+        fs::write(workspace.join("user-prompt.md"), "repository prompt").unwrap();
 
         let cfg = load_for_workspace(&user_path, &workspace);
 
@@ -673,7 +686,10 @@ mod tests {
         assert_eq!(cfg.ask, vec!["shell"]);
         assert_eq!(cfg.deny, vec!["git"]);
         assert!(cfg.api_keys.is_empty());
-        assert_eq!(PathBuf::from(cfg.system_prompt_file), user_prompt);
+        assert_eq!(
+            PathBuf::from(cfg.system_prompt_file),
+            fs::canonicalize(user_prompt).unwrap()
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
