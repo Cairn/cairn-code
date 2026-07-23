@@ -60,29 +60,8 @@ impl Provider for OpenRouterProvider {
     ) -> Result<(Vec<Message>, Usage), String> {
         let key = self.get_key();
         if key.is_empty() { return Err(crate::llm::provider::missing_api_key("OPENROUTER_API_KEY")); }
-
-        let mut mt = if max_tokens == 0 || max_tokens > 4096 {
-            4096
-        } else {
-            max_tokens
-        };
-
-        loop {
-            let body = openrouter_request_body(messages, tools, system, model, true, mt)?;
-            let result = do_stream_request(&key, body, &mut on_chunk, cancel);
-            match result {
-                Err(e) => {
-                    if let Some(affordable) = parse_openrouter_402(&e) {
-                        if affordable < mt {
-                            mt = affordable;
-                            continue;
-                        }
-                    }
-                    return Err(e);
-                }
-                Ok(r) => return Ok(r),
-            }
-        }
+        let body = openrouter_request_body(messages, tools, system, model, true, max_tokens)?;
+        do_stream_request(&key, body, &mut on_chunk, cancel)
     }
 
     fn complete(
@@ -95,29 +74,8 @@ impl Provider for OpenRouterProvider {
     ) -> Result<(Vec<Message>, Usage), String> {
         let key = self.get_key();
         if key.is_empty() { return Err(crate::llm::provider::missing_api_key("OPENROUTER_API_KEY")); }
-
-        let mut mt = if max_tokens == 0 || max_tokens > 4096 {
-            4096
-        } else {
-            max_tokens
-        };
-
-        loop {
-            let body = openrouter_request_body(messages, tools, system, model, false, mt)?;
-            let result = do_complete_request(&key, body);
-            match result {
-                Err(e) => {
-                    if let Some(affordable) = parse_openrouter_402(&e) {
-                        if affordable < mt {
-                            mt = affordable;
-                            continue;
-                        }
-                    }
-                    return Err(e);
-                }
-                Ok(r) => return Ok(r),
-            }
-        }
+        let body = openrouter_request_body(messages, tools, system, model, false, max_tokens)?;
+        do_complete_request(&key, body)
     }
 }
 
@@ -202,22 +160,6 @@ fn parse_openrouter_complete_response(raw: &str) -> Result<(Vec<Message>, Usage)
     crate::llm::openai_compat::parse_complete_response(raw)
 }
 
-fn parse_openrouter_402(err: &str) -> Option<usize> {
-    let lower = err.to_lowercase();
-    if lower.contains("fewer max_tokens") || lower.contains("fewer max tokens") || lower.contains("fewer max_completion_tokens") {
-        return Some(1024);
-    }
-    // "requested up to N tokens, but can only afford M"
-    if let Some(pos) = err.find("but can only afford ") {
-        let after = &err[pos + "but can only afford ".len()..];
-        let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(affordable) = num.parse::<usize>() {
-            return Some(affordable.min(4096).max(1));
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,11 +185,23 @@ mod tests {
         let reg = default_registry();
         let tools: Vec<ToolDefinition> = reg.definitions();
         let msgs = vec![Message { role: "user".into(), content: Content::Text("hello".into()) }];
-        let body = openrouter_request_body(&msgs, &tools, "You are helpful.", "openai/gpt-4o", true, 4096).unwrap();
+        let body = openrouter_request_body(
+            &msgs,
+            &tools,
+            "You are helpful.",
+            "openai/gpt-4o",
+            true,
+            12_345,
+        )
+        .unwrap();
         match crate::json::parse(&body) {
             Ok(v) => {
                 let obj = v.as_object().unwrap();
                 assert_eq!(obj.get("model").and_then(|v| v.as_str()), Some("openai/gpt-4o"));
+                assert_eq!(
+                    obj.get("max_completion_tokens").and_then(|v| v.as_u64()),
+                    Some(12_345)
+                );
                 assert!(obj.get("messages").and_then(|v| v.as_array()).is_some());
                 let tools_arr = obj.get("tools").and_then(|v| v.as_array()).unwrap();
                 assert_eq!(tools_arr.len(), 14);

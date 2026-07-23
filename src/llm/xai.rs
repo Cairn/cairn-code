@@ -84,7 +84,7 @@ impl Provider for XaiProvider {
         tools: &[ToolDefinition],
         system: &str,
         model: &str,
-        _max_tokens: usize,
+        max_tokens: usize,
         mut on_chunk: StreamingCallback,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(Vec<Message>, Usage), String> {
@@ -95,7 +95,7 @@ impl Provider for XaiProvider {
                     .into(),
             );
         }
-        let body = request_body(messages, tools, system, model, true)?;
+        let body = request_body(messages, tools, system, model, max_tokens, true)?;
         let req = http_client::HttpRequest {
             url: CHAT_URL.into(),
             headers: vec![
@@ -149,7 +149,7 @@ impl Provider for XaiProvider {
         tools: &[ToolDefinition],
         system: &str,
         model: &str,
-        _max_tokens: usize,
+        max_tokens: usize,
     ) -> Result<(Vec<Message>, Usage), String> {
         let key = self.get_key();
         if key.is_empty() {
@@ -158,7 +158,7 @@ impl Provider for XaiProvider {
                     .into(),
             );
         }
-        let body = request_body(messages, tools, system, model, false)?;
+        let body = request_body(messages, tools, system, model, max_tokens, false)?;
         let req = http_client::HttpRequest {
             url: CHAT_URL.into(),
             headers: vec![
@@ -193,11 +193,13 @@ fn request_body(
     tools: &[ToolDefinition],
     system: &str,
     model: &str,
+    max_tokens: usize,
     stream: bool,
 ) -> Result<String, String> {
     let (base_model, effort) = parse_model_spec(model);
     let model_esc = openai_compat::escape_json_str(&base_model);
     let mut body = format!("{{\"model\":\"{model_esc}\",\"stream\":{stream}");
+    body.push_str(&format!(",\"max_completion_tokens\":{max_tokens}"));
     if let Some(effort) = effort {
         // Chat Completions: top-level reasoning_effort (xAI / OpenAI-style).
         let e = openai_compat::escape_json_str(&effort);
@@ -521,21 +523,29 @@ mod tests {
 
     #[test]
     fn request_body_includes_reasoning_effort() {
-        let body = request_body(&[], &[], "sys", "grok-4.5:medium", false).unwrap();
+        let body = request_body(&[], &[], "sys", "grok-4.5:medium", 12_345, false).unwrap();
+        let value = crate::json::parse(&body).unwrap();
+        let object = value.as_object().unwrap();
+
         assert!(body.contains("\"model\":\"grok-4.5\""));
         assert!(body.contains("\"reasoning_effort\":\"medium\""));
         assert!(!body.contains("grok-4.5:medium"));
+        assert_eq!(
+            object.get("max_completion_tokens").and_then(|v| v.as_u64()),
+            Some(12_345)
+        );
+        assert!(object.get("max_tokens").is_none());
     }
 
     #[test]
     fn request_body_default_effort_for_45() {
-        let body = request_body(&[], &[], "sys", "grok-4.5", true).unwrap();
+        let body = request_body(&[], &[], "sys", "grok-4.5", 8192, true).unwrap();
         assert!(body.contains("\"reasoning_effort\":\"high\""));
     }
 
     #[test]
     fn request_body_no_effort_for_plain_models() {
-        let body = request_body(&[], &[], "sys", "grok-3", false).unwrap();
+        let body = request_body(&[], &[], "sys", "grok-3", 8192, false).unwrap();
         assert!(!body.contains("reasoning_effort"));
     }
 

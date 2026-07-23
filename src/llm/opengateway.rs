@@ -75,7 +75,7 @@ impl Provider for OpenGatewayProvider {
         tools: &[ToolDefinition],
         system: &str,
         model: &str,
-        _max_tokens: usize,
+        max_tokens: usize,
         mut on_chunk: StreamingCallback,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(Vec<Message>, Usage), String> {
@@ -83,7 +83,7 @@ impl Provider for OpenGatewayProvider {
         if key.is_empty() {
             return Err(crate::llm::provider::missing_api_key("GITLAWB_OPENGATEWAY_API_KEY"));
         }
-        let body = request_body(messages, tools, system, model, true)?;
+        let body = request_body(messages, tools, system, model, max_tokens, true)?;
         let req = http_client::HttpRequest {
             url: CHAT_URL.into(),
             headers: vec![
@@ -125,13 +125,13 @@ impl Provider for OpenGatewayProvider {
         tools: &[ToolDefinition],
         system: &str,
         model: &str,
-        _max_tokens: usize,
+        max_tokens: usize,
     ) -> Result<(Vec<Message>, Usage), String> {
         let key = self.get_key();
         if key.is_empty() {
             return Err(crate::llm::provider::missing_api_key("GITLAWB_OPENGATEWAY_API_KEY"));
         }
-        let body = request_body(messages, tools, system, model, false)?;
+        let body = request_body(messages, tools, system, model, max_tokens, false)?;
         let req = http_client::HttpRequest {
             url: CHAT_URL.into(),
             headers: vec![
@@ -152,9 +152,11 @@ fn request_body(
     tools: &[ToolDefinition],
     system: &str,
     model: &str,
+    max_tokens: usize,
     stream: bool,
 ) -> Result<String, String> {
     let mut body = format!("{{\"model\":\"{model}\",\"stream\":{stream}");
+    body.push_str(&format!(",\"max_tokens\":{max_tokens}"));
     body.push_str(",\"messages\":");
     body.push_str(&openai_compat::build_messages_json(messages, system));
     body.push_str(&openai_compat::build_tools_json(tools));
@@ -191,11 +193,13 @@ mod tests {
             role: "user".into(),
             content: Content::Text("hi".into()),
         }];
-        let body = request_body(&msgs, &[], "sys", DEFAULT_MODEL, true).unwrap();
+        let body = request_body(&msgs, &[], "sys", DEFAULT_MODEL, 12_345, true).unwrap();
         let val = crate::json::parse(&body).unwrap();
         let obj = val.as_object().unwrap();
         assert_eq!(obj.get("model").and_then(|v| v.as_str()), Some(DEFAULT_MODEL));
         assert_eq!(obj.get("stream").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(obj.get("max_tokens").and_then(|v| v.as_u64()), Some(12_345));
+        assert!(obj.get("max_completion_tokens").is_none());
         assert!(obj.get("messages").and_then(|v| v.as_array()).is_some());
     }
 
@@ -207,7 +211,7 @@ mod tests {
         // not be empty — still assert with_api_key overrides.
         let p = OpenGatewayProvider::new().with_api_key("");
         // with empty stored key falls through to env; just check request_body works
-        let body = request_body(&[], &[], "", "mimo-v2.5-pro", false).unwrap();
+        let body = request_body(&[], &[], "", "mimo-v2.5-pro", 8192, false).unwrap();
         assert!(body.contains("mimo-v2.5-pro"));
         let _ = p;
     }
