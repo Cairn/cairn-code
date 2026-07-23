@@ -62,6 +62,8 @@ impl Tool for McpTool {
 /// Failed servers are skipped with a warning (session still starts).
 pub fn register_mcp_tools(registry: &mut Registry, cfg: &McpConfig) -> McpRuntime {
     let mut runtime = McpRuntime::empty();
+    runtime.warnings.extend(cfg.warnings.clone());
+
     let mut servers: Vec<(String, McpServerConfig)> = cfg
         .servers
         .iter()
@@ -69,21 +71,45 @@ pub fn register_mcp_tools(registry: &mut Registry, cfg: &McpConfig) -> McpRuntim
         .collect();
     servers.sort_by(|a, b| a.0.cmp(&b.0));
 
-    for (server_name, scfg) in servers {
-        if scfg.disabled {
-            continue;
-        }
-        match McpClient::connect(&server_name, &scfg) {
-            Ok(mut client) => {
-                let tools = match client.list_tools() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        runtime
-                            .warnings
-                            .push(format!("MCP server {server_name:?}: tools/list failed: {e}"));
-                        continue;
-                    }
+    let enabled_servers: Vec<(String, McpServerConfig)> = servers
+        .into_iter()
+        .filter(|(_, scfg)| !scfg.disabled)
+        .collect();
+
+    if enabled_servers.is_empty() {
+        return runtime;
+    }
+
+    let handles: Vec<_> = enabled_servers
+        .into_iter()
+        .map(|(server_name, scfg)| {
+            std::thread::spawn(move || {
+                let res = match McpClient::connect(&server_name, &scfg) {
+                    Ok(mut client) => match client.list_tools() {
+                        Ok(tools) => Ok((client, tools)),
+                        Err(e) => Err(format!(
+                            "MCP server {server_name:?}: tools/list failed: {e}"
+                        )),
+                    },
+                    Err(e) => Err(format!("MCP server {server_name:?} failed to start: {e}")),
                 };
+                (server_name, res)
+            })
+        })
+        .collect();
+
+    for h in handles {
+        let (server_name, res) = match h.join() {
+            Ok(val) => val,
+            Err(_) => {
+                runtime
+                    .warnings
+                    .push("MCP server worker thread panicked".to_string());
+                continue;
+            }
+        };
+        match res {
+            Ok((client, tools)) => {
                 let client = Arc::new(Mutex::new(client));
                 runtime.clients.push(client.clone());
                 for remote in tools {
@@ -109,14 +135,10 @@ pub fn register_mcp_tools(registry: &mut Registry, cfg: &McpConfig) -> McpRuntim
                     runtime.tool_names.push(display);
                 }
             }
-            Err(e) => {
-                runtime
-                    .warnings
-                    .push(format!("MCP server {server_name:?} failed to start: {e}"));
+            Err(warning) => {
+                runtime.warnings.push(warning);
             }
         }
     }
     runtime
 }
-
-

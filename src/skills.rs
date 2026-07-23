@@ -31,7 +31,11 @@ pub fn default_skills_dir() -> PathBuf {
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".into());
     let home = PathBuf::from(home);
-    let xdg = home.join(".local").join("share").join("cairn-code").join("skills");
+    let xdg = home
+        .join(".local")
+        .join("share")
+        .join("cairn-code")
+        .join("skills");
     if xdg.exists() {
         return xdg;
     }
@@ -143,24 +147,44 @@ pub fn parse_skill(raw: &str, default_name: &str, path: PathBuf) -> Option<Skill
 }
 
 fn split_frontmatter(raw: &str) -> (Option<String>, String) {
-    let bytes = raw.as_bytes();
-    if !raw.starts_with("---") {
+    let (first_line, rest_after_first) = if let Some(rest) = raw.strip_prefix("---\r\n") {
+        ("---", rest)
+    } else if let Some(rest) = raw.strip_prefix("---\n") {
+        ("---", rest)
+    } else {
         return (None, raw.to_string());
+    };
+    let _ = first_line;
+
+    let mut curr = rest_after_first;
+    let mut front_len = 0;
+    loop {
+        if curr.starts_with("---\r\n")
+            || curr.starts_with("---\n")
+            || curr == "---"
+            || curr == "---\r"
+        {
+            let front = rest_after_first[..front_len]
+                .trim_end_matches(['\r', '\n'])
+                .to_string();
+            let after_idx = if curr.starts_with("---\r\n") {
+                5
+            } else if curr.starts_with("---\n") {
+                4
+            } else {
+                curr.len()
+            };
+            let after = curr[after_idx..].to_string();
+            return (Some(front), after);
+        }
+        if let Some(next_line_idx) = curr.find('\n') {
+            let next_start = next_line_idx + 1;
+            front_len += next_start;
+            curr = &curr[next_start..];
+        } else {
+            break;
+        }
     }
-    // After opening ---
-    let rest = &raw[3..];
-    let rest = rest.strip_prefix('\r').unwrap_or(rest);
-    let rest = rest.strip_prefix('\n').unwrap_or(rest);
-    // Find closing ---
-    if let Some(idx) = rest.find("\n---") {
-        let front = rest[..idx].to_string();
-        let after = &rest[idx + 4..];
-        let after = after.strip_prefix('\r').unwrap_or(after);
-        let after = after.strip_prefix('\n').unwrap_or(after);
-        return (Some(front), after.to_string());
-    }
-    // Also allow ---\r\n style end at start of line
-    let _ = bytes;
     (None, raw.to_string())
 }
 
@@ -193,13 +217,10 @@ pub fn catalog_prompt(skills: &[Skill]) -> String {
 
 /// Resolve a skill by name (case-sensitive first, then case-insensitive).
 pub fn find_skill<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
-    skills
-        .iter()
-        .find(|s| s.name == name)
-        .or_else(|| {
-            let lower = name.to_ascii_lowercase();
-            skills.iter().find(|s| s.name.to_ascii_lowercase() == lower)
-        })
+    skills.iter().find(|s| s.name == name).or_else(|| {
+        let lower = name.to_ascii_lowercase();
+        skills.iter().find(|s| s.name.to_ascii_lowercase() == lower)
+    })
 }
 
 #[cfg(test)]
@@ -239,10 +260,7 @@ mod tests {
 
     #[test]
     fn load_from_temp_root() {
-        let root = std::env::temp_dir().join(format!(
-            "cairn-skills-test-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("cairn-skills-test-{}", std::process::id()));
         let skill_dir = root.join("greet");
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(
@@ -256,6 +274,18 @@ mod tests {
         assert_eq!(skills[0].description, "Say hello");
         assert!(skills[0].content.contains("greet"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_split_frontmatter_strict_boundaries() {
+        assert_eq!(split_frontmatter("---text\nfoo\n---").0, None);
+        assert_eq!(split_frontmatter("  ---\nfoo\n---").0, None);
+        let (front, body) = split_frontmatter("---\nname: foo\n---\nbody text");
+        assert_eq!(front.unwrap(), "name: foo");
+        assert_eq!(body, "body text");
+        let (front_crlf, body_crlf) = split_frontmatter("---\r\nname: foo\r\n---\r\nbody text");
+        assert_eq!(front_crlf.unwrap(), "name: foo");
+        assert_eq!(body_crlf, "body text");
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub struct McpServerConfig {
 #[derive(Debug, Clone, Default)]
 pub struct McpConfig {
     pub servers: HashMap<String, McpServerConfig>,
+    pub warnings: Vec<String>,
 }
 
 impl McpConfig {
@@ -45,6 +46,9 @@ impl McpConfig {
                 .unwrap_or("")
                 .to_string();
             if command.is_empty() {
+                cfg.warnings.push(format!(
+                    "MCP server {name:?}: missing or empty 'command'; skipped"
+                ));
                 continue;
             }
             let args = sobj
@@ -70,8 +74,11 @@ impl McpConfig {
                 .unwrap_or(false);
             // type: only stdio supported; ignore http/sse for v1
             if let Some(ty) = sobj.get("type").and_then(|x| x.as_str()) {
-                let ty = ty.to_ascii_lowercase();
-                if ty != "stdio" && ty != "std" && !ty.is_empty() {
+                let ty_lower = ty.to_ascii_lowercase();
+                if ty_lower != "stdio" && ty_lower != "std" && !ty_lower.is_empty() {
+                    cfg.warnings.push(format!(
+                        "MCP server {name:?}: unsupported transport type {ty:?}; skipped"
+                    ));
                     continue;
                 }
             }
@@ -131,12 +138,18 @@ mod tests {
         assert_eq!(cfg.servers.len(), 2);
         assert_eq!(cfg.servers["docs"].command, "npx");
         assert_eq!(cfg.servers["docs"].args, vec!["-y", "foo"]);
-        assert_eq!(cfg.servers["docs"].env.get("A").map(|s| s.as_str()), Some("1"));
+        assert_eq!(
+            cfg.servers["docs"].env.get("A").map(|s| s.as_str()),
+            Some("1")
+        );
         assert!(cfg.servers["off"].disabled);
     }
 
     #[test]
     fn tool_name_sanitized() {
-        assert_eq!(mcp_tool_name("my-server", "list.files"), "mcp_my_server_list_files");
+        assert_eq!(
+            mcp_tool_name("my-server", "list.files"),
+            "mcp_my_server_list_files"
+        );
     }
 }
