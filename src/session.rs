@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,12 +33,18 @@ pub struct Session {
     pub updated_at: u64,
 }
 
+static ID_SEQ: AtomicU64 = AtomicU64::new(0);
+
 pub fn new_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("{:016x}", nanos)
+    // Clock resolution on some CI runners is coarser than back-to-back calls,
+    // so fold in a process-local counter to guarantee uniqueness even when
+    // two calls land on the same nanosecond.
+    let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{:016x}{:04x}", nanos, seq & 0xffff)
 }
 
 pub fn save(sessions_dir: &str, session: &Session) -> Result<(), String> {
