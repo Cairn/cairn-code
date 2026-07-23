@@ -1,7 +1,7 @@
-use std::sync::{Arc, Mutex};
 use super::provider::*;
 use crate::http_client;
 use crate::json;
+use std::sync::{Arc, Mutex};
 
 pub struct OllamaProvider {
     base_url: String,
@@ -10,29 +10,69 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     pub fn new() -> Self {
         OllamaProvider {
-            base_url: std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".into()),
+            base_url: std::env::var("OLLAMA_HOST")
+                .unwrap_or_else(|_| "http://localhost:11434".into()),
         }
     }
 
     fn chat_url(&self) -> String {
-        format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'))
+        format!(
+            "{}/v1/chat/completions",
+            self.base_url.trim_end_matches('/')
+        )
     }
 }
 
 impl Provider for OllamaProvider {
-    fn name(&self) -> &str { "ollama" }
-    fn default_model(&self) -> &str { "llama3.2" }
+    fn name(&self) -> &str {
+        "ollama"
+    }
+    fn default_model(&self) -> &str {
+        "llama3.2"
+    }
 
     fn available_models(&self) -> Vec<ModelInfo> {
         vec![
-            ModelInfo { id: "llama3.2".into(), name: "Llama 3.2".into(), max_ctx: 128_000 },
-            ModelInfo { id: "llama3.1".into(), name: "Llama 3.1".into(), max_ctx: 128_000 },
-            ModelInfo { id: "codellama".into(), name: "Code Llama".into(), max_ctx: 16_000 },
-            ModelInfo { id: "mistral".into(), name: "Mistral".into(), max_ctx: 32_000 },
-            ModelInfo { id: "mixtral".into(), name: "Mixtral".into(), max_ctx: 32_000 },
-            ModelInfo { id: "deepseek-coder".into(), name: "DeepSeek Coder".into(), max_ctx: 16_000 },
-            ModelInfo { id: "qwen2.5".into(), name: "Qwen 2.5".into(), max_ctx: 32_000 },
-            ModelInfo { id: "phi4".into(), name: "Phi-4".into(), max_ctx: 16_000 },
+            ModelInfo {
+                id: "llama3.2".into(),
+                name: "Llama 3.2".into(),
+                max_ctx: 128_000,
+            },
+            ModelInfo {
+                id: "llama3.1".into(),
+                name: "Llama 3.1".into(),
+                max_ctx: 128_000,
+            },
+            ModelInfo {
+                id: "codellama".into(),
+                name: "Code Llama".into(),
+                max_ctx: 16_000,
+            },
+            ModelInfo {
+                id: "mistral".into(),
+                name: "Mistral".into(),
+                max_ctx: 32_000,
+            },
+            ModelInfo {
+                id: "mixtral".into(),
+                name: "Mixtral".into(),
+                max_ctx: 32_000,
+            },
+            ModelInfo {
+                id: "deepseek-coder".into(),
+                name: "DeepSeek Coder".into(),
+                max_ctx: 16_000,
+            },
+            ModelInfo {
+                id: "qwen2.5".into(),
+                name: "Qwen 2.5".into(),
+                max_ctx: 32_000,
+            },
+            ModelInfo {
+                id: "phi4".into(),
+                name: "Phi-4".into(),
+                max_ctx: 16_000,
+            },
         ]
     }
 
@@ -49,32 +89,38 @@ impl Provider for OllamaProvider {
         let body = ollama_request_body(messages, tools, system, model, true)?;
         let req = http_client::HttpRequest {
             url: self.chat_url(),
-            headers: vec![
-                ("Content-Type".into(), "application/json".into()),
-            ],
+            headers: vec![("Content-Type".into(), "application/json".into())],
             body: Some(body),
         };
         let response_data: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let response_data2 = response_data.clone();
-        http_client::request_streaming_with_cancel(&req, move |line| {
-            let mut data = response_data2.lock().unwrap();
-            data.push_str(line);
-            data.push('\n');
-            if let Some(json_str) = line.strip_prefix("data: ") {
-                if json_str == "[DONE]" { return; }
-                if let Ok(val) = json::parse(json_str) {
-                    if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
-                        if let Some(choice) = choices.first() {
-                            if let Some(delta) = choice.get("delta") {
-                                if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-                                    on_chunk(text, "text");
+        http_client::request_streaming_with_cancel(
+            &req,
+            move |line| {
+                let mut data = response_data2.lock().unwrap();
+                data.push_str(line);
+                data.push('\n');
+                if let Some(json_str) = line.strip_prefix("data: ") {
+                    if json_str == "[DONE]" {
+                        return;
+                    }
+                    if let Ok(val) = json::parse(json_str) {
+                        if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
+                            if let Some(choice) = choices.first() {
+                                if let Some(delta) = choice.get("delta") {
+                                    if let Some(text) =
+                                        delta.get("content").and_then(|v| v.as_str())
+                                    {
+                                        on_chunk(text, "text");
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-        }, Some(cancel))?;
+            },
+            Some(cancel),
+        )?;
         let raw = response_data.lock().unwrap().clone();
         parse_ollama_response(&raw)
     }
@@ -90,9 +136,7 @@ impl Provider for OllamaProvider {
         let body = ollama_request_body(messages, tools, system, model, false)?;
         let req = http_client::HttpRequest {
             url: self.chat_url(),
-            headers: vec![
-                ("Content-Type".into(), "application/json".into()),
-            ],
+            headers: vec![("Content-Type".into(), "application/json".into())],
             body: Some(body),
         };
         let resp = http_client::request(&req)?;
@@ -109,7 +153,9 @@ fn ollama_request_body(
 ) -> Result<String, String> {
     let mut body = format!("{{\"model\":\"{model}\",\"stream\":{stream}");
     body.push_str(",\"messages\":");
-    body.push_str(&crate::llm::openai_compat::build_messages_json(messages, system));
+    body.push_str(&crate::llm::openai_compat::build_messages_json(
+        messages, system,
+    ));
     body.push_str(&crate::llm::openai_compat::build_tools_json(tools));
     body.push('}');
     crate::llm::openai_compat::validate_json_body(body)

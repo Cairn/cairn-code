@@ -87,7 +87,8 @@ pub fn resolve_id(sessions_dir: &str, query: &str) -> Result<String, String> {
         return Err("invalid session id".into());
     }
     let sessions = list(sessions_dir)?;
-    let matches: Vec<&SessionSummary> = sessions.iter()
+    let matches: Vec<&SessionSummary> = sessions
+        .iter()
         .filter(|s| s.id == q || s.id.starts_with(q))
         .collect();
     match matches.as_slice() {
@@ -121,10 +122,14 @@ pub fn list(sessions_dir: &str) -> Result<Vec<SessionSummary>, String> {
                         model: s.model,
                         msg_count: s.messages.len(),
                         updated_at: s.updated_at,
-                        summary: s.messages.first().and_then(|m| match &m.content {
-                            crate::llm::Content::Text(t) => Some(t.clone()),
-                            _ => None,
-                        }).unwrap_or_default(),
+                        summary: s
+                            .messages
+                            .first()
+                            .and_then(|m| match &m.content {
+                                crate::llm::Content::Text(t) => Some(t.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default(),
                     });
                 }
             }
@@ -168,8 +173,14 @@ fn session_to_json(s: &Session) -> String {
         json_escape(&s.model),
         json_escape(&s.provider)
     ));
-    json.push_str(&format!("\"tokens_in\":{},\"tokens_out\":{},", s.tokens_in, s.tokens_out));
-    json.push_str(&format!("\"created_at\":{},\"updated_at\":{},", s.created_at, s.updated_at));
+    json.push_str(&format!(
+        "\"tokens_in\":{},\"tokens_out\":{},",
+        s.tokens_in, s.tokens_out
+    ));
+    json.push_str(&format!(
+        "\"created_at\":{},\"updated_at\":{},",
+        s.created_at, s.updated_at
+    ));
     json.push_str("\"messages\":[");
     for (i, msg) in s.messages.iter().enumerate() {
         if i > 0 {
@@ -222,9 +233,21 @@ fn session_from_json(json_str: &str) -> Result<Session, String> {
     let val = crate::json::parse(json_str).map_err(|e| e.to_string())?;
     let obj = val.as_object().ok_or("not an object")?;
 
-    let id = obj.get("id").and_then(|v| v.as_str()).ok_or("no id")?.to_string();
-    let model = obj.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let provider = obj.get("provider").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let id = obj
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("no id")?
+        .to_string();
+    let model = obj
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let provider = obj
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let tokens_in = obj.get("tokens_in").and_then(|v| v.as_u64()).unwrap_or(0);
     let tokens_out = obj.get("tokens_out").and_then(|v| v.as_u64()).unwrap_or(0);
     let created_at = obj.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -236,7 +259,16 @@ fn session_from_json(json_str: &str) -> Result<Session, String> {
         Vec::new()
     };
 
-    Ok(Session { id, model, provider, messages, tokens_in, tokens_out, created_at, updated_at })
+    Ok(Session {
+        id,
+        model,
+        provider,
+        messages,
+        tokens_in,
+        tokens_out,
+        created_at,
+        updated_at,
+    })
 }
 
 fn message_from_json(val: &crate::json::JsonValue) -> Option<Message> {
@@ -251,7 +283,11 @@ fn message_from_json(val: &crate::json::JsonValue) -> Option<Message> {
         match type_str {
             "tool_use" => {
                 let name = o.get("name")?.as_str()?.to_string();
-                let id = o.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let id = o
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let input = o
                     .get("input")
                     .map(|v| crate::json::serialize(v))
@@ -259,12 +295,27 @@ fn message_from_json(val: &crate::json::JsonValue) -> Option<Message> {
                 crate::llm::Content::ToolUse(crate::llm::ToolUse { name, input, id })
             }
             "tool_result" => {
-                let tool_use_id = o.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let content = o.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                crate::llm::Content::ToolResult(crate::llm::ToolResult { tool_use_id, content })
+                let tool_use_id = o
+                    .get("tool_use_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let content = o
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                crate::llm::Content::ToolResult(crate::llm::ToolResult {
+                    tool_use_id,
+                    content,
+                })
             }
             "thinking" => {
-                let thinking = o.get("thinking").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let thinking = o
+                    .get("thinking")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 crate::llm::Content::Thinking(thinking)
             }
             _ => crate::llm::Content::Text(crate::json::serialize(content_val)),
@@ -301,8 +352,14 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let msgs = vec![
-            Message { role: "user".into(), content: crate::llm::Content::Text("hello".into()) },
-            Message { role: "assistant".into(), content: crate::llm::Content::Text("hi".into()) },
+            Message {
+                role: "user".into(),
+                content: crate::llm::Content::Text("hello".into()),
+            },
+            Message {
+                role: "assistant".into(),
+                content: crate::llm::Content::Text("hi".into()),
+            },
         ];
 
         let session = Session {
@@ -354,9 +411,10 @@ mod tests {
 
         let session = Session {
             id: test_id.clone(),
-            messages: vec![
-                Message { role: "user".into(), content: crate::llm::Content::Text("hello".into()) },
-            ],
+            messages: vec![Message {
+                role: "user".into(),
+                content: crate::llm::Content::Text("hello".into()),
+            }],
             model: "mock".into(),
             provider: "mock".into(),
             tokens_in: 1,

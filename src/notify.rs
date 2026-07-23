@@ -41,11 +41,9 @@ pub fn play(kind: Kind) {
     let _ = io::stderr().flush();
 
     // Richer, non-blocking system beep when we can without new dependencies.
-    thread::spawn(move || {
-        match kind {
-            Kind::Done => platform_beep_done(),
-            Kind::Attention => platform_beep_attention(),
-        }
+    thread::spawn(move || match kind {
+        Kind::Done => platform_beep_done(),
+        Kind::Attention => platform_beep_attention(),
     });
 }
 

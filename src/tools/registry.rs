@@ -5,8 +5,12 @@ pub trait Tool: Send {
     fn description(&self) -> &str;
     fn input_schema(&self) -> String;
     fn needs_permission(&self) -> bool;
-    fn needs_permission_for(&self, _input: &str) -> bool { self.needs_permission() }
-    fn permission_key(&self, _input: &str) -> String { self.name().to_string() }
+    fn needs_permission_for(&self, _input: &str) -> bool {
+        self.needs_permission()
+    }
+    fn permission_key(&self, _input: &str) -> String {
+        self.name().to_string()
+    }
     fn execute(&self, input: &str) -> Result<String, String>;
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {

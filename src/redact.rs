@@ -242,7 +242,8 @@ mod tests {
 
     #[test]
     fn redacts_github_and_slackish_tokens() {
-        let s = redact_secrets("token ghp_abcdefghijklmnopqrstuvwxyz012345 and xoxb-12345678-abcdefgh");
+        let s =
+            redact_secrets("token ghp_abcdefghijklmnopqrstuvwxyz012345 and xoxb-12345678-abcdefgh");
         assert!(!s.contains("ghp_abcdefghijklmnopqrstuvwxyz012345"));
         assert!(s.contains(REDACTED));
     }

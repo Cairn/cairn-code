@@ -105,7 +105,9 @@ fn format_status_error(status: u16, body: &str) -> String {
         "Prompt exceeds the model context window. Start a new session (/clear) or continue so compaction can shrink history."
     } else {
         match status {
-            401 | 403 => "Authentication failed. Check your API key (env var or save one via /provider).",
+            401 | 403 => {
+                "Authentication failed. Check your API key (env var or save one via /provider)."
+            }
             404 => "Not found. Check the model id and that your provider supports it.",
             402 => "Payment required or insufficient credits on this provider.",
             429 => "Rate limited by the provider. Wait and retry, or switch model/provider.",
@@ -136,13 +138,19 @@ fn format_transport_error(msg: &str) -> String {
         return format!("Network error: DNS lookup failed ({m}). Check connectivity.");
     }
     if lower.contains("connection refused") {
-        return format!("Network error: connection refused ({m}). Is the provider running and reachable?");
+        return format!(
+            "Network error: connection refused ({m}). Is the provider running and reachable?"
+        );
     }
     if lower.contains("timed out") || lower.contains("timeout") {
-        return format!("Network error: connection timed out ({m}). Retry, or check network/firewall.");
+        return format!(
+            "Network error: connection timed out ({m}). Retry, or check network/firewall."
+        );
     }
     if lower.contains("failed to connect") || lower.contains("couldn't connect") {
-        return format!("Network error: could not connect ({m}). Check connectivity and provider URL.");
+        return format!(
+            "Network error: could not connect ({m}). Check connectivity and provider URL."
+        );
     }
     // curl missing from PATH shows up as a spawn error.
     if lower.contains("the system cannot find the file")
@@ -150,7 +158,9 @@ fn format_transport_error(msg: &str) -> String {
         || lower.contains("program not found")
         || lower.contains("not found") && lower.contains("curl")
     {
-        return format!("Network error: could not run curl ({m}). Install curl and ensure it is on PATH.");
+        return format!(
+            "Network error: could not run curl ({m}). Install curl and ensure it is on PATH."
+        );
     }
     format!("Network error: {m}")
 }
@@ -164,7 +174,10 @@ fn backoff_delay(attempt: u32) -> Duration {
 }
 
 fn now_millis() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn debug_log_request(req: &HttpRequest) {
@@ -227,7 +240,9 @@ fn parse_status_line(line: &str) -> u16 {
 
 fn request_once(req: &HttpRequest) -> Result<HttpResponse, RequestError> {
     let child = spawn_curl(req).map_err(RequestError::Transport)?;
-    let output = child.wait_with_output().map_err(|e| RequestError::Transport(format!("{e}")))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| RequestError::Transport(format!("{e}")))?;
 
     if !output.status.success() && output.stdout.is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -261,7 +276,9 @@ pub fn request(req: &HttpRequest) -> Result<HttpResponse, String> {
     loop {
         match request_once(req) {
             Ok(resp) => return Ok(resp),
-            Err(RequestError::Status(status, _)) if is_retriable_status(status) && attempt < MAX_RETRIES => {
+            Err(RequestError::Status(status, _))
+                if is_retriable_status(status) && attempt < MAX_RETRIES =>
+            {
                 attempt += 1;
                 std::thread::sleep(backoff_delay(attempt));
             }
@@ -281,7 +298,9 @@ pub fn request_get(url: &str, headers: &[(String, String)]) -> Result<HttpRespon
     loop {
         match request_get_once(url, headers) {
             Ok(resp) => return Ok(resp),
-            Err(RequestError::Status(status, _)) if is_retriable_status(status) && attempt < MAX_RETRIES => {
+            Err(RequestError::Status(status, _))
+                if is_retriable_status(status) && attempt < MAX_RETRIES =>
+            {
                 attempt += 1;
                 std::thread::sleep(backoff_delay(attempt));
             }
@@ -303,7 +322,9 @@ fn request_get_once(url: &str, headers: &[(String, String)]) -> Result<HttpRespo
     cmd.arg("-H").arg("Expect:");
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let child = cmd.spawn().map_err(|e| RequestError::Transport(format!("curl: {e}")))?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| RequestError::Transport(format!("curl: {e}")))?;
     let output = child
         .wait_with_output()
         .map_err(|e| RequestError::Transport(format!("{e}")))?;
@@ -354,7 +375,12 @@ where
     };
     let stdout = match child.stdout.take() {
         Some(s) => s,
-        None => return Err((StreamOutcome::Other(RequestError::Transport("no stdout".into())), false)),
+        None => {
+            return Err((
+                StreamOutcome::Other(RequestError::Transport("no stdout".into())),
+                false,
+            ))
+        }
     };
     let reader = BufReader::with_capacity(64 * 1024, stdout);
 
@@ -388,7 +414,8 @@ where
                 Err(RecvTimeoutError::Disconnected) => return,
                 Err(RecvTimeoutError::Timeout) => {
                     let cancelled = cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false);
-                    let idle_for = now_millis().saturating_sub(last_activity_ref.load(Ordering::Relaxed));
+                    let idle_for =
+                        now_millis().saturating_sub(last_activity_ref.load(Ordering::Relaxed));
                     if cancelled || idle_for >= STREAM_IDLE_TIMEOUT.as_millis() as u64 {
                         if !cancelled {
                             timed_out_ref.store(true, Ordering::Relaxed);
@@ -405,7 +432,10 @@ where
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
-                Err(e) => { read_error = Some(e.to_string()); break; }
+                Err(e) => {
+                    read_error = Some(e.to_string());
+                    break;
+                }
             };
             last_activity.store(now_millis(), Ordering::Relaxed);
             match state {
@@ -447,11 +477,19 @@ where
 
     let exit = match child.lock().unwrap().wait() {
         Ok(e) => e,
-        Err(e) => return Err((StreamOutcome::Other(RequestError::Transport(e.to_string())), emitted_any)),
+        Err(e) => {
+            return Err((
+                StreamOutcome::Other(RequestError::Transport(e.to_string())),
+                emitted_any,
+            ))
+        }
     };
 
     if let Some(e) = read_error {
-        return Err((StreamOutcome::Other(RequestError::Transport(format!("read error: {e}"))), emitted_any));
+        return Err((
+            StreamOutcome::Other(RequestError::Transport(format!("read error: {e}"))),
+            emitted_any,
+        ));
     }
 
     if status == 0 {
@@ -462,13 +500,22 @@ where
             }
         }
         if !exit.success() {
-            return Err((StreamOutcome::Other(RequestError::Transport(stderr.trim().to_string())), emitted_any));
+            return Err((
+                StreamOutcome::Other(RequestError::Transport(stderr.trim().to_string())),
+                emitted_any,
+            ));
         }
-        return Err((StreamOutcome::Other(RequestError::Transport("no response".into())), emitted_any));
+        return Err((
+            StreamOutcome::Other(RequestError::Transport("no response".into())),
+            emitted_any,
+        ));
     }
 
     if status < 200 || status >= 300 {
-        return Err((StreamOutcome::Other(RequestError::Status(status, error_body)), emitted_any));
+        return Err((
+            StreamOutcome::Other(RequestError::Status(status, error_body)),
+            emitted_any,
+        ));
     }
 
     Ok(())
@@ -505,7 +552,9 @@ where
                 attempt += 1;
                 std::thread::sleep(backoff_delay(attempt));
             }
-            Err((StreamOutcome::Other(RequestError::Transport(_)), false)) if attempt < MAX_RETRIES => {
+            Err((StreamOutcome::Other(RequestError::Transport(_)), false))
+                if attempt < MAX_RETRIES =>
+            {
                 attempt += 1;
                 std::thread::sleep(backoff_delay(attempt));
             }
@@ -560,7 +609,11 @@ mod tests {
             "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
         ]);
-        let req = HttpRequest { url, headers: vec![], body: Some("{}".into()) };
+        let req = HttpRequest {
+            url,
+            headers: vec![],
+            body: Some("{}".into()),
+        };
         let resp = request(&req).unwrap();
         assert_eq!(resp.body, "ok");
     }
@@ -570,19 +623,27 @@ mod tests {
         let url = start_mock_server(vec![
             "HTTP/1.1 400 Bad Request\r\nContent-Length: 6\r\nConnection: close\r\n\r\nbadreq",
         ]);
-        let req = HttpRequest { url, headers: vec![], body: Some("{}".into()) };
+        let req = HttpRequest {
+            url,
+            headers: vec![],
+            body: Some("{}".into()),
+        };
         let err = request(&req).unwrap_err();
-        assert!(err.contains("400"), "expected error to mention status 400, got: {err}");
+        assert!(
+            err.contains("400"),
+            "expected error to mention status 400, got: {err}"
+        );
     }
 
     #[test]
     fn test_status_error_auth_is_actionable() {
-        let msg = format_status_error(
-            401,
-            r#"{"error":{"message":"Incorrect API key provided"}}"#,
-        );
+        let msg = format_status_error(401, r#"{"error":{"message":"Incorrect API key provided"}}"#);
         assert!(msg.contains("401"), "{msg}");
-        assert!(msg.to_ascii_lowercase().contains("authentication") || msg.to_ascii_lowercase().contains("api key"), "{msg}");
+        assert!(
+            msg.to_ascii_lowercase().contains("authentication")
+                || msg.to_ascii_lowercase().contains("api key"),
+            "{msg}"
+        );
         assert!(msg.contains("Incorrect API key"), "{msg}");
     }
 
@@ -606,6 +667,10 @@ mod tests {
     #[test]
     fn test_transport_error_dns() {
         let msg = format_transport_error("Could not resolve host: api.example.com");
-        assert!(msg.to_ascii_lowercase().contains("dns") || msg.to_ascii_lowercase().contains("network"), "{msg}");
+        assert!(
+            msg.to_ascii_lowercase().contains("dns")
+                || msg.to_ascii_lowercase().contains("network"),
+            "{msg}"
+        );
     }
 }

@@ -1,12 +1,18 @@
-use std::process::{Command, Stdio};
 use super::registry::Tool;
+use std::process::{Command, Stdio};
 
 pub struct WebFetchTool;
 
 impl Tool for WebFetchTool {
-    fn name(&self) -> &str { "web_fetch" }
-    fn description(&self) -> &str { "Fetch content from a URL and extract text" }
-    fn needs_permission(&self) -> bool { true }
+    fn name(&self) -> &str {
+        "web_fetch"
+    }
+    fn description(&self) -> &str {
+        "Fetch content from a URL and extract text"
+    }
+    fn needs_permission(&self) -> bool {
+        true
+    }
 
     fn input_schema(&self) -> String {
         r#"{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}"#.into()
@@ -15,7 +21,10 @@ impl Tool for WebFetchTool {
     fn execute(&self, input: &str) -> Result<String, String> {
         let val = crate::json::parse(input).map_err(|e| format!("invalid input: {e}"))?;
         let obj = val.as_object().ok_or("expected object")?;
-        let url = obj.get("url").and_then(|v| v.as_str()).ok_or("url required")?;
+        let url = obj
+            .get("url")
+            .and_then(|v| v.as_str())
+            .ok_or("url required")?;
 
         let child = Command::new("curl")
             .args(["-sS", "-L", url])
@@ -44,8 +53,12 @@ pub(crate) fn html_to_text(html: &str) -> String {
             if c == '<' {
                 tag_name.clear();
             } else if c == '>' {
-                if tag_name == "/script" { in_script = false; }
-                if tag_name == "/style" { in_style = false; }
+                if tag_name == "/script" {
+                    in_script = false;
+                }
+                if tag_name == "/style" {
+                    in_style = false;
+                }
             } else if tag_name.len() < 10 {
                 tag_name.push(c);
             }
@@ -60,9 +73,23 @@ pub(crate) fn html_to_text(html: &str) -> String {
             '>' => {
                 in_tag = false;
                 let tn = tag_name.trim().to_lowercase();
-                if tn == "script" || tn.starts_with("script ") { in_script = true; }
-                if tn == "style" || tn.starts_with("style ") { in_style = true; }
-                if tn == "br" || tn == "br/" || tn == "/p" || tn == "/div" || tn == "/tr" || tn == "/li" || tn == "/h1" || tn == "/h2" || tn == "/h3" || tn == "/h4" {
+                if tn == "script" || tn.starts_with("script ") {
+                    in_script = true;
+                }
+                if tn == "style" || tn.starts_with("style ") {
+                    in_style = true;
+                }
+                if tn == "br"
+                    || tn == "br/"
+                    || tn == "/p"
+                    || tn == "/div"
+                    || tn == "/tr"
+                    || tn == "/li"
+                    || tn == "/h1"
+                    || tn == "/h2"
+                    || tn == "/h3"
+                    || tn == "/h4"
+                {
                     text.push('\n');
                 }
             }

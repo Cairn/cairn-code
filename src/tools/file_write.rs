@@ -1,12 +1,18 @@
-use std::fs;
 use super::registry::Tool;
+use std::fs;
 
 pub struct FileWriteTool;
 
 impl Tool for FileWriteTool {
-    fn name(&self) -> &str { "file_write" }
-    fn description(&self) -> &str { "Create or overwrite a file" }
-    fn needs_permission(&self) -> bool { true }
+    fn name(&self) -> &str {
+        "file_write"
+    }
+    fn description(&self) -> &str {
+        "Create or overwrite a file"
+    }
+    fn needs_permission(&self) -> bool {
+        true
+    }
 
     fn input_schema(&self) -> String {
         r#"{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}"#.into()
@@ -15,7 +21,10 @@ impl Tool for FileWriteTool {
     fn execute(&self, input: &str) -> Result<String, String> {
         let val = crate::json::parse(input).map_err(|e| format!("invalid input: {e}"))?;
         let obj = val.as_object().ok_or("expected object")?;
-        let file_path = obj.get("file_path").and_then(|v| v.as_str()).ok_or("file_path required")?;
+        let file_path = obj
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .ok_or("file_path required")?;
         let content = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
         let resolved = super::workspace::resolve_in_workspace(file_path)?;
@@ -39,7 +48,10 @@ mod tests {
         let tool = FileWriteTool;
         let input = r#"{"file_path":"../outside_cairn_write_test.txt","content":"x"}"#;
         let err = tool.execute(input).unwrap_err();
-        assert!(err.contains("outside the workspace"), "unexpected error: {err}");
+        assert!(
+            err.contains("outside the workspace"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -4,11 +4,15 @@ use super::registry::Tool;
 pub struct FileUndoTool;
 
 impl Tool for FileUndoTool {
-    fn name(&self) -> &str { "file_undo" }
+    fn name(&self) -> &str {
+        "file_undo"
+    }
     fn description(&self) -> &str {
         "Undo the most recent file_edit or file_write in this session, restoring the previous file contents (or deleting a newly created file)"
     }
-    fn needs_permission(&self) -> bool { true }
+    fn needs_permission(&self) -> bool {
+        true
+    }
 
     fn input_schema(&self) -> String {
         r#"{"type":"object","properties":{},"required":[]}"#.into()
@@ -44,9 +48,8 @@ mod tests {
         fs::write(&rel, "original").unwrap();
 
         let edit = FileEditTool;
-        let input = format!(
-            r#"{{"file_path":"{rel}","old_string":"original","new_string":"changed"}}"#
-        );
+        let input =
+            format!(r#"{{"file_path":"{rel}","old_string":"original","new_string":"changed"}}"#);
         edit.execute(&input).unwrap();
         assert_eq!(fs::read_to_string(&rel).unwrap(), "changed");
 
@@ -88,6 +91,9 @@ mod tests {
     fn undo_empty_stack_errors_clearly() {
         crate::tools::file_history::clear();
         let err = FileUndoTool.execute("{}").unwrap_err();
-        assert!(err.to_ascii_lowercase().contains("nothing to undo"), "got: {err}");
+        assert!(
+            err.to_ascii_lowercase().contains("nothing to undo"),
+            "got: {err}"
+        );
     }
 }
