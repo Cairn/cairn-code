@@ -31,6 +31,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn request_body_escapes_model_name() {
+        let model = "model\",\"injected\":true,\"tail";
+        let body = openai_request_body(&[], &[], "", model, false).unwrap();
+        let value = crate::json::parse(&body).unwrap();
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.get("model").and_then(|v| v.as_str()), Some(model));
+        assert!(obj.get("injected").is_none());
+    }
+
+    #[test]
     fn identity_and_models() {
         let p = OpenAIProvider::new().with_api_key("sk-test");
         assert_eq!(p.name(), "openai");
@@ -145,6 +155,7 @@ fn openai_request_body(
     model: &str,
     stream: bool,
 ) -> Result<String, String> {
+    let model = crate::llm::openai_compat::escape_json_str(model);
     let mut body = format!("{{\"model\":\"{model}\",\"stream\":{stream}");
     body.push_str(",\"messages\":");
     body.push_str(&crate::llm::openai_compat::build_messages_json(messages, system));

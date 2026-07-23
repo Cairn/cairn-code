@@ -69,13 +69,14 @@ Optionally create a config file:
 }
 ```
 
-Repository preferences may also be placed in `.cairn/config.json`. Project files
-can select provider, model, token/turn limits, and display preferences, but they
-cannot change tool permissions or credentials. Add a workspace's absolute path
-to the user-owned `trusted_workspaces` list before Cairn will load its `CAIRN.md`
-or `system_prompt_file`; project prompt files must resolve inside that workspace.
+Repository preferences may also be placed in `.cairn/config.json`. Add a
+workspace's absolute path to the user-owned `trusted_workspaces` list before
+Cairn will apply project preferences or load its `CAIRN.md` or
+`system_prompt_file`. Project files cannot change tool permissions or
+credentials, and project prompt files must resolve inside the trusted workspace.
 Relative user-config prompt paths resolve from the user config directory, not
-from the current repository.
+from the current repository. If no absolute user config directory is available,
+Cairn ignores project configuration and prompts.
 
 ### Run
 
@@ -187,8 +188,8 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | `default_model` | string | `"claude-sonnet-4-20250514"` | Default model identifier |
 | `max_turns` | int | `100` | Maximum agent loop iterations |
 | `max_tokens` | int | `8192` | Max tokens per LLM response |
-| `system_prompt_file` | string | `"CAIRN.md"` | User-selected system prompt; project-selected prompts require workspace trust and must stay inside it |
-| `trusted_workspaces` | []string | `[]` | Exact absolute workspace paths allowed to select project prompt files (user config only) |
+| `system_prompt_file` | string | `"CAIRN.md"` | User-selected system prompt; the project default is loaded only for a trusted workspace |
+| `trusted_workspaces` | []string | `[]` | Exact absolute workspace paths allowed to apply project preferences and prompts (user config only) |
 | `permissions.auto_allow` | []string | `[]` | Tools to auto-approve |
 | `permissions.ask` | []string | `[]` | Tools that require confirmation |
 | `permissions.deny` | []string | `[]` | Tools to block |

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -44,7 +45,12 @@ impl Default for Config {
 impl Config {
     pub fn load() -> Self {
         let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        load_for_workspace(&dirs_config_path(), &workspace)
+        let Some(user_path) = config_path() else {
+            let mut cfg = Config::default();
+            cfg.system_prompt_file.clear();
+            return cfg;
+        };
+        load_for_workspace(&user_path, &workspace)
     }
 
     pub fn is_tool_denied(&self, name: &str) -> bool {
@@ -60,11 +66,23 @@ impl Config {
     }
 }
 
-pub fn config_path() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config/cairn-code/config.json")
+pub fn config_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+
+    config_path_from_home(home.as_deref())
+}
+
+fn config_path_from_home(home: Option<&OsStr>) -> Option<PathBuf> {
+    let home = Path::new(home?);
+    home.is_absolute()
+        .then(|| home.join(".config/cairn-code/config.json"))
+}
+
+fn config_path_or_err() -> Result<PathBuf, String> {
+    config_path().ok_or_else(|| "user config directory is unavailable or not absolute".to_string())
 }
 
 /// Name of the environment variable that holds the API key for the given provider.
@@ -96,10 +114,6 @@ pub fn env_key_for(provider: &str) -> Option<String> {
     None
 }
 
-fn dirs_config_path() -> PathBuf {
-    config_path()
-}
-
 fn load_for_workspace(user_path: &Path, workspace: &Path) -> Config {
     migrate_plaintext_keys_in_file(user_path);
 
@@ -129,9 +143,13 @@ fn load_for_workspace(user_path: &Path, workspace: &Path) -> Config {
     let trusted = user_content
         .as_deref()
         .is_some_and(|content| workspace_is_trusted(content, workspace));
+    if !trusted {
+        return cfg;
+    }
+
     let project_path = workspace.join(".cairn/config.json");
     let Some(project_content) = fs::read_to_string(project_path).ok() else {
-        if trusted && user_selected_prompt.is_none() {
+        if user_selected_prompt.is_none() {
             if let Some(path) = resolve_workspace_prompt(workspace, "CAIRN.md") {
                 cfg.system_prompt_file = path.to_string_lossy().into_owned();
             }
@@ -148,15 +166,13 @@ fn load_for_workspace(user_path: &Path, workspace: &Path) -> Config {
 
     apply_project_preferences(&mut cfg, project);
 
-    if trusted {
-        if let Some(prompt) = project.get("system_prompt_file").and_then(|v| v.as_str()) {
-            if let Some(path) = resolve_workspace_prompt(workspace, prompt) {
-                cfg.system_prompt_file = path.to_string_lossy().into_owned();
-            }
-        } else if user_selected_prompt.is_none() {
-            if let Some(path) = resolve_workspace_prompt(workspace, "CAIRN.md") {
-                cfg.system_prompt_file = path.to_string_lossy().into_owned();
-            }
+    if let Some(prompt) = project.get("system_prompt_file").and_then(|v| v.as_str()) {
+        if let Some(path) = resolve_workspace_prompt(workspace, prompt) {
+            cfg.system_prompt_file = path.to_string_lossy().into_owned();
+        }
+    } else if user_selected_prompt.is_none() {
+        if let Some(path) = resolve_workspace_prompt(workspace, "CAIRN.md") {
+            cfg.system_prompt_file = path.to_string_lossy().into_owned();
         }
     }
 
@@ -292,7 +308,7 @@ pub fn sessions_dir() -> String {
 
 pub fn save_config(provider: &str, model: &str, api_key: Option<&str>) -> Result<(), String> {
     use crate::json::JsonValue;
-    let path = config_path();
+    let path = config_path_or_err()?;
     let mut obj: std::collections::HashMap<String, JsonValue> = if path.exists() {
         let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
         crate::json::parse(&content).map_err(|e| e.to_string())?.as_object().cloned().unwrap_or_default()
@@ -319,7 +335,7 @@ pub fn save_config(provider: &str, model: &str, api_key: Option<&str>) -> Result
 /// Persist only the TUI theme preference, leaving other config keys intact.
 pub fn save_theme(theme: &str) -> Result<(), String> {
     use crate::json::JsonValue;
-    let path = config_path();
+    let path = config_path_or_err()?;
     let mut obj: std::collections::HashMap<String, JsonValue> = if path.exists() {
         let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
         crate::json::parse(&content).map_err(|e| e.to_string())?.as_object().cloned().unwrap_or_default()
@@ -347,7 +363,7 @@ pub fn save_show_suggestions(show: bool) -> Result<(), String> {
 
 fn save_bool_pref(key: &str, value: bool) -> Result<(), String> {
     use crate::json::JsonValue;
-    let path = config_path();
+    let path = config_path_or_err()?;
     let mut obj: std::collections::HashMap<String, JsonValue> = if path.exists() {
         let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
         crate::json::parse(&content).map_err(|e| e.to_string())?.as_object().cloned().unwrap_or_default()
@@ -363,36 +379,63 @@ fn save_bool_pref(key: &str, value: bool) -> Result<(), String> {
     std::fs::write(&path, &output).map_err(|e| e.to_string())
 }
 
-pub fn save_full_config(cfg: &Config) -> Result<(), String> {
+pub fn save_permissions(cfg: &Config) -> Result<(), String> {
+    let path = config_path_or_err()?;
+    save_permissions_to_path(&path, cfg)
+}
+
+fn save_permissions_to_path(path: &Path, cfg: &Config) -> Result<(), String> {
     use crate::json::JsonValue;
-    let path = config_path();
-    let mut obj: std::collections::HashMap<String, JsonValue> = if path.exists() {
-        let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        crate::json::parse(&content).map_err(|e| e.to_string())?.as_object().cloned().unwrap_or_default()
+    let mut obj: HashMap<String, JsonValue> = if path.exists() {
+        let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+        crate::json::parse(&content)
+            .map_err(|e| e.to_string())?
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
     } else {
-        std::collections::HashMap::new()
+        HashMap::new()
     };
 
-    obj.insert("default_provider".into(), JsonValue::String(cfg.default_provider.clone()));
-    obj.insert("default_model".into(), JsonValue::String(cfg.default_model.clone()));
-    obj.insert("theme".into(), JsonValue::String(cfg.theme.clone()));
-    obj.insert("show_thinking".into(), JsonValue::Bool(cfg.show_thinking));
-    obj.insert("show_suggestions".into(), JsonValue::Bool(cfg.show_suggestions));
-
-    let perms = JsonValue::Object(std::collections::HashMap::from([
-        ("auto_allow".into(), JsonValue::Array(cfg.auto_allow.iter().map(|s| JsonValue::String(s.clone())).collect())),
-        ("ask".into(), JsonValue::Array(cfg.ask.iter().map(|s| JsonValue::String(s.clone())).collect())),
-        ("deny".into(), JsonValue::Array(cfg.deny.iter().map(|s| JsonValue::String(s.clone())).collect())),
-    ]));
-    obj.insert("permissions".into(), perms);
-    // API keys are never written to the config file; they live in the OS keyring.
+    obj.insert(
+        "permissions".into(),
+        JsonValue::Object(HashMap::from([
+            (
+                "auto_allow".into(),
+                JsonValue::Array(
+                    cfg.auto_allow
+                        .iter()
+                        .map(|s| JsonValue::String(s.clone()))
+                        .collect(),
+                ),
+            ),
+            (
+                "ask".into(),
+                JsonValue::Array(
+                    cfg.ask
+                        .iter()
+                        .map(|s| JsonValue::String(s.clone()))
+                        .collect(),
+                ),
+            ),
+            (
+                "deny".into(),
+                JsonValue::Array(
+                    cfg.deny
+                        .iter()
+                        .map(|s| JsonValue::String(s.clone()))
+                        .collect(),
+                ),
+            ),
+        ])),
+    );
     obj.remove("api_keys");
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let output = crate::json::serialize(&JsonValue::Object(obj));
-    std::fs::write(&path, &output).map_err(|e| e.to_string())
+    fs::write(path, output).map_err(|e| e.to_string())
 }
 
 pub fn config_get_api_key(provider: &str) -> Option<String> {
@@ -638,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_project_only_applies_safe_preferences() {
+    fn untrusted_project_cannot_override_user_preferences() {
         let root = temp_test_dir("untrusted");
         let workspace = root.join("workspace");
         fs::create_dir_all(workspace.join(".cairn")).unwrap();
@@ -648,6 +691,13 @@ mod tests {
         fs::write(
             &user_path,
             r#"{
+                "default_provider": "ollama",
+                "default_model": "user-model",
+                "max_turns": 7,
+                "max_tokens": 2048,
+                "theme": "user-theme",
+                "show_thinking": false,
+                "show_suggestions": false,
                 "system_prompt_file": "user-prompt.md",
                 "permissions": {
                     "auto_allow": ["file_read"],
@@ -660,9 +710,13 @@ mod tests {
         fs::write(
             workspace.join(".cairn/config.json"),
             r#"{
+                "default_provider": "openai",
                 "default_model": "project-model",
+                "max_turns": 999,
                 "max_tokens": 1234,
+                "theme": "project-theme",
                 "show_thinking": true,
+                "show_suggestions": true,
                 "system_prompt_file": "../outside.md",
                 "permissions": {
                     "auto_allow": ["shell", "file_write"],
@@ -679,9 +733,13 @@ mod tests {
 
         let cfg = load_for_workspace(&user_path, &workspace);
 
-        assert_eq!(cfg.default_model, "project-model");
-        assert_eq!(cfg.max_tokens, 1234);
-        assert!(cfg.show_thinking);
+        assert_eq!(cfg.default_provider, "ollama");
+        assert_eq!(cfg.default_model, "user-model");
+        assert_eq!(cfg.max_turns, 7);
+        assert_eq!(cfg.max_tokens, 2048);
+        assert_eq!(cfg.theme, "user-theme");
+        assert!(!cfg.show_thinking);
+        assert!(!cfg.show_suggestions);
         assert_eq!(cfg.auto_allow, vec!["file_read"]);
         assert_eq!(cfg.ask, vec!["shell"]);
         assert_eq!(cfg.deny, vec!["git"]);
@@ -707,6 +765,9 @@ mod tests {
         fs::write(
             workspace.join(".cairn/config.json"),
             r#"{
+                "default_model": "project-model",
+                "max_tokens": 1234,
+                "show_thinking": true,
                 "system_prompt_file": "prompts/project.md",
                 "permissions": {"auto_allow": ["shell"]}
             }"#,
@@ -719,6 +780,9 @@ mod tests {
             PathBuf::from(cfg.system_prompt_file),
             fs::canonicalize(prompt).unwrap()
         );
+        assert_eq!(cfg.default_model, "project-model");
+        assert_eq!(cfg.max_tokens, 1234);
+        assert!(cfg.show_thinking);
         assert_eq!(cfg.auto_allow, vec!["file_read"]);
 
         fs::write(root.join("outside.md"), "outside prompt").unwrap();
@@ -789,8 +853,106 @@ mod tests {
 
     #[test]
     fn test_config_path() {
-        let path = config_path();
+        let path = config_path().expect("test environment should have an absolute home directory");
         assert!(path.to_string_lossy().contains("cairn-code"));
+    }
+
+    #[test]
+    fn config_path_requires_an_absolute_home() {
+        assert!(config_path_from_home(None).is_none());
+        assert!(config_path_from_home(Some(OsStr::new("."))).is_none());
+
+        let absolute = std::env::temp_dir();
+        assert_eq!(
+            config_path_from_home(Some(absolute.as_os_str())),
+            Some(absolute.join(".config/cairn-code/config.json"))
+        );
+    }
+
+    #[test]
+    fn saving_permissions_preserves_other_user_settings() {
+        let root = temp_test_dir("save-permissions");
+        let path = root.join("config.json");
+        fs::write(
+            &path,
+            r#"{
+                "default_provider": "openai",
+                "default_model": "user-model",
+                "max_turns": 50,
+                "max_tokens": 4096,
+                "system_prompt_file": "user-prompt.md",
+                "theme": "user-theme",
+                "show_thinking": false,
+                "show_suggestions": true,
+                "trusted_workspaces": ["C:/trusted"],
+                "permissions": {"auto_allow": ["file_read"]}
+            }"#,
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.default_provider = "project-provider".into();
+        cfg.default_model = "project-model".into();
+        cfg.max_turns = 999;
+        cfg.max_tokens = 1234;
+        cfg.system_prompt_file = "project-prompt.md".into();
+        cfg.theme = "project-theme".into();
+        cfg.show_thinking = true;
+        cfg.show_suggestions = false;
+        cfg.auto_allow = vec!["file_read".into(), "shell".into()];
+        cfg.ask = vec!["file_write".into()];
+        cfg.deny = vec!["git".into()];
+
+        save_permissions_to_path(&path, &cfg).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let value = crate::json::parse(&content).unwrap();
+        let obj = value.as_object().unwrap();
+        assert_eq!(
+            obj.get("default_provider").and_then(|v| v.as_str()),
+            Some("openai")
+        );
+        assert_eq!(
+            obj.get("default_model").and_then(|v| v.as_str()),
+            Some("user-model")
+        );
+        assert_eq!(obj.get("max_turns").and_then(|v| v.as_u64()), Some(50));
+        assert_eq!(obj.get("max_tokens").and_then(|v| v.as_u64()), Some(4096));
+        assert_eq!(
+            obj.get("system_prompt_file").and_then(|v| v.as_str()),
+            Some("user-prompt.md")
+        );
+        assert_eq!(obj.get("theme").and_then(|v| v.as_str()), Some("user-theme"));
+        assert_eq!(
+            obj.get("show_thinking").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            obj.get("show_suggestions").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(obj.get("trusted_workspaces").is_some());
+        let permissions = obj
+            .get("permissions")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(
+            permissions
+                .get("auto_allow")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            permissions
+                .get("deny")
+                .and_then(|v| v.as_array())
+                .and_then(|values| values.first())
+                .and_then(|v| v.as_str()),
+            Some("git")
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

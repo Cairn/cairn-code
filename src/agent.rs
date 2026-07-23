@@ -131,6 +131,17 @@ impl Agent {
         }
     }
 
+    fn tool_needs_approval(&self, name: &str) -> bool {
+        self.tools
+            .get(name)
+            .is_some_and(|tool| tool.needs_permission())
+            || self.config.ask.iter().any(|tool| tool == name)
+    }
+
+    fn tool_is_always_allowed(&self, name: &str) -> bool {
+        self.config.auto_allow.iter().any(|tool| tool == name)
+    }
+
     /// Summarizes the oldest messages (up to a safe split point) into one
     /// message, keeping the most recent turns verbatim. Returns the number
     /// of original messages folded into the summary, or 0 if it skipped
@@ -293,10 +304,8 @@ impl Agent {
 
                     let _ = tx.send(AgentEvent::ToolUse(tu.name.clone(), tu.input.clone()));
 
-                    let tool = self.tools.get(&tu.name);
-                    let wants_permission = tool.map(|t| t.needs_permission()).unwrap_or(false);
-                    let needs_ask = wants_permission || self.config.ask.iter().any(|t| t == &tu.name);
-                    let always_allowed = self.config.auto_allow.iter().any(|t| t == &tu.name);
+                    let needs_ask = self.tool_needs_approval(&tu.name);
+                    let always_allowed = self.tool_is_always_allowed(&tu.name);
                     let denied = self.config.is_tool_denied(&tu.name);
 
                     let result = if denied {
@@ -317,7 +326,7 @@ impl Agent {
                         match response.as_str() {
                             "always_allow" => {
                                 self.config.auto_allow.push(tu.name.clone());
-                                let _ = crate::config::save_full_config(&self.config);
+                                let _ = crate::config::save_permissions(&self.config);
                                 self.tools.get(&tu.name).map(|t| t.execute(&tu.input)).unwrap_or(Err(format!("Unknown tool: {}", tu.name)))
                             }
                             "allow" => {
@@ -410,9 +419,22 @@ impl Agent {
             match &msg.content {
                 llm::Content::Text(t) => output.push_str(t),
                 llm::Content::ToolUse(tu) => {
-                    let result = match self.tools.get(&tu.name) {
-                        Some(tool) => tool.execute(&tu.input).unwrap_or_else(|e| format!("Error: {e}")),
-                        None => format!("Error: unknown tool {}", tu.name),
+                    let result = if self.config.is_tool_denied(&tu.name) {
+                        format!("Error: tool '{}' is denied by config", tu.name)
+                    } else if self.tool_needs_approval(&tu.name)
+                        && !self.tool_is_always_allowed(&tu.name)
+                    {
+                        format!(
+                            "Error: tool '{}' requires approval, which is unavailable in print mode",
+                            tu.name
+                        )
+                    } else {
+                        match self.tools.get(&tu.name) {
+                            Some(tool) => tool
+                                .execute(&tu.input)
+                                .unwrap_or_else(|e| format!("Error: {e}")),
+                            None => format!("Error: unknown tool {}", tu.name),
+                        }
                     };
                     output.push_str(&format!("\n[{}({})]: {}", tu.name, tu.input, result));
                 }
@@ -490,6 +512,90 @@ mod tests {
                 content: content.into(),
             }),
         }
+    }
+
+    struct ToolCallingProvider;
+
+    impl llm::Provider for ToolCallingProvider {
+        fn name(&self) -> &str { "tool-calling-mock" }
+        fn default_model(&self) -> &str { "mock-model" }
+        fn available_models(&self) -> Vec<llm::ModelInfo> { Vec::new() }
+        fn stream_complete(
+            &self,
+            _messages: &[llm::Message],
+            _tools: &[llm::ToolDefinition],
+            _system: &str,
+            _model: &str,
+            _max_tokens: usize,
+            _on_chunk: llm::StreamingCallback,
+            _cancel: &AtomicBool,
+        ) -> Result<(Vec<llm::Message>, Usage), String> {
+            Err("streaming is not used by this test".into())
+        }
+        fn complete(
+            &self,
+            _messages: &[llm::Message],
+            _tools: &[llm::ToolDefinition],
+            _system: &str,
+            _model: &str,
+            _max_tokens: usize,
+        ) -> Result<(Vec<llm::Message>, Usage), String> {
+            Ok((vec![tool_use("mutate", "{}")], Usage::default()))
+        }
+    }
+
+    struct CountingTool {
+        executions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::tools::registry::Tool for CountingTool {
+        fn name(&self) -> &str { "mutate" }
+        fn description(&self) -> &str { "mutates test state" }
+        fn input_schema(&self) -> String { "{}".into() }
+        fn needs_permission(&self) -> bool { true }
+        fn execute(&self, _input: &str) -> Result<String, String> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok("executed".into())
+        }
+    }
+
+    fn print_mode_agent(
+        config: Config,
+        executions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Agent {
+        let mut tools = Registry::new();
+        tools.register(Box::new(CountingTool { executions }));
+        Agent::new(
+            Box::new(ToolCallingProvider),
+            "mock-model".into(),
+            tools,
+            config,
+        )
+    }
+
+    #[test]
+    fn print_mode_tool_permissions_fail_closed() {
+        let executions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut agent = print_mode_agent(Config::default(), executions.clone());
+        let output = agent.run_simple("run it").unwrap();
+        assert!(output.contains("approval"));
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+        let mut allowed = Config::default();
+        allowed.auto_allow.push("mutate".into());
+        let mut agent = print_mode_agent(allowed, executions.clone());
+        let output = agent.run_simple("run it").unwrap();
+        assert!(output.contains("executed"));
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+
+        let mut denied = Config::default();
+        denied.auto_allow.push("mutate".into());
+        denied.deny.push("mutate".into());
+        let mut agent = print_mode_agent(denied, executions.clone());
+        let output = agent.run_simple("run it").unwrap();
+        assert!(output.contains("denied"));
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -778,4 +884,3 @@ mod tests {
         assert!(err.to_ascii_lowercase().contains("could not compact"), "{err}");
     }
 }
-

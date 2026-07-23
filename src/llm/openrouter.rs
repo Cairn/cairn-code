@@ -185,6 +185,7 @@ fn openrouter_request_body(
     stream: bool,
     max_tokens: usize,
 ) -> Result<String, String> {
+    let model = crate::llm::openai_compat::escape_json_str(model);
     let mut body = format!("{{\"model\":\"{model}\",\"stream\":{stream}");
     body.push_str(&format!(",\"max_completion_tokens\":{max_tokens}"));
     body.push_str(",\"messages\":");
@@ -222,6 +223,16 @@ fn parse_openrouter_402(err: &str) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::tools::registry::default_registry;
+
+    #[test]
+    fn request_body_escapes_model_name() {
+        let model = "model\",\"injected\":true,\"tail";
+        let body = openrouter_request_body(&[], &[], "", model, false, 100).unwrap();
+        let value = crate::json::parse(&body).unwrap();
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.get("model").and_then(|v| v.as_str()), Some(model));
+        assert!(obj.get("injected").is_none());
+    }
 
     #[test]
     fn test_all_tool_schemas_are_valid_json() {

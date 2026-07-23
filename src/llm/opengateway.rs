@@ -154,6 +154,7 @@ fn request_body(
     model: &str,
     stream: bool,
 ) -> Result<String, String> {
+    let model = openai_compat::escape_json_str(model);
     let mut body = format!("{{\"model\":\"{model}\",\"stream\":{stream}");
     body.push_str(",\"messages\":");
     body.push_str(&openai_compat::build_messages_json(messages, system));
@@ -197,6 +198,16 @@ mod tests {
         assert_eq!(obj.get("model").and_then(|v| v.as_str()), Some(DEFAULT_MODEL));
         assert_eq!(obj.get("stream").and_then(|v| v.as_bool()), Some(true));
         assert!(obj.get("messages").and_then(|v| v.as_array()).is_some());
+    }
+
+    #[test]
+    fn request_body_escapes_model_name() {
+        let model = "model\",\"injected\":true,\"tail";
+        let body = request_body(&[], &[], "", model, false).unwrap();
+        let value = crate::json::parse(&body).unwrap();
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.get("model").and_then(|v| v.as_str()), Some(model));
+        assert!(obj.get("injected").is_none());
     }
 
     #[test]

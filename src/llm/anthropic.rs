@@ -364,6 +364,7 @@ fn build_request_body(
     max_tokens: usize,
     stream: bool,
 ) -> Result<String, String> {
+    let model = crate::llm::openai_compat::escape_json_str(model);
     let mut body = String::new();
     body.push_str(&format!(
         "{{\"model\":\"{model}\",\"max_tokens\":{max_tokens},\"stream\":{stream}"
@@ -535,6 +536,16 @@ fn parse_anthropic_response(raw: &str) -> Result<(Vec<Message>, Usage), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_body_escapes_model_name() {
+        let model = "model\",\"injected\":true,\"tail";
+        let body = build_request_body(&[], &[], "", model, 100, false).unwrap();
+        let value = crate::json::parse(&body).unwrap();
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.get("model").and_then(|v| v.as_str()), Some(model));
+        assert!(obj.get("injected").is_none());
+    }
 
     #[test]
     fn provider_identity_and_fallback_catalog() {
