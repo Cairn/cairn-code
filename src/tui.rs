@@ -3776,7 +3776,8 @@ impl Tui {
         if self.cmd_picker_sel >= self.cmd_picker_filtered.len() {
             self.cmd_picker_sel = self.cmd_picker_filtered.len().saturating_sub(1);
         }
-        // Keep flag for mouse/scroll guards; UI is ghost-only (no multi-line list).
+        // Also gates mouse-wheel scrolling and Esc/Ctrl+C dismiss for the
+        // visible Commands overlay rendered under the composer.
         self.show_command_picker = !self.cmd_picker_filtered.is_empty();
     }
 
@@ -4273,6 +4274,9 @@ pub(crate) fn slash_completion_help(completion: &str) -> Option<&'static str> {
         ["/auth", "status"] => Some("Show credential status"),
         ["/auth", "key"] => Some("Paste an API key"),
         ["/theme", "list"] => Some("List theme names"),
+        ["/reset", "list"] => Some("List banked rate-limit resets"),
+        ["/reset", "apply"] => Some("Apply a banked rate-limit reset"),
+        ["/reset", "status"] => Some("Show rate-limit reset status"),
         [_, "on"] => Some("Enable"),
         [_, "off"] => Some("Disable"),
         ["/auth", _, _] | ["/provider", _] => Some("provider"),
@@ -5129,6 +5133,18 @@ mod completion_tests {
         );
         assert_eq!(slash_completion_help("/thinking on"), Some("Enable"));
         assert_eq!(slash_completion_help("/mouse off"), Some("Disable"));
+        assert_eq!(
+            slash_completion_help("/reset list"),
+            Some("List banked rate-limit resets")
+        );
+        assert_eq!(
+            slash_completion_help("/reset apply"),
+            Some("Apply a banked rate-limit reset")
+        );
+        assert_eq!(
+            slash_completion_help("/reset status"),
+            Some("Show rate-limit reset status")
+        );
         assert_eq!(slash_completion_help("not a command"), None);
     }
 
