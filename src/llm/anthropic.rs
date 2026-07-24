@@ -364,64 +364,64 @@ fn build_request_body(
     max_tokens: usize,
     stream: bool,
 ) -> Result<String, String> {
-    let mut body = String::new();
-    body.push_str(&format!(
-        "{{\"model\":\"{model}\",\"max_tokens\":{max_tokens},\"stream\":{stream}"
-    ));
+    let messages = messages
+        .iter()
+        .map(|msg| {
+            let content = match &msg.content {
+                Content::Text(text) | Content::Thinking(text) => {
+                    serde_json::Value::String(text.clone())
+                }
+                Content::ToolUse(tool_use) => {
+                    let input = serde_json::from_str::<serde_json::Value>(&tool_use.input)
+                        .map_err(|e| format!("Invalid input for tool '{}': {e}", tool_use.name))?;
+                    serde_json::json!([{
+                        "type": "tool_use",
+                        "id": tool_use.id,
+                        "name": tool_use.name,
+                        "input": input,
+                    }])
+                }
+                Content::ToolResult(tool_result) => serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": tool_result.tool_use_id,
+                    "content": tool_result.content,
+                }]),
+            };
+            Ok(serde_json::json!({
+                "role": msg.role,
+                "content": content,
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "stream": stream,
+        "messages": messages,
+    });
     if !system.is_empty() {
-        let escaped = system
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n");
-        body.push_str(&format!(",\"system\":\"{escaped}\""));
+        body["system"] = serde_json::Value::String(system.to_string());
     }
-    body.push_str(",\"messages\":[");
-    for (i, msg) in messages.iter().enumerate() {
-        if i > 0 {
-            body.push(',');
-        }
-        body.push_str(&format!("{{\"role\":\"{}\",\"content\":", msg.role));
-        match &msg.content {
-            Content::Text(t) => {
-                let escaped = t.replace('\\', "\\\\").replace('"', "\\\"");
-                body.push_str(&format!("\"{escaped}\""));
-            }
-            Content::ToolUse(tu) => {
-                body.push_str(&format!(
-                    "[{{\"type\":\"tool_use\",\"id\":\"{}\",\"name\":\"{}\",\"input\":{}}}]",
-                    tu.id, tu.name, tu.input
-                ));
-            }
-            Content::ToolResult(tr) => {
-                let escaped = tr.content.replace('\\', "\\\\").replace('"', "\\\"");
-                body.push_str(&format!(
-                    "[{{\"type\":\"tool_result\",\"tool_use_id\":\"{}\",\"content\":\"{escaped}\"}}]",
-                    tr.tool_use_id
-                ));
-            }
-            Content::Thinking(t) => {
-                let escaped = t.replace('\\', "\\\\").replace('"', "\\\"");
-                body.push_str(&format!("\"{escaped}\""));
-            }
-        }
-        body.push('}');
-    }
-    body.push(']');
     if !tools.is_empty() {
-        body.push_str(",\"tools\":[");
-        for (i, tool) in tools.iter().enumerate() {
-            if i > 0 {
-                body.push(',');
-            }
-            body.push_str(&format!(
-                "{{\"name\":\"{}\",\"description\":\"{}\",\"input_schema\":{}}}",
-                tool.name, tool.description, tool.input_schema
-            ));
-        }
-        body.push(']');
+        body["tools"] = serde_json::Value::Array(
+            tools
+                .iter()
+                .map(|tool| {
+                    let input_schema =
+                        serde_json::from_str::<serde_json::Value>(&tool.input_schema).map_err(
+                            |e| format!("Invalid input schema for tool '{}': {e}", tool.name),
+                        )?;
+                    Ok(serde_json::json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": input_schema,
+                    }))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        );
     }
-    body.push('}');
-    Ok(body)
+    serde_json::to_string(&body).map_err(|e| format!("Failed to serialize Anthropic request: {e}"))
 }
 
 #[derive(Debug)]
@@ -721,6 +721,99 @@ mod tests {
         let body = r#"{"data":[{"id":"claude-haiku-4-5","display_name":"Haiku","type":"model"}],"has_more":false}"#;
         let page = parse_models_page(body).unwrap();
         assert_eq!(page.models[0].max_ctx, 200_000);
+    }
+
+    #[test]
+    fn request_body_serializes_special_characters_and_structured_tool_input() {
+        let messages = vec![
+            Message {
+                role: "user\"role".into(),
+                content: Content::Text("line 1\nline 2\r\t\0 café 🎉".into()),
+            },
+            Message {
+                role: "assistant".into(),
+                content: Content::ToolUse(ToolUse {
+                    id: "tool\"id".into(),
+                    name: "tool\nname".into(),
+                    input: r#"{"text":"quoted \"value\"","items":[1,true]}"#.into(),
+                }),
+            },
+            Message {
+                role: "user".into(),
+                content: Content::ToolResult(ToolResult {
+                    tool_use_id: "tool\"id".into(),
+                    content: "result\nwith\u{0008} control".into(),
+                }),
+            },
+        ];
+        let tools = vec![ToolDefinition {
+            name: "tool\nname".into(),
+            description: "description with \"quotes\" and café".into(),
+            input_schema: r#"{"type":"object","properties":{"quoted\"key":{"type":"string"}}}"#
+                .into(),
+        }];
+
+        let body = build_request_body(
+            &messages,
+            &tools,
+            "system\nwith\tcontrols and 日本語",
+            "claude\"model",
+            1024,
+            true,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(value["model"], "claude\"model");
+        assert_eq!(value["system"], "system\nwith\tcontrols and 日本語");
+        assert_eq!(value["messages"][0]["role"], "user\"role");
+        assert_eq!(
+            value["messages"][0]["content"],
+            "line 1\nline 2\r\t\0 café 🎉"
+        );
+        assert_eq!(value["messages"][1]["content"][0]["id"], "tool\"id");
+        assert_eq!(
+            value["messages"][1]["content"][0]["input"]["text"],
+            "quoted \"value\""
+        );
+        assert_eq!(
+            value["tools"][0]["input_schema"]["properties"]["quoted\"key"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn request_body_rejects_malformed_tool_input() {
+        let messages = vec![Message {
+            role: "assistant".into(),
+            content: Content::ToolUse(ToolUse {
+                id: "toolu_1".into(),
+                name: "shell".into(),
+                input: r#"{"command":"cargo test"},"role":"user""#.into(),
+            }),
+        }];
+
+        let error =
+            build_request_body(&messages, &[], "", "claude-sonnet-5", 1024, false).unwrap_err();
+
+        assert!(error.contains("Invalid input for tool 'shell'"), "{error}");
+    }
+
+    #[test]
+    fn request_body_rejects_malformed_tool_schema() {
+        let tools = vec![ToolDefinition {
+            name: "broken".into(),
+            description: String::new(),
+            input_schema: r#"{"type":"object"#.into(),
+        }];
+
+        let error =
+            build_request_body(&[], &tools, "", "claude-sonnet-5", 1024, false).unwrap_err();
+
+        assert!(
+            error.contains("Invalid input schema for tool 'broken'"),
+            "{error}"
+        );
     }
 
     #[test]
