@@ -715,33 +715,38 @@ impl Tui {
             }
 
             if matches!(self.state, State::Idle) {
-                match ratatui::crossterm::event::read() {
-                    Ok(Event::Key(key)) => {
-                        if !self.handle_key(key) {
+                // Paint pending frames before blocking on input. Otherwise the
+                // first frame (startup), post-Done UI, and any other idle dirty
+                // never appear until the user scrolls or types.
+                if !self.dirty && !needs_rebuild {
+                    match ratatui::crossterm::event::read() {
+                        Ok(Event::Key(key)) => {
+                            if !self.handle_key(key) {
+                                break 'outer;
+                            } else {
+                                self.dirty = true;
+                            }
+                        }
+                        Ok(Event::Paste(data)) => {
+                            if self.handle_paste(&data) {
+                                self.dirty = true;
+                            }
+                        }
+                        Ok(Event::Mouse(m)) => {
+                            if self.handle_mouse(m.kind) {
+                                self.dirty = true;
+                            }
+                        }
+                        Ok(Event::Resize(_, _)) => {
+                            needs_rebuild = true;
+                            self.dirty = true;
+                        }
+                        Err(e) => {
+                            result = Err(format!("Event error: {e}"));
                             break 'outer;
-                        } else {
-                            self.dirty = true;
                         }
+                        _ => {}
                     }
-                    Ok(Event::Paste(data)) => {
-                        if self.handle_paste(&data) {
-                            self.dirty = true;
-                        }
-                    }
-                    Ok(Event::Mouse(m)) => {
-                        if self.handle_mouse(m.kind) {
-                            self.dirty = true;
-                        }
-                    }
-                    Ok(Event::Resize(_, _)) => {
-                        needs_rebuild = true;
-                        self.dirty = true;
-                    }
-                    Err(e) => {
-                        result = Err(format!("Event error: {e}"));
-                        break 'outer;
-                    }
-                    _ => {}
                 }
             } else {
                 // Advance the MiniDot frame on its own clock (not on every stream dirty).
