@@ -42,11 +42,11 @@ impl Provider for OllamaProvider {
         tools: &[ToolDefinition],
         system: &str,
         model: &str,
-        _max_tokens: usize,
+        max_tokens: usize,
         mut on_chunk: StreamingCallback,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(Vec<Message>, Usage), String> {
-        let body = ollama_request_body(messages, tools, system, model, true)?;
+        let body = ollama_request_body(messages, tools, system, model, max_tokens, true)?;
         let req = http_client::HttpRequest {
             url: self.chat_url(),
             headers: vec![
@@ -85,9 +85,9 @@ impl Provider for OllamaProvider {
         tools: &[ToolDefinition],
         system: &str,
         model: &str,
-        _max_tokens: usize,
+        max_tokens: usize,
     ) -> Result<(Vec<Message>, Usage), String> {
-        let body = ollama_request_body(messages, tools, system, model, false)?;
+        let body = ollama_request_body(messages, tools, system, model, max_tokens, false)?;
         let req = http_client::HttpRequest {
             url: self.chat_url(),
             headers: vec![
@@ -105,9 +105,11 @@ fn ollama_request_body(
     tools: &[ToolDefinition],
     system: &str,
     model: &str,
+    max_tokens: usize,
     stream: bool,
 ) -> Result<String, String> {
     let mut body = format!("{{\"model\":\"{model}\",\"stream\":{stream}");
+    body.push_str(&format!(",\"max_tokens\":{max_tokens}"));
     body.push_str(",\"messages\":");
     body.push_str(&crate::llm::openai_compat::build_messages_json(messages, system));
     body.push_str(&crate::llm::openai_compat::build_tools_json(tools));
@@ -126,6 +128,19 @@ fn parse_ollama_complete_response(raw: &str) -> Result<(Vec<Message>, Usage), St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_request_body_includes_max_tokens() {
+        let body = ollama_request_body(&[], &[], "sys", "llama3.2", 12_345, false).unwrap();
+        let value = crate::json::parse(&body).unwrap();
+        let object = value.as_object().unwrap();
+
+        assert_eq!(
+            object.get("max_tokens").and_then(|v| v.as_u64()),
+            Some(12_345)
+        );
+        assert!(object.get("max_completion_tokens").is_none());
+    }
 
     #[test]
     fn test_provider_name_and_default_model() {
