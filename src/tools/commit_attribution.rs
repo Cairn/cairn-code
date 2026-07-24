@@ -367,7 +367,8 @@ mod tests {
 
     #[test]
     fn handles_git_exe_and_path() {
-        let out = ensure_shell_command_co_author(r#"C:\Program Files\Git\cmd\git.exe commit -m hi"#);
+        let out =
+            ensure_shell_command_co_author(r#"C:\Program Files\Git\cmd\git.exe commit -m hi"#);
         // path may not match if spaces confuse token — ensure we still try git.exe form
         let out2 = ensure_shell_command_co_author("git.exe commit -m hi");
         assert!(out2.contains("--trailer"), "{out2}");
@@ -399,13 +400,7 @@ mod tests {
 
     #[test]
     fn multiple_commits_in_one_line() {
-        let out = ensure_shell_command_co_author(
-            "git commit -m one; git commit -m two",
-        );
-        assert_eq!(
-            out.matches("--trailer").count(),
-            2,
-            "{out}"
-        );
+        let out = ensure_shell_command_co_author("git commit -m one; git commit -m two");
+        assert_eq!(out.matches("--trailer").count(), 2, "{out}");
     }
 }
