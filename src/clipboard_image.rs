@@ -237,9 +237,10 @@ end try"#
         {
             Err("no image on the clipboard".into())
         } else {
+            let msg = err.trim();
             Err(format!(
                 "clipboard image failed: {}",
-                err.trim().if_empty("unknown error")
+                if msg.is_empty() { "unknown error" } else { msg }
             ))
         }
     };
@@ -315,20 +316,6 @@ fn read_via_cmd(bin: &str, args: &[&str], media_type: &str) -> Result<ClipboardI
         media_type: media,
         bytes: output.stdout,
     })
-}
-
-trait IfEmpty {
-    fn if_empty(self, fallback: &str) -> String;
-}
-
-impl IfEmpty for &str {
-    fn if_empty(self, fallback: &str) -> String {
-        if self.is_empty() {
-            fallback.to_string()
-        } else {
-            self.to_string()
-        }
-    }
 }
 
 #[cfg(test)]

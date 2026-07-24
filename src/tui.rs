@@ -3162,7 +3162,20 @@ impl Tui {
                     lines.push(Line::from(""));
                 }
                 "text" => {
-                    lines.extend(crate::markdown::render(&line.content, &self.theme));
+                    // Interim assistant narration (plans / status between tools):
+                    // blank line above and below + accent colour so it separates
+                    // from dense tool chrome without looking like user prompts.
+                    if lines.last().is_none_or(|l| !line_is_blank(l)) {
+                        lines.push(Line::from(""));
+                    }
+                    lines.extend(crate::markdown::render_with_body(
+                        &line.content,
+                        &self.theme,
+                        orange_fg,
+                    ));
+                    if lines.last().is_none_or(|l| !line_is_blank(l)) {
+                        lines.push(Line::from(""));
+                    }
                 }
                 "tool_use" => {
                     // One line: name + short arg hint (no multi-line JSON dump).
@@ -3260,7 +3273,15 @@ impl Tui {
             }
         }
         if !self.streaming_text.is_empty() {
-            lines.extend(crate::markdown::render(&self.streaming_text, &self.theme));
+            // Match finished assistant text: accent body + breathing room.
+            if lines.last().is_none_or(|l| !line_is_blank(l)) {
+                lines.push(Line::from(""));
+            }
+            lines.extend(crate::markdown::render_with_body(
+                &self.streaming_text,
+                &self.theme,
+                orange_fg,
+            ));
         }
         // Spinner while waiting / thinking without answer text. Skip when full
         // thinking body is already on screen (show_thinking on).
@@ -5806,6 +5827,10 @@ fn char_width(c: char) -> usize {
     } else {
         1
     }
+}
+
+fn line_is_blank(line: &Line<'_>) -> bool {
+    line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty())
 }
 
 fn display_width(s: &str) -> usize {
