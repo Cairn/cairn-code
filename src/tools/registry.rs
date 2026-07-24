@@ -5,8 +5,12 @@ pub trait Tool: Send {
     fn description(&self) -> &str;
     fn input_schema(&self) -> String;
     fn needs_permission(&self) -> bool;
-    fn needs_permission_for(&self, _input: &str) -> bool { self.needs_permission() }
-    fn permission_key(&self, _input: &str) -> String { self.name().to_string() }
+    fn needs_permission_for(&self, _input: &str) -> bool {
+        self.needs_permission()
+    }
+    fn permission_key(&self, _input: &str) -> String {
+        self.name().to_string()
+    }
     fn execute(&self, input: &str) -> Result<String, String>;
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -64,8 +68,12 @@ pub fn default_registry() -> Registry {
     r.register(Box::new(crate::tools::file_read::FileReadTool::new(
         workspace.clone(),
     )));
-    r.register(Box::new(crate::tools::file_write::FileWriteTool));
-    r.register(Box::new(crate::tools::file_edit::FileEditTool));
+    r.register(Box::new(crate::tools::file_write::FileWriteTool::new(
+        workspace.clone(),
+    )));
+    r.register(Box::new(crate::tools::file_edit::FileEditTool::new(
+        workspace.clone(),
+    )));
     r.register(Box::new(crate::tools::file_undo::FileUndoTool));
     r.register(Box::new(crate::tools::shell::ShellTool));
     r.register(Box::new(crate::tools::powershell_tool::PowerShellTool));
