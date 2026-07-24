@@ -9,6 +9,7 @@ pub mod go_tool;
 pub mod grep_tool;
 pub mod memory;
 pub mod powershell_tool;
+pub mod process_runner;
 pub mod python_tool;
 pub mod registry;
 pub mod shell;

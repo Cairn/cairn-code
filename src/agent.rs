@@ -378,9 +378,9 @@ impl Agent {
         result
     }
 
-    fn dispatch_tool(&self, tu: &llm::ToolUse) -> Result<String, String> {
+    fn dispatch_tool(&self, tu: &llm::ToolUse, cancel: &AtomicBool) -> Result<String, String> {
         match self.tools.get(&tu.name) {
-            Some(tool) => tool.execute(&tu.input),
+            Some(tool) => tool.execute_with_cancel(&tu.input, cancel),
             None => Err(format!("Unknown tool: {}", tu.name)),
         }
     }
@@ -422,8 +422,17 @@ impl Agent {
             return Err(format!("Tool '{}' is denied by config", tu.name));
         }
 
+        // Cancellation reaches synchronous tool execution through this token.
+        // Interactive callers pass the live cancel flag; non-interactive
+        // callers (e.g. --print) have no user to cancel, so they never do.
+        static NEVER_CANCEL: AtomicBool = AtomicBool::new(false);
+        let cancel_flag: &AtomicBool = match interactive {
+            Some((_, cancel, _)) => cancel,
+            None => &NEVER_CANCEL,
+        };
+
         if !needs_ask || always_allowed {
-            return self.dispatch_tool(tu);
+            return self.dispatch_tool(tu, cancel_flag);
         }
 
         let Some((tx, cancel, perm_rx)) = interactive else {
@@ -455,9 +464,9 @@ impl Agent {
                     self.config.auto_allow.push(permission_key);
                 }
                 let _ = crate::config::save_permissions(&self.config);
-                self.dispatch_tool(tu)
+                self.dispatch_tool(tu, cancel_flag)
             }
-            "allow" => self.dispatch_tool(tu),
+            "allow" => self.dispatch_tool(tu, cancel_flag),
             _ => Err(format!("Permission denied by user for tool '{}'", tu.name)),
         }
     }
