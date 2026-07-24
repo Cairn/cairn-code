@@ -1,6 +1,7 @@
+use crate::tools::process_runner::{self, ByteLimitedOutput, ByteLimitedRunError, ManagedChild};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Mutex;
@@ -21,13 +22,28 @@ const MAX_RETRIES: u32 = 3;
 const BASE_BACKOFF_MS: u64 = 500;
 const CONNECT_TIMEOUT_SECS: &str = "10";
 const POST_TIMEOUT_SECS: &str = "600";
+/// Provider completions and model catalogs are normally far smaller than
+/// this. Eight MiB leaves ample room for unusually large completions/tool
+/// calls while bounding headers plus body before JSON parsing.
+const RESPONSE_CAP_BYTES: usize = 8 * 1024 * 1024;
+/// Streaming wire data has substantial JSON/SSE overhead per token, but is
+/// reduced incrementally rather than retained verbatim. A separate 64 MiB cap
+/// accommodates long reasoning streams while still bounding total transport.
+const STREAM_RESPONSE_CAP_BYTES: usize = 64 * 1024 * 1024;
 /// Upper bound on a raw form-post response (headers + body). OAuth token
 /// responses are a few KB; anything larger is treated as a transport fault so
 /// a hostile endpoint cannot make us buffer an unbounded reply.
 const RAW_RESPONSE_CAP_BYTES: usize = 512 * 1024;
+/// SSE records are normally a few KiB at most. This is deliberately generous
+/// for providers that send a large tool argument in one data record.
+const STREAM_EVENT_CAP_BYTES: usize = 1024 * 1024;
+/// Matches the hardened web-fetch subprocess path: enough for actionable curl
+/// diagnostics, but not enough for a hostile subprocess to consume memory.
+const STDERR_CAP_BYTES: usize = 16 * 1024;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const WATCHDOG_POLL: Duration = Duration::from_millis(200);
 
+#[derive(Debug)]
 enum RequestError {
     /// A completed HTTP response with a non-2xx status.
     Status(u16, String),
@@ -416,12 +432,11 @@ fn curl_command(req: &HttpRequest) -> Command {
     cmd
 }
 
-fn spawn_curl(req: &HttpRequest) -> Result<Child, String> {
+fn spawn_curl(req: &HttpRequest) -> Result<ManagedChild, String> {
     debug_log_request(req);
 
-    let mut child = curl_command(req)
-        .spawn()
-        .map_err(|e| format!("curl: {e}"))?;
+    let mut child =
+        ManagedChild::spawn(curl_command(req)).map_err(|error| format!("curl: {error}"))?;
 
     let body = req.body.clone().unwrap_or_default();
     let mut stdin = child.stdin.take().ok_or("curl: no stdin")?;
@@ -430,6 +445,48 @@ fn spawn_curl(req: &HttpRequest) -> Result<Child, String> {
     });
 
     Ok(child)
+}
+
+fn run_curl_with_cap(
+    command: Command,
+    body: Option<Vec<u8>>,
+    response_cap: usize,
+) -> Result<ByteLimitedOutput, RequestError> {
+    process_runner::run_with_byte_limits(command, body, response_cap, STDERR_CAP_BYTES)
+        .map_err(byte_limited_curl_error)
+}
+
+fn byte_limited_curl_error(error: ByteLimitedRunError) -> RequestError {
+    match error {
+        ByteLimitedRunError::Spawn(reason) => {
+            RequestError::RetryableTransport(format!("curl: {reason}"))
+        }
+        ByteLimitedRunError::StdoutLimit {
+            limit,
+            cleanup_error,
+        } => RequestError::Transport(process_runner::with_cleanup(
+            format!("provider response exceeded {limit} byte limit"),
+            &cleanup_error,
+        )),
+        ByteLimitedRunError::StderrLimit {
+            limit,
+            cleanup_error,
+        } => RequestError::Transport(process_runner::with_cleanup(
+            format!("curl stderr exceeded {limit} byte limit"),
+            &cleanup_error,
+        )),
+        ByteLimitedRunError::Read {
+            stream,
+            reason,
+            cleanup_error,
+        } => RequestError::Transport(process_runner::with_cleanup(
+            format!("failed reading curl {stream}: {reason}"),
+            &cleanup_error,
+        )),
+        ByteLimitedRunError::Wait(reason) => {
+            RequestError::Transport(format!("failed waiting for curl: {reason}"))
+        }
+    }
 }
 
 fn curl_exit_error(status: ExitStatus, stderr: &[u8]) -> RequestError {
@@ -455,10 +512,12 @@ fn parse_status_line(line: &str) -> u16 {
 }
 
 fn request_once(req: &HttpRequest) -> Result<HttpResponse, RequestError> {
-    let child = spawn_curl(req).map_err(RequestError::RetryableTransport)?;
-    let output = child
-        .wait_with_output()
-        .map_err(|e| RequestError::Transport(format!("{e}")))?;
+    debug_log_request(req);
+    let output = run_curl_with_cap(
+        curl_command(req),
+        Some(req.body.clone().unwrap_or_default().into_bytes()),
+        RESPONSE_CAP_BYTES,
+    )?;
 
     if !output.status.success() {
         return Err(curl_exit_error(output.status, &output.stderr));
@@ -539,29 +598,13 @@ pub fn form_post(url: &str, form_body: &str) -> Result<(u16, String), String> {
 /// directly (rather than `spawn_curl`) so credential-bearing OAuth bodies are
 /// never written to the debug request log.
 fn request_raw_once(req: &HttpRequest) -> Result<(u16, String), RequestError> {
-    let mut child = curl_command(req)
-        .spawn()
-        .map_err(|e| RequestError::RetryableTransport(format!("curl: {e}")))?;
-
-    let body = req.body.clone().unwrap_or_default();
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| RequestError::Transport("curl: no stdin".to_string()))?;
-    std::thread::spawn(move || {
-        let _ = stdin.write_all(body.as_bytes());
-    });
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| RequestError::Transport(format!("{e}")))?;
+    let output = run_curl_with_cap(
+        curl_command(req),
+        Some(req.body.clone().unwrap_or_default().into_bytes()),
+        RAW_RESPONSE_CAP_BYTES,
+    )?;
     if !output.status.success() {
         return Err(curl_exit_error(output.status, &output.stderr));
-    }
-    if output.stdout.len() > RAW_RESPONSE_CAP_BYTES {
-        return Err(RequestError::Transport(
-            "response exceeded size limit".to_string(),
-        ));
     }
 
     let raw = String::from_utf8_lossy(&output.stdout);
@@ -612,12 +655,7 @@ fn request_get_once(url: &str, headers: &[(String, String)]) -> Result<HttpRespo
     cmd.arg("-H").arg("Expect:");
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let child = cmd
-        .spawn()
-        .map_err(|e| RequestError::Transport(format!("curl: {e}")))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|e| RequestError::Transport(format!("{e}")))?;
+    let output = run_curl_with_cap(cmd, None, RESPONSE_CAP_BYTES)?;
     if !output.status.success() {
         return Err(curl_exit_error(output.status, &output.stderr));
     }
@@ -639,10 +677,126 @@ fn request_get_once(url: &str, headers: &[(String, String)]) -> Result<HttpRespo
     Ok(HttpResponse { body })
 }
 
+#[derive(Debug)]
 enum StreamOutcome {
     Cancelled,
     IdleTimeout,
     Other(RequestError),
+}
+
+#[derive(Debug)]
+enum StreamReadFailure {
+    ResponseLimit,
+    EventLimit,
+    Io(String),
+}
+
+enum StderrRead {
+    Complete(Vec<u8>),
+    Limit {
+        cleanup_error: Option<String>,
+    },
+    Io {
+        reason: String,
+        cleanup_error: Option<String>,
+    },
+}
+
+/// Read one line without allowing `BufRead::lines`/`read_line` to grow a
+/// `String` before a limit can be checked. The total includes line terminators;
+/// the per-event budget does not.
+fn read_bounded_stream_line<R: BufRead>(
+    reader: &mut R,
+    total: &mut usize,
+    total_limit: usize,
+    event_limit: usize,
+) -> Result<Option<String>, StreamReadFailure> {
+    let mut line = Vec::with_capacity(8 * 1024);
+    loop {
+        let available = reader
+            .fill_buf()
+            .map_err(|error| StreamReadFailure::Io(error.to_string()))?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            return String::from_utf8(line)
+                .map(Some)
+                .map_err(|error| StreamReadFailure::Io(error.to_string()));
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_bytes = newline.unwrap_or(available.len());
+        let consumed = content_bytes + usize::from(newline.is_some());
+        if total
+            .checked_add(consumed)
+            .is_none_or(|next| next > total_limit)
+        {
+            return Err(StreamReadFailure::ResponseLimit);
+        }
+        if line
+            .len()
+            .checked_add(content_bytes)
+            .is_none_or(|next| next > event_limit)
+        {
+            return Err(StreamReadFailure::EventLimit);
+        }
+
+        line.extend_from_slice(&available[..content_bytes]);
+        reader.consume(consumed);
+        *total += consumed;
+        if newline.is_some() {
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return String::from_utf8(line)
+                .map(Some)
+                .map_err(|error| StreamReadFailure::Io(error.to_string()));
+        }
+    }
+}
+
+fn terminate_stream_child(child: &Mutex<ManagedChild>) -> Option<String> {
+    child
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .terminate()
+        .err()
+}
+
+fn read_stream_stderr<R: Read>(mut stderr: R, child: &Mutex<ManagedChild>) -> StderrRead {
+    let mut retained = Vec::with_capacity(STDERR_CAP_BYTES);
+    let mut buffer = [0_u8; 8_192];
+    loop {
+        match stderr.read(&mut buffer) {
+            Ok(0) => return StderrRead::Complete(retained),
+            Ok(read) => {
+                let remaining = STDERR_CAP_BYTES.saturating_sub(retained.len());
+                retained.extend_from_slice(&buffer[..read.min(remaining)]);
+                if read > remaining {
+                    return StderrRead::Limit {
+                        cleanup_error: terminate_stream_child(child),
+                    };
+                }
+            }
+            Err(error) => {
+                return StderrRead::Io {
+                    reason: error.to_string(),
+                    cleanup_error: terminate_stream_child(child),
+                }
+            }
+        }
+    }
+}
+
+fn add_wait_cleanup(cleanup_error: &mut Option<String>, wait_error: Option<&std::io::Error>) {
+    let Some(wait_error) = wait_error else {
+        return;
+    };
+    match cleanup_error {
+        Some(cleanup) => cleanup.push_str(&format!("; wait failed: {wait_error}")),
+        None => *cleanup_error = Some(format!("wait failed: {wait_error}")),
+    }
 }
 
 /// Runs one streaming attempt. `on_line` is called for every non-empty body
@@ -667,16 +821,9 @@ where
             ))
         }
     };
-    let stdout = match child.stdout.take() {
-        Some(s) => s,
-        None => {
-            return Err((
-                StreamOutcome::Other(RequestError::Transport("no stdout".into())),
-                false,
-            ))
-        }
-    };
-    let reader = BufReader::with_capacity(64 * 1024, stdout);
+    let stdout = child.stdout.take().expect("curl stdout is piped");
+    let stderr = child.stderr.take().expect("curl stderr is piped");
+    let mut reader = BufReader::with_capacity(64 * 1024, stdout);
 
     let child = Mutex::new(child);
     let last_activity = AtomicU64::new(now_millis());
@@ -684,7 +831,8 @@ where
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
     let mut emitted_any = false;
-    let mut read_error: Option<String> = None;
+    let mut response_bytes = 0;
+    let mut read_failure: Option<(StreamReadFailure, Option<String>)> = None;
 
     #[derive(PartialEq)]
     enum State {
@@ -701,7 +849,8 @@ where
     let last_activity_ref = &last_activity;
     let timed_out_ref = &timed_out;
 
-    std::thread::scope(|scope| {
+    let stderr_result = std::thread::scope(|scope| {
+        let stderr_reader = scope.spawn(|| read_stream_stderr(stderr, &child));
         scope.spawn(move || loop {
             match stop_rx.recv_timeout(WATCHDOG_POLL) {
                 Ok(()) => return,
@@ -714,20 +863,25 @@ where
                         if !cancelled {
                             timed_out_ref.store(true, Ordering::Relaxed);
                         }
-                        if let Ok(mut c) = child_ref.lock() {
-                            let _ = c.kill();
-                        }
+                        let _ = terminate_stream_child(child_ref);
                         return;
                     }
                 }
             }
         });
 
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(e) => {
-                    read_error = Some(e.to_string());
+        loop {
+            let line = match read_bounded_stream_line(
+                &mut reader,
+                &mut response_bytes,
+                STREAM_RESPONSE_CAP_BYTES,
+                STREAM_EVENT_CAP_BYTES,
+            ) {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(failure) => {
+                    let cleanup_error = terminate_stream_child(&child);
+                    read_failure = Some((failure, cleanup_error));
                     break;
                 }
             };
@@ -756,43 +910,88 @@ where
             }
         }
 
+        let stderr_result = stderr_reader.join().unwrap_or_else(|_| StderrRead::Io {
+            reason: "stderr reader thread panicked".to_string(),
+            cleanup_error: terminate_stream_child(&child),
+        });
         let _ = stop_tx.send(());
+        stderr_result
     });
 
+    let wait_result = child
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .wait();
     let cancelled = cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false);
     if cancelled {
-        let _ = child.lock().map(|mut c| c.wait());
         return Err((StreamOutcome::Cancelled, emitted_any));
     }
     if timed_out.load(Ordering::Relaxed) {
-        let _ = child.lock().map(|mut c| c.wait());
         return Err((StreamOutcome::IdleTimeout, emitted_any));
     }
 
-    let exit = match child.lock().unwrap().wait() {
-        Ok(e) => e,
-        Err(e) => {
+    if let Some((failure, mut cleanup_error)) = read_failure {
+        add_wait_cleanup(&mut cleanup_error, wait_result.as_ref().err());
+        let message = match failure {
+            StreamReadFailure::ResponseLimit => process_runner::with_cleanup(
+                format!("provider stream exceeded {STREAM_RESPONSE_CAP_BYTES} byte response limit"),
+                &cleanup_error,
+            ),
+            StreamReadFailure::EventLimit => process_runner::with_cleanup(
+                format!("provider stream event exceeded {STREAM_EVENT_CAP_BYTES} byte limit"),
+                &cleanup_error,
+            ),
+            StreamReadFailure::Io(reason) => process_runner::with_cleanup(
+                format!("failed reading provider stream: {reason}"),
+                &cleanup_error,
+            ),
+        };
+        return Err((
+            StreamOutcome::Other(RequestError::Transport(message)),
+            emitted_any,
+        ));
+    }
+
+    let stderr = match stderr_result {
+        StderrRead::Complete(stderr) => stderr,
+        StderrRead::Limit { mut cleanup_error } => {
+            add_wait_cleanup(&mut cleanup_error, wait_result.as_ref().err());
             return Err((
-                StreamOutcome::Other(RequestError::Transport(e.to_string())),
+                StreamOutcome::Other(RequestError::Transport(process_runner::with_cleanup(
+                    format!("curl stderr exceeded {STDERR_CAP_BYTES} byte limit"),
+                    &cleanup_error,
+                ))),
+                emitted_any,
+            ));
+        }
+        StderrRead::Io {
+            reason,
+            mut cleanup_error,
+        } => {
+            add_wait_cleanup(&mut cleanup_error, wait_result.as_ref().err());
+            return Err((
+                StreamOutcome::Other(RequestError::Transport(process_runner::with_cleanup(
+                    format!("failed reading curl stderr: {reason}"),
+                    &cleanup_error,
+                ))),
+                emitted_any,
+            ));
+        }
+    };
+
+    let exit = match wait_result {
+        Ok(exit) => exit,
+        Err(error) => {
+            return Err((
+                StreamOutcome::Other(RequestError::Transport(format!(
+                    "failed waiting for curl: {error}"
+                ))),
                 emitted_any,
             ))
         }
     };
 
-    if let Some(e) = read_error {
-        return Err((
-            StreamOutcome::Other(RequestError::Transport(format!("read error: {e}"))),
-            emitted_any,
-        ));
-    }
-
     if !exit.success() {
-        let mut stderr = Vec::new();
-        if let Ok(mut c) = child.lock() {
-            if let Some(mut e) = c.stderr.take() {
-                let _ = e.read_to_end(&mut stderr);
-            }
-        }
         return Err((
             StreamOutcome::Other(curl_exit_error(exit, &stderr)),
             emitted_any,
@@ -861,6 +1060,10 @@ mod tests {
     /// fresh loopback port. Used to make curl (a real subprocess) exercise
     /// the retry path against a real, if trivial, HTTP server.
     fn start_mock_server(responses: Vec<&'static str>) -> String {
+        start_owned_mock_server(responses.into_iter().map(String::from).collect())
+    }
+
+    fn start_owned_mock_server(responses: Vec<String>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -1017,6 +1220,113 @@ mod tests {
             result,
             Err((StreamOutcome::Other(RequestError::Transport(_)), true))
         ));
+    }
+
+    #[test]
+    fn bounded_stream_reader_accepts_normal_lines_and_tracks_total() {
+        let input = b"data: one\r\ndata: two\n";
+        let mut reader = BufReader::with_capacity(4, &input[..]);
+        let mut total = 0;
+
+        assert_eq!(
+            read_bounded_stream_line(&mut reader, &mut total, 64, 32).unwrap(),
+            Some("data: one".to_string())
+        );
+        assert_eq!(
+            read_bounded_stream_line(&mut reader, &mut total, 64, 32).unwrap(),
+            Some("data: two".to_string())
+        );
+        assert_eq!(
+            read_bounded_stream_line(&mut reader, &mut total, 64, 32).unwrap(),
+            None
+        );
+        assert_eq!(total, input.len());
+    }
+
+    #[test]
+    fn bounded_stream_reader_rejects_event_and_total_overflow() {
+        let mut event_reader = BufReader::with_capacity(4, &b"12345\n"[..]);
+        let mut total = 0;
+        assert!(matches!(
+            read_bounded_stream_line(&mut event_reader, &mut total, 64, 4),
+            Err(StreamReadFailure::EventLimit)
+        ));
+
+        let mut total_reader = BufReader::with_capacity(4, &b"one\ntwo\n"[..]);
+        let mut total = 0;
+        assert!(read_bounded_stream_line(&mut total_reader, &mut total, 7, 4).is_ok());
+        assert!(matches!(
+            read_bounded_stream_line(&mut total_reader, &mut total, 7, 4),
+            Err(StreamReadFailure::ResponseLimit)
+        ));
+    }
+
+    #[test]
+    fn test_streaming_accepts_normal_response() {
+        let body = "data: ok\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let req = HttpRequest {
+            url: start_owned_mock_server(vec![response]),
+            headers: vec![],
+            body: Some("{}".into()),
+        };
+        let mut lines = Vec::new();
+
+        request_streaming_attempt(&req, &mut |line| lines.push(line.to_string()), None).unwrap();
+
+        assert_eq!(lines, ["data: ok"]);
+    }
+
+    #[test]
+    fn test_request_rejects_fast_oversized_stdout() {
+        let body = "x".repeat(RESPONSE_CAP_BYTES);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let req = HttpRequest {
+            url: start_owned_mock_server(vec![response]),
+            headers: vec![],
+            body: Some("{}".into()),
+        };
+
+        let error = request(&req).unwrap_err();
+
+        assert!(error.contains("response exceeded"), "{error}");
+        assert!(error.contains(&RESPONSE_CAP_BYTES.to_string()), "{error}");
+    }
+
+    #[test]
+    fn test_streaming_rejects_fast_oversized_event() {
+        let body = format!("data: {}\n", "x".repeat(STREAM_EVENT_CAP_BYTES));
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let req = HttpRequest {
+            url: start_owned_mock_server(vec![response]),
+            headers: vec![],
+            body: Some("{}".into()),
+        };
+        let mut lines = Vec::new();
+
+        let result =
+            request_streaming_attempt(&req, &mut |line| lines.push(line.to_string()), None);
+
+        assert!(lines.is_empty());
+        match result {
+            Err((StreamOutcome::Other(RequestError::Transport(message)), false)) => {
+                assert!(message.contains("stream event exceeded"), "{message}");
+                assert!(
+                    message.contains(&STREAM_EVENT_CAP_BYTES.to_string()),
+                    "{message}"
+                );
+            }
+            _ => panic!("oversized event must be rejected before emission"),
+        }
     }
 
     #[test]

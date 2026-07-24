@@ -11,9 +11,10 @@
 
 use std::collections::VecDeque;
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// How the caller wants a command run.
@@ -33,6 +34,35 @@ pub struct RunResult {
     pub success: bool,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// A completed process whose output fit within strict byte limits.
+pub(crate) struct ByteLimitedOutput {
+    pub status: ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Failure from [`run_with_byte_limits`]. Unlike [`run`], this mode never
+/// returns truncated output: crossing either limit terminates the process tree
+/// and reports which stream overflowed.
+#[derive(Debug)]
+pub(crate) enum ByteLimitedRunError {
+    Spawn(String),
+    StdoutLimit {
+        limit: usize,
+        cleanup_error: Option<String>,
+    },
+    StderrLimit {
+        limit: usize,
+        cleanup_error: Option<String>,
+    },
+    Read {
+        stream: &'static str,
+        reason: String,
+        cleanup_error: Option<String>,
+    },
+    Wait(String),
 }
 
 /// Why a run did not complete normally. Messages are raw (no tool prefix) so
@@ -73,21 +103,12 @@ pub fn run(
     cancel: Option<&AtomicBool>,
 ) -> Result<RunResult, RunError> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    configure_process_group(&mut command);
 
     // Overflow (timeout near the end of the monotonic clock) degrades to
     // "no deadline" rather than erroring; cancellation still applies.
     let deadline = options.timeout.and_then(|d| Instant::now().checked_add(d));
 
-    let process_tree = ProcessTree::new().map_err(RunError::Spawn)?;
-    let mut child = command
-        .spawn()
-        .map_err(|e| RunError::Spawn(e.to_string()))?;
-    if let Err(error) = process_tree.attach(&mut child) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(RunError::Spawn(error));
-    }
+    let mut child = ManagedChild::spawn(command).map_err(RunError::Spawn)?;
 
     let stdout_rx = drain_bounded(
         child.stdout.take().expect("stdout is piped"),
@@ -108,18 +129,14 @@ pub fn run(
         receive_output(&stderr_rx, &mut stderr);
 
         if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-            let cleanup_error = process_tree.terminate(&mut child).err();
-            if cleanup_error.is_none() {
-                let _ = child.wait();
-            }
+            let mut cleanup_error = child.terminate().err();
+            add_wait_error(&mut cleanup_error, child.wait().err());
             return Err(RunError::Cancelled { cleanup_error });
         }
 
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            let cleanup_error = process_tree.terminate(&mut child).err();
-            if cleanup_error.is_none() {
-                let _ = child.wait();
-            }
+            let mut cleanup_error = child.terminate().err();
+            add_wait_error(&mut cleanup_error, child.wait().err());
             let after_ms = options
                 .timeout
                 .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
@@ -138,10 +155,8 @@ pub fn run(
                 Ok(Some(status)) => break status,
                 Ok(None) => {}
                 Err(e) => {
-                    let cleanup_error = process_tree.terminate(&mut child).err();
-                    if cleanup_error.is_none() {
-                        let _ = child.wait();
-                    }
+                    let mut cleanup_error = child.terminate().err();
+                    add_wait_error(&mut cleanup_error, child.wait().err());
                     return Err(RunError::Wait {
                         reason: e.to_string(),
                         cleanup_error,
@@ -159,6 +174,154 @@ pub fn run(
         stdout: stdout.unwrap_or_default(),
         stderr: stderr.unwrap_or_default(),
     })
+}
+
+fn add_wait_error(cleanup_error: &mut Option<String>, wait_error: Option<std::io::Error>) {
+    let Some(wait_error) = wait_error else {
+        return;
+    };
+    match cleanup_error {
+        Some(cleanup) => cleanup.push_str(&format!("; wait failed: {wait_error}")),
+        None => *cleanup_error = Some(format!("wait failed: {wait_error}")),
+    }
+}
+
+/// Run a subprocess while retaining at most the requested number of bytes
+/// from each stream. Both pipes are drained concurrently. If either limit is
+/// crossed, the managed process tree is terminated and reaped, and no partial
+/// output is returned to the caller. The command must enforce its own finite
+/// wall-clock timeout; current callers use curl's `--max-time`.
+pub(crate) fn run_with_byte_limits(
+    mut command: Command,
+    stdin: Option<Vec<u8>>,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<ByteLimitedOutput, ByteLimitedRunError> {
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = ManagedChild::spawn(command).map_err(ByteLimitedRunError::Spawn)?;
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let child = Mutex::new(child);
+
+    let (stdout_result, stderr_result) = std::thread::scope(|scope| {
+        let stdout_reader = scope.spawn(|| read_strict(stdout, stdout_limit, &child));
+        let stderr_reader = scope.spawn(|| read_strict(stderr, stderr_limit, &child));
+        let stdin_writer = stdin.map(|input| {
+            let mut stdin = child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .stdin
+                .take();
+            scope.spawn(move || {
+                if let Some(stdin) = stdin.as_mut() {
+                    let _ = std::io::Write::write_all(stdin, &input);
+                }
+            })
+        });
+
+        let stdout_result = stdout_reader.join().unwrap_or_else(|_| StrictRead::Read {
+            reason: "stdout reader thread panicked".to_string(),
+            cleanup_error: terminate_locked(&child),
+        });
+        let stderr_result = stderr_reader.join().unwrap_or_else(|_| StrictRead::Read {
+            reason: "stderr reader thread panicked".to_string(),
+            cleanup_error: terminate_locked(&child),
+        });
+        if let Some(writer) = stdin_writer {
+            let _ = writer.join();
+        }
+        (stdout_result, stderr_result)
+    });
+
+    let wait_result = child
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .wait();
+
+    let stdout = strict_output("stdout", stdout_limit, stdout_result)?;
+    let stderr = strict_output("stderr", stderr_limit, stderr_result)?;
+    let status = wait_result.map_err(|error| ByteLimitedRunError::Wait(error.to_string()))?;
+    Ok(ByteLimitedOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+enum StrictRead {
+    Complete(Vec<u8>),
+    Limit {
+        cleanup_error: Option<String>,
+    },
+    Read {
+        reason: String,
+        cleanup_error: Option<String>,
+    },
+}
+
+fn read_strict<R: Read>(mut reader: R, limit: usize, child: &Mutex<ManagedChild>) -> StrictRead {
+    let mut retained = Vec::with_capacity(limit.min(8_192));
+    let mut buffer = [0_u8; 8_192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return StrictRead::Complete(retained),
+            Ok(read) => {
+                let remaining = limit.saturating_sub(retained.len());
+                retained.extend_from_slice(&buffer[..read.min(remaining)]);
+                if read > remaining {
+                    return StrictRead::Limit {
+                        cleanup_error: terminate_locked(child),
+                    };
+                }
+            }
+            Err(error) => {
+                return StrictRead::Read {
+                    reason: error.to_string(),
+                    cleanup_error: terminate_locked(child),
+                }
+            }
+        }
+    }
+}
+
+fn strict_output(
+    stream: &'static str,
+    limit: usize,
+    result: StrictRead,
+) -> Result<Vec<u8>, ByteLimitedRunError> {
+    match result {
+        StrictRead::Complete(output) => Ok(output),
+        StrictRead::Limit { cleanup_error } if stream == "stdout" => {
+            Err(ByteLimitedRunError::StdoutLimit {
+                limit,
+                cleanup_error,
+            })
+        }
+        StrictRead::Limit { cleanup_error } => Err(ByteLimitedRunError::StderrLimit {
+            limit,
+            cleanup_error,
+        }),
+        StrictRead::Read {
+            reason,
+            cleanup_error,
+        } => Err(ByteLimitedRunError::Read {
+            stream,
+            reason,
+            cleanup_error,
+        }),
+    }
+}
+
+fn terminate_locked(child: &Mutex<ManagedChild>) -> Option<String> {
+    child
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .terminate()
+        .err()
 }
 
 fn receive_output(rx: &Receiver<String>, output: &mut Option<String>) {
@@ -238,6 +401,48 @@ fn drain_bounded<R: Read + Send + 'static>(
         let _ = tx.send(collector.finish());
     });
     rx
+}
+
+/// A child placed in its own process group / job object, so all subprocess
+/// call sites use the same descendant-safe termination behavior.
+pub(crate) struct ManagedChild {
+    child: Child,
+    process_tree: ProcessTree,
+}
+
+impl ManagedChild {
+    pub(crate) fn spawn(mut command: Command) -> Result<Self, String> {
+        configure_process_group(&mut command);
+        let process_tree = ProcessTree::new()?;
+        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        if let Err(error) = process_tree.attach(&mut child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        Ok(Self {
+            child,
+            process_tree,
+        })
+    }
+
+    pub(crate) fn terminate(&mut self) -> Result<(), String> {
+        self.process_tree.terminate(&mut self.child)
+    }
+}
+
+impl std::ops::Deref for ManagedChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for ManagedChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
 }
 
 #[cfg(unix)]
@@ -416,6 +621,7 @@ impl ProcessTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn echo_command(text: &str) -> Command {
         let mut command = Command::new(if cfg!(windows) { "powershell" } else { "bash" });
@@ -437,6 +643,22 @@ mod tests {
                 .arg(format!("Start-Sleep -Seconds {seconds}"));
         } else {
             command.arg("-c").arg(format!("sleep {seconds}"));
+        }
+        command
+    }
+
+    fn large_output_command(stderr: bool) -> Command {
+        let mut command = Command::new(if cfg!(windows) { "powershell" } else { "bash" });
+        if cfg!(windows) {
+            let stream = if stderr { "Error" } else { "Out" };
+            command
+                .arg("-Command")
+                .arg(format!("[Console]::{stream}.Write(('x' * 1000000))"));
+        } else {
+            let redirect = if stderr { " >&2" } else { "" };
+            command
+                .arg("-c")
+                .arg(format!("head -c 1000000 /dev/zero{redirect}"));
         }
         command
     }
@@ -498,5 +720,40 @@ mod tests {
             .expect("command should be cancelled");
             assert!(matches!(err, RunError::Cancelled { .. }));
         });
+    }
+
+    #[test]
+    fn byte_limited_run_accepts_normal_output() {
+        let output = run_with_byte_limits(echo_command("bounded-ok"), None, 1024, 1024)
+            .expect("small output should fit");
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("bounded-ok"));
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn byte_limited_run_stops_fast_oversized_stdout() {
+        let started = Instant::now();
+        let error = run_with_byte_limits(large_output_command(false), None, 1024, 1024)
+            .err()
+            .expect("oversized stdout must fail");
+        assert!(matches!(
+            error,
+            ByteLimitedRunError::StdoutLimit { limit: 1024, .. }
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn byte_limited_run_stops_fast_oversized_stderr() {
+        let started = Instant::now();
+        let error = run_with_byte_limits(large_output_command(true), None, 1024, 1024)
+            .err()
+            .expect("oversized stderr must fail");
+        assert!(matches!(
+            error,
+            ByteLimitedRunError::StderrLimit { limit: 1024, .. }
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }
