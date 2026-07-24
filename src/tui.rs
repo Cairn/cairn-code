@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use ratatui::{
     crossterm::{
         event::{
-            DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-            MouseEventKind,
+            DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+            Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
         },
         execute,
     },
@@ -577,6 +577,9 @@ impl Tui {
         if execute!(stdout(), EnableMouseCapture).is_ok() {
             self.mouse_capture = true;
         }
+        // Bracketed paste: terminals deliver pasted blobs as Event::Paste instead of
+        // fake keystrokes, so emoji / multi-byte Unicode and multi-line text work.
+        let _ = execute!(stdout(), EnableBracketedPaste);
 
         let mut result = Ok(());
         let mut last_spinner_update = std::time::Instant::now();
@@ -719,6 +722,11 @@ impl Tui {
                             self.dirty = true;
                         }
                     }
+                    Ok(Event::Paste(data)) => {
+                        if self.handle_paste(&data) {
+                            self.dirty = true;
+                        }
+                    }
                     Ok(Event::Mouse(m)) => {
                         if self.handle_mouse(m.kind) {
                             self.dirty = true;
@@ -764,6 +772,11 @@ impl Tui {
                                 self.dirty = true;
                             }
                         }
+                        Ok(Event::Paste(data)) => {
+                            if self.handle_paste(&data) {
+                                self.dirty = true;
+                            }
+                        }
                         Ok(Event::Mouse(m)) => {
                             if self.handle_mouse(m.kind) {
                                 self.dirty = true;
@@ -791,6 +804,7 @@ impl Tui {
                 } else {
                     let _ = execute!(stdout(), DisableMouseCapture);
                 }
+                let _ = execute!(stdout(), EnableBracketedPaste);
                 needs_rebuild = true;
                 self.dirty = true;
             }
@@ -821,7 +835,39 @@ impl Tui {
         if self.mouse_capture {
             let _ = execute!(stdout(), DisableMouseCapture);
         }
+        let _ = execute!(stdout(), DisableBracketedPaste);
+        // TerminalGuard drop restores ratatui/raw mode.
         result
+    }
+
+    /// Insert clipboard / bracketed-paste text into the composer at the cursor.
+    /// Returns true if the buffer changed (needs redraw).
+    fn handle_paste(&mut self, data: &str) -> bool {
+        // Same gates as KeyCode::Char: don't hijack list pickers or overlays.
+        let allow = self.awaiting_api_key
+            || (!self.show_model_picker
+                && !self.show_provider_picker
+                && !self.show_theme_picker
+                && !self.show_session_picker
+                && !self.show_help
+                && !self.show_shortcuts);
+        if !allow {
+            return false;
+        }
+        // Strip CSI/OSC noise if someone pastes styled terminal output; keep
+        // Unicode (emoji), newlines, and tabs for normal prompts.
+        let cleaned = sanitize_paste_for_composer(data);
+        if cleaned.is_empty() {
+            return false;
+        }
+        self.ctrl_c_exit_armed = false;
+        self.idle_suggestion = None;
+        self.input_buf.insert_str(self.cursor, &cleaned);
+        self.cursor += cleaned.len();
+        if !self.awaiting_api_key {
+            self.update_cmd_picker();
+        }
+        true
     }
 
     /// Returns true if the event was actually acted on (a scroll), so callers
@@ -3882,6 +3928,14 @@ fn completion_wants_trailing_space(completion: &str) -> bool {
     )
 }
 
+/// Clean pasted text for the composer: drop CSI/OSC and other C0/C1 controls
+/// while keeping Unicode (including emoji), newlines, and tabs.
+pub(crate) fn sanitize_paste_for_composer(input: &str) -> String {
+    // Reuse the shared control-sequence stripper; it already preserves \n/\t and
+    // normal Unicode scalar values (emoji, CJK, combining marks).
+    sanitize_terminal_output(input)
+}
+
 /// Strip terminal controls before writing untrusted text directly to a terminal.
 ///
 /// This is intentionally used only at raw stdout boundaries. Ratatui should
@@ -3991,8 +4045,9 @@ pub fn sanitize_terminal_output(input: &str) -> String {
 /// Leave the ratatui alt-screen and print plain text so the host terminal can
 /// drag-select (Windows Terminal does not reliably select inside a redrawing TUI).
 fn enter_plain_select_mode(terminal: &mut DefaultTerminal, text: &str) -> Result<(), String> {
-    // Drop mouse capture and leave alt-screen / raw mode.
+    // Drop mouse capture / paste mode and leave alt-screen / raw mode.
     let _ = execute!(stdout(), DisableMouseCapture);
+    let _ = execute!(stdout(), DisableBracketedPaste);
     // restore() disables raw mode and leaves the alternate screen.
     ratatui::restore();
 
@@ -4819,6 +4874,48 @@ mod claude_chrome_tests {
                 .any(|l| l.content.contains("Ctrl+C")),
             "exit hint belongs in the footer, not the transcript"
         );
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::*;
+
+    #[test]
+    fn paste_inserts_emoji_and_unicode_at_cursor() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.input_buf = "hi ".into();
+        tui.cursor = tui.input_buf.len();
+        assert!(tui.handle_paste("🪨 world 🙂"));
+        assert_eq!(tui.input_buf, "hi 🪨 world 🙂");
+        assert_eq!(tui.cursor, tui.input_buf.len());
+    }
+
+    #[test]
+    fn paste_mid_buffer_and_multiline() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.input_buf = "ab".into();
+        tui.cursor = 1; // between a and b
+        assert!(tui.handle_paste("X\nY"));
+        assert_eq!(tui.input_buf, "aX\nYb");
+        assert_eq!(tui.cursor, "aX\nY".len());
+    }
+
+    #[test]
+    fn paste_strips_csi_keeps_text() {
+        let cleaned = sanitize_paste_for_composer("hello\x1b[31mred\x1b[0m 🪨");
+        assert!(cleaned.contains("hello"));
+        assert!(cleaned.contains("red"));
+        assert!(cleaned.contains('🪨'));
+        assert!(!cleaned.contains('\u{001b}'));
+    }
+
+    #[test]
+    fn paste_ignored_while_model_picker_open() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.show_model_picker = true;
+        assert!(!tui.handle_paste("should not land"));
+        assert!(tui.input_buf.is_empty());
     }
 }
 
