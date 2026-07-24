@@ -132,16 +132,48 @@ pub fn build_tools_json(tools: &[ToolDefinition]) -> String {
     body
 }
 
+/// Largest byte index at or below `index` that starts a character.
+///
+/// `str::floor_char_boundary` is still unstable, and the parser's byte offsets
+/// routinely land mid-character on non-ASCII payloads.
+fn char_boundary_floor(s: &str, index: usize) -> usize {
+    let mut index = index.min(s.len());
+    while index > 0 && !s.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Smallest byte index at or above `index` that starts a character.
+fn char_boundary_ceil(s: &str, index: usize) -> usize {
+    let mut index = index.min(s.len());
+    while index < s.len() && !s.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
 /// Sanity-checks a hand-built request body and returns a diagnostic error
 /// (with byte offset and surrounding context) if it isn't valid JSON.
 pub fn validate_json_body(body: String) -> Result<String, String> {
     if let Err(e) = json::parse(&body) {
-        let pos = e.pos;
-        let start = pos.saturating_sub(20);
-        let end = (pos + 20).min(body.len());
+        // The error offset is a byte index, so the surrounding window has to be
+        // snapped outward to character boundaries before slicing: `&body[a..b]`
+        // panics when either end splits a multi-byte character. Any non-ASCII
+        // text near the fault would otherwise turn a reportable bad body into a
+        // crash — in the code whose job is explaining the bad body.
+        let pos = e.pos.min(body.len());
+        let start = char_boundary_floor(&body, pos.saturating_sub(20));
+        let end = char_boundary_ceil(&body, pos.saturating_add(20).min(body.len()));
         let context = &body[start..end];
-        let ch = body.as_bytes().get(pos).map(|&b| b as char).unwrap_or('?');
-        return Err(format!("Invalid JSON body: {e}\nChar at pos {pos}: '{ch}' (0x{:02X})\nContext: ...{context}...", ch as u8));
+        // Deliberately the raw byte, not the decoded character: `pos` may be
+        // mid-character, and the offending byte is what makes the parse fail.
+        let byte = body.as_bytes().get(pos).copied();
+        let shown = byte.map(char::from).unwrap_or('?');
+        return Err(format!(
+            "Invalid JSON body: {e}\nByte at pos {pos}: '{shown}' (0x{:02X})\nContext: ...{context}...",
+            byte.unwrap_or(0)
+        ));
     }
     Ok(body)
 }
@@ -386,6 +418,51 @@ pub fn parse_complete_response(raw: &str) -> Result<(Vec<Message>, Usage), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_json_body_reports_multibyte_context_without_panicking() {
+        // Whether a fixed window splits a character depends on how the fault
+        // aligns against the filler, so sweep the padding: a single length can
+        // land on a boundary by luck and hide the bug. Each filler width is
+        // swept across a full character so every alignment is exercised.
+        for filler in ["é", "中", "😀", "ü"] {
+            for pad in 0..8 {
+                let body = format!("{{\"k\":\"{}{}\" BAD}}", "x".repeat(pad), filler.repeat(20));
+                let error = validate_json_body(body).unwrap_err();
+                assert!(
+                    error.contains("Context:"),
+                    "filler {filler:?} pad {pad}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_json_body_handles_faults_at_the_edges() {
+        // Empty and single-byte bodies drive the window past both ends.
+        for body in ["", "{", "\u{1b}", "é"] {
+            let error = validate_json_body(body.to_string()).unwrap_err();
+            assert!(error.contains("Invalid JSON body:"), "{body:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn validate_json_body_passes_valid_bodies_through_unchanged() {
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"héllo 😀"}]}"#;
+        assert_eq!(validate_json_body(body.to_string()).unwrap(), body);
+    }
+
+    #[test]
+    fn char_boundary_helpers_snap_outward() {
+        let s = "aé😀b"; // 1 + 2 + 4 + 1 bytes
+        assert_eq!(char_boundary_floor(s, 2), 1); // inside 'é'
+        assert_eq!(char_boundary_ceil(s, 2), 3); // inside 'é'
+        assert_eq!(char_boundary_floor(s, 5), 3); // inside '😀'
+        assert_eq!(char_boundary_ceil(s, 5), 7); // inside '😀'
+                                                 // Out-of-range indices clamp to the string rather than panicking.
+        assert_eq!(char_boundary_floor(s, 999), s.len());
+        assert_eq!(char_boundary_ceil(s, 999), s.len());
+    }
 
     #[test]
     fn test_streaming_multiple_tool_calls_all_survive() {
