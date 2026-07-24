@@ -318,13 +318,13 @@ mod tests {
             "-m".to_string(),
             message.clone(),
         ]);
-        assert_eq!(args, vec!["commit".to_string(), "-m".to_string(), message]);
+        // No extra `-m` trailer arg when the message already co-authors cairn-code.
         assert_eq!(
-            args.iter()
-                .filter(|a| a.as_str() == CO_AUTHOR_TRAILER)
-                .count(),
-            1
+            args,
+            vec!["commit".to_string(), "-m".to_string(), message.clone()]
         );
+        assert!(message_has_cairn_co_author(&message));
+        assert_eq!(args.iter().filter(|a| *a == CO_AUTHOR_TRAILER).count(), 0);
     }
 
     #[test]
