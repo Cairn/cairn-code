@@ -190,75 +190,42 @@ fn request_body(
 }
 
 fn curated_models() -> Vec<ModelInfo> {
-    vec![
-        ModelInfo {
-            id: "grok-4.5".into(),
-            name: "Grok 4.5".into(),
-            max_ctx: 500_000,
-        },
-        ModelInfo {
-            id: "grok-4.3".into(),
-            name: "Grok 4.3".into(),
-            max_ctx: 1_000_000,
-        },
-        ModelInfo {
-            id: "grok-4.20-0309-reasoning".into(),
-            name: "Grok 4.20 Reasoning".into(),
-            max_ctx: 1_000_000,
-        },
-        ModelInfo {
-            id: "grok-4.20-0309-non-reasoning".into(),
-            name: "Grok 4.20 Non-reasoning".into(),
-            max_ctx: 1_000_000,
-        },
-        ModelInfo {
-            id: "grok-4.20-multi-agent-0309".into(),
-            name: "Grok 4.20 Multi-agent".into(),
-            max_ctx: 1_000_000,
-        },
-        ModelInfo {
-            id: "grok-build-0.1".into(),
-            name: "Grok Build 0.1".into(),
-            max_ctx: 256_000,
-        },
-        ModelInfo {
-            id: "grok-4".into(),
-            name: "Grok 4".into(),
-            max_ctx: 256_000,
-        },
-        ModelInfo {
-            id: "grok-code-fast-1".into(),
-            name: "Grok Code Fast".into(),
-            max_ctx: 256_000,
-        },
-        ModelInfo {
-            id: "grok-3".into(),
-            name: "Grok 3".into(),
-            max_ctx: 131_072,
-        },
-        ModelInfo {
-            id: "grok-3-mini".into(),
-            name: "Grok 3 Mini".into(),
-            max_ctx: 131_072,
-        },
-    ]
+    // Picker only lists current Grok 4.5+ chat models. Older families (4.20,
+    // 4.3, 4, 3, code-fast, build) are obsolete for day-to-day use.
+    vec![ModelInfo {
+        id: "grok-4.5".into(),
+        name: "Grok 4.5".into(),
+        max_ctx: 500_000,
+    }]
+}
+
+/// Models shown in `/model` for xAI. Keep Grok 4.5 and anything clearly newer
+/// (5.x+); drop legacy 4.20 / 4.3 / 4 / 3 / build / code-fast rows.
+fn is_current_picker_model(id: &str) -> bool {
+    let lower = id.to_ascii_lowercase();
+    if !is_chat_model_id(&lower) {
+        return false;
+    }
+    if lower.starts_with("grok-4.5") {
+        return true;
+    }
+    // Future major lines (grok-5, grok-6, …) — not grok-4 / grok-4.3 / grok-4.20.
+    if let Some(rest) = lower.strip_prefix("grok-") {
+        let major: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = major.parse::<u32>() {
+            return n >= 5;
+        }
+    }
+    false
 }
 
 fn context_for_id(id: &str) -> u64 {
     let lower = id.to_ascii_lowercase();
     if lower.starts_with("grok-4.5") {
         500_000
-    } else if lower.starts_with("grok-4.3")
-        || lower.starts_with("grok-4.20")
-        || lower.contains("4.20")
-    {
-        1_000_000
-    } else if lower.starts_with("grok-build") {
-        256_000
-    } else if lower.starts_with("grok-4") || lower.contains("code-fast") {
-        256_000
-    } else if lower.starts_with("grok-3") {
-        131_072
+    } else if lower.starts_with("grok-5") || lower.starts_with("grok-6") {
+        // Conservative default until we know shipped context windows.
+        500_000
     } else {
         131_072
     }
@@ -314,13 +281,17 @@ fn is_chat_model_id(id: &str) -> bool {
 
 fn model_supports_effort(id: &str) -> bool {
     let lower = id.to_ascii_lowercase();
-    lower.starts_with("grok-4.5") || lower.contains("multi-agent")
+    // Current picker models use reasoning effort; keep multi-agent for any
+    // residual request path even though it is no longer listed.
+    lower.starts_with("grok-4.5")
+        || lower.starts_with("grok-5")
+        || lower.contains("multi-agent")
 }
 
 fn efforts_for(id: &str) -> Option<&'static [&'static str]> {
     let lower = id.to_ascii_lowercase();
-    // Strongest effort first: high → medium → low (xhigh above high for multi-agent).
-    if lower.starts_with("grok-4.5") {
+    // Strongest effort first: high → medium → low.
+    if lower.starts_with("grok-4.5") || lower.starts_with("grok-5") {
         return Some(&["high", "medium", "low"]);
     }
     if lower.contains("multi-agent") {
@@ -370,20 +341,10 @@ fn expand_reasoning_rows(base: Vec<ModelInfo>) -> Vec<ModelInfo> {
 
 fn rank_model(id: &str) -> u8 {
     let base = id.to_ascii_lowercase();
-    if base.starts_with("grok-4.5") {
+    if base.starts_with("grok-5") || base.starts_with("grok-6") {
         0
-    } else if base.starts_with("grok-4.3") {
+    } else if base.starts_with("grok-4.5") {
         1
-    } else if base.contains("multi-agent") {
-        2
-    } else if base.starts_with("grok-4.20") {
-        3
-    } else if base.starts_with("grok-build") {
-        4
-    } else if base.starts_with("grok-4") {
-        5
-    } else if base.contains("code") {
-        6
     } else {
         10
     }
@@ -394,7 +355,7 @@ fn ids_to_model_info(ids: &[String]) -> Vec<ModelInfo> {
     let mut out = Vec::new();
     for id in ids {
         let id = id.trim();
-        if id.is_empty() || !is_chat_model_id(id) {
+        if id.is_empty() || !is_current_picker_model(id) {
             continue;
         }
         let key = id.to_ascii_lowercase();
@@ -473,6 +434,14 @@ mod tests {
         assert!(models.iter().any(|m| m.id.starts_with("grok-4.5")));
         assert!(models.iter().any(|m| m.id == "grok-4.5:high"));
         assert!(models.iter().any(|m| m.id == "grok-4.5:low"));
+        assert!(
+            models.iter().all(|m| {
+                let (base, _) = parse_model_spec(&m.id);
+                is_current_picker_model(&base)
+            }),
+            "picker leaked legacy models: {:?}",
+            models.iter().map(|m| &m.id).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -520,39 +489,54 @@ mod tests {
 
     #[test]
     fn parse_models_json() {
-        let body = r#"{"data":[{"id":"grok-4.5"},{"id":"grok-imagine-image"},{"id":"grok-4.3"}]}"#;
+        let body = r#"{"data":[{"id":"grok-4.5"},{"id":"grok-imagine-image"},{"id":"grok-4.3"},{"id":"grok-4"},{"id":"grok-3"}]}"#;
         let ids = parse_models_response(body).unwrap();
-        assert_eq!(ids, vec!["grok-4.5", "grok-imagine-image", "grok-4.3"]);
+        assert!(ids.contains(&"grok-4.5".into()));
+        assert!(ids.contains(&"grok-4.3".into()));
         let infos = ids_to_model_info(&ids);
         assert!(infos.iter().any(|m| m.id == "grok-4.5"));
-        assert!(infos.iter().any(|m| m.id == "grok-4.3"));
+        // Legacy catalog rows must not appear in the picker.
+        assert!(!infos.iter().any(|m| m.id == "grok-4.3"));
+        assert!(!infos.iter().any(|m| m.id == "grok-4"));
+        assert!(!infos.iter().any(|m| m.id == "grok-3"));
         assert!(!infos.iter().any(|m| m.id.contains("imagine")));
     }
 
     #[test]
-    fn expand_multi_agent_has_xhigh() {
-        let rows = expand_reasoning_rows(vec![ModelInfo {
-            id: "grok-4.20-multi-agent-0309".into(),
-            name: "Multi".into(),
-            max_ctx: 1_000_000,
-        }]);
-        assert!(rows.iter().any(|m| m.id.ends_with(":xhigh")));
+    fn curated_picker_is_only_grok_45_family() {
+        let models = expand_reasoning_rows(curated_models());
+        assert!(!models.is_empty());
+        assert!(
+            models.iter().all(|m| m.id.starts_with("grok-4.5")),
+            "unexpected curated picker rows: {:?}",
+            models.iter().map(|m| &m.id).collect::<Vec<_>>()
+        );
+        assert!(models.iter().any(|m| m.id == "grok-4.5:high"));
+        assert!(models.iter().any(|m| m.id == "grok-4.5:medium"));
+        assert!(models.iter().any(|m| m.id == "grok-4.5:low"));
+    }
+
+    #[test]
+    fn is_current_picker_filters_legacy() {
+        assert!(is_current_picker_model("grok-4.5"));
+        assert!(is_current_picker_model("grok-4.5-preview"));
+        assert!(is_current_picker_model("grok-5"));
+        assert!(!is_current_picker_model("grok-4.3"));
+        assert!(!is_current_picker_model("grok-4.20-multi-agent-0309"));
+        assert!(!is_current_picker_model("grok-4"));
+        assert!(!is_current_picker_model("grok-3"));
+        assert!(!is_current_picker_model("grok-code-fast-1"));
+        assert!(!is_current_picker_model("grok-build-0.1"));
+        assert!(!is_current_picker_model("grok-imagine-image"));
     }
 
     #[test]
     fn effort_rows_ordered_high_medium_low() {
-        let rows = expand_reasoning_rows(vec![
-            ModelInfo {
-                id: "grok-4.5".into(),
-                name: "Grok 4.5".into(),
-                max_ctx: 500_000,
-            },
-            ModelInfo {
-                id: "grok-4.20-multi-agent-0309".into(),
-                name: "Multi".into(),
-                max_ctx: 1_000_000,
-            },
-        ]);
+        let rows = expand_reasoning_rows(vec![ModelInfo {
+            id: "grok-4.5".into(),
+            name: "Grok 4.5".into(),
+            max_ctx: 500_000,
+        }]);
         let g45: Vec<_> = rows
             .iter()
             .filter(|m| m.id.starts_with("grok-4.5:"))
@@ -562,13 +546,6 @@ mod tests {
             g45,
             vec!["grok-4.5:high", "grok-4.5:medium", "grok-4.5:low"]
         );
-
-        let ma: Vec<_> = rows
-            .iter()
-            .filter(|m| m.id.contains("multi-agent"))
-            .map(|m| m.id.rsplit_once(':').unwrap().1)
-            .collect();
-        assert_eq!(ma, vec!["xhigh", "high", "medium", "low"]);
     }
 
     #[test]
