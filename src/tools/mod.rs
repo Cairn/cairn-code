@@ -12,6 +12,7 @@ pub mod powershell_tool;
 pub mod python_tool;
 pub mod registry;
 pub mod shell;
+pub mod skill_tool;
 pub mod todo;
 pub mod web_fetch;
 pub mod web_search;
