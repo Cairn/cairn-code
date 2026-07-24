@@ -3488,6 +3488,112 @@ fn completion_wants_trailing_space(completion: &str) -> bool {
     )
 }
 
+/// Strip terminal controls before writing untrusted text directly to a terminal.
+///
+/// This is intentionally used only at raw stdout boundaries. Ratatui should
+/// continue receiving the original text so its normal rendering is unchanged.
+pub fn sanitize_terminal_output(input: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum State {
+        Text,
+        Escape,
+        EscapeIntermediate,
+        Csi,
+        ControlString { osc: bool },
+        ControlStringEscape { osc: bool },
+    }
+
+    let mut output = String::with_capacity(input.len());
+    let mut state = State::Text;
+
+    for character in input.chars() {
+        state = match state {
+            State::Text => match character {
+                '\n' | '\t' => {
+                    output.push(character);
+                    State::Text
+                }
+                '\u{001b}' => State::Escape,
+                '\u{009b}' => State::Csi,
+                '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
+                    State::ControlString {
+                        osc: character == '\u{009d}',
+                    }
+                }
+                '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}' => State::Text,
+                _ => {
+                    output.push(character);
+                    State::Text
+                }
+            },
+            State::Escape => match character {
+                '[' => State::Csi,
+                ']' => State::ControlString { osc: true },
+                'P' | 'X' | '^' | '_' => State::ControlString { osc: false },
+                '\u{001b}' => State::Escape,
+                '\u{009b}' => State::Csi,
+                '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
+                    State::ControlString {
+                        osc: character == '\u{009d}',
+                    }
+                }
+                '\n' | '\t' => {
+                    output.push(character);
+                    State::Text
+                }
+                '\u{0020}'..='\u{002f}' => State::EscapeIntermediate,
+                '\u{0030}'..='\u{007e}' | '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}' => {
+                    State::Text
+                }
+                _ => {
+                    output.push(character);
+                    State::Text
+                }
+            },
+            State::EscapeIntermediate => match character {
+                '\u{0020}'..='\u{002f}' => State::EscapeIntermediate,
+                '\u{0030}'..='\u{007e}' => State::Text,
+                '\u{001b}' => State::Escape,
+                '\n' | '\t' => {
+                    output.push(character);
+                    State::Text
+                }
+                '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}' => State::Text,
+                _ => {
+                    output.push(character);
+                    State::Text
+                }
+            },
+            State::Csi => match character {
+                '\u{0040}'..='\u{007e}' => State::Text,
+                '\u{001b}' => State::Escape,
+                '\u{009b}' => State::Csi,
+                '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
+                    State::ControlString {
+                        osc: character == '\u{009d}',
+                    }
+                }
+                '\u{009c}' => State::Text,
+                _ => State::Csi,
+            },
+            State::ControlString { osc } => match character {
+                '\u{009c}' => State::Text,
+                '\u{0007}' if osc => State::Text,
+                '\u{001b}' => State::ControlStringEscape { osc },
+                _ => State::ControlString { osc },
+            },
+            State::ControlStringEscape { osc } => match character {
+                '\\' | '\u{009c}' => State::Text,
+                '\u{0007}' if osc => State::Text,
+                '\u{001b}' => State::ControlStringEscape { osc },
+                _ => State::ControlString { osc },
+            },
+        };
+    }
+
+    output
+}
+
 /// Leave the ratatui alt-screen and print plain text so the host terminal can
 /// drag-select (Windows Terminal does not reliably select inside a redrawing TUI).
 fn enter_plain_select_mode(terminal: &mut DefaultTerminal, text: &str) -> Result<(), String> {
@@ -3504,6 +3610,7 @@ fn enter_plain_select_mode(terminal: &mut DefaultTerminal, text: &str) -> Result
          Press Enter to return to Cairn.\n\
          ==================================\n"
     );
+    let text = sanitize_terminal_output(text);
     let _ = writeln!(out, "{text}");
     let _ = writeln!(out, "\n======== end — press Enter to return ========\n");
     let _ = out.flush();
@@ -3515,6 +3622,58 @@ fn enter_plain_select_mode(terminal: &mut DefaultTerminal, text: &str) -> Result
     *terminal = ratatui::init();
     terminal.clear().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod terminal_output_tests {
+    use super::sanitize_terminal_output;
+
+    #[test]
+    fn strips_osc_clipboard_title_and_hyperlink_payloads() {
+        let input = concat!(
+            "before",
+            "\u{001b}]52;c;YXR0YWNrZXItY29udHJvbGxlZA==\u{0007}",
+            "\u{001b}]0;forged title\u{001b}\\",
+            "\u{001b}]8;;https://evil.example/\u{001b}\\link text\u{001b}]8;;\u{001b}\\",
+            "after"
+        );
+
+        assert_eq!(sanitize_terminal_output(input), "beforelink textafter");
+        assert_eq!(
+            sanitize_terminal_output("safe\u{001b}]52;c;unterminated payload"),
+            "safe"
+        );
+    }
+
+    #[test]
+    fn strips_csi_other_escape_sequences_and_their_payloads() {
+        let input = concat!(
+            "plain ",
+            "\u{001b}[31mred\u{001b}[0m",
+            "\u{009b}2J",
+            " visible",
+            "\u{001b}P1;2|dcs payload\u{001b}\\",
+            " end"
+        );
+
+        assert_eq!(sanitize_terminal_output(input), "plain red visible end");
+    }
+
+    #[test]
+    fn strips_c0_c1_controls_and_eight_bit_control_strings() {
+        let input = "a\u{0000}b\u{0007}c\u{0008}d\r e\u{007f}f\u{0085}g\u{001b}";
+        assert_eq!(sanitize_terminal_output(input), "abcd efg");
+        assert_eq!(
+            sanitize_terminal_output("left\u{009d}52;c;secret\u{009c}right"),
+            "leftright"
+        );
+    }
+
+    #[test]
+    fn preserves_normal_unicode_newlines_and_tabs() {
+        let input = "Grüße from 東京 🏔️\n\tcafé\n";
+        assert_eq!(sanitize_terminal_output(input), input);
+    }
 }
 
 /// Best-effort clipboard write: Windows PowerShell first, then OSC 52.

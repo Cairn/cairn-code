@@ -221,6 +221,17 @@ fn cli_preserves_unicode_prompt_and_response() {
 }
 
 #[test]
+fn cli_print_strips_terminal_control_sequences() {
+    let fixture = CliFixture::new();
+    let response = r#"{"choices":[{"message":{"role":"assistant","content":"before\u001b]52;c;YXR0YWNr\u0007\u001b[2Jafter"}}]}"#;
+
+    let output = stdout(&fixture.run("return untrusted terminal controls", response));
+
+    assert_eq!(output, "beforeafter\n");
+    assert!(!output.contains("YXR0YWNr"), "{output:?}");
+}
+
+#[test]
 fn corrupt_session_is_rejected_without_losing_neighboring_session() {
     let root = tempfile::tempdir().unwrap();
     fs::write(
