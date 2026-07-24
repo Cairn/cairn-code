@@ -382,11 +382,43 @@ fn flatten_content(content: Option<&JsonValue>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn flatten_text_blocks() {
         let raw = r#"{"content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}]}"#;
         let v = json::parse(raw).unwrap();
         assert_eq!(flatten_content(v.get("content")), "hello\nworld");
+    }
+
+    #[test]
+    fn read_loop_ndjson_framing() {
+        let payload = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n";
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel();
+        pending.lock().unwrap().insert(1, Pending { tx });
+        read_loop(Cursor::new(payload), pending, "test");
+        let res = rx.recv().unwrap();
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn read_loop_content_length_framing() {
+        let body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"status\":\"ok\"}}";
+        let payload = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel();
+        pending.lock().unwrap().insert(2, Pending { tx });
+        read_loop(Cursor::new(payload), pending, "test");
+        let res = rx.recv().unwrap();
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn wait_response_timeout_and_disconnect() {
+        let (tx, rx) = mpsc::channel();
+        assert!(wait_response(&rx, Duration::from_millis(50), "test", "test").is_err());
+        drop(tx);
+        assert!(wait_response(&rx, Duration::from_secs(1), "test", "test").is_err());
     }
 }
