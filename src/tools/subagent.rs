@@ -52,7 +52,7 @@ impl Tool for SubagentTool {
     }
 
     fn input_schema(&self) -> String {
-        r#"{"type":"object","properties":{"harness":{"type":"string","description":"Harness name: claude, agy, grok, zero, or a custom name from config.subagents.harnesses"},"prompt":{"type":"string","description":"Full task for the child harness"},"isolation":{"type":"string","description":"none | worktree (default from config, usually worktree)"},"timeout_ms":{"type":"integer","description":"Wall-clock timeout in milliseconds (default 600000)"},"cwd":{"type":"string","description":"Working directory; mutually exclusive with isolation=worktree"},"extra_args":{"type":"array","items":{"type":"string"},"description":"Extra argv appended after the harness template args"}},"required":["harness","prompt"]}"#.into()
+        r#"{"type":"object","properties":{"harness":{"type":"string","description":"Harness name: claude, agy, grok, zero, or a custom name from config.subagents.harnesses"},"prompt":{"type":"string","description":"Full task for the child harness"},"isolation":{"type":"string","description":"none | worktree (default from config, usually worktree)"},"timeout_ms":{"type":"integer","description":"Wall-clock timeout in milliseconds (default 600000)"},"cwd":{"type":"string","description":"Any directory this process can access; mutually exclusive with isolation=worktree. Not confined to the workspace root."},"extra_args":{"type":"array","items":{"type":"string"},"description":"Extra argv after the harness template. Fully model-controlled after permission (can pass flags like --dangerously-skip-permissions if the harness accepts them)"}},"required":["harness","prompt"]}"#.into()
     }
 
     fn execute(&self, input: &str) -> Result<String, String> {

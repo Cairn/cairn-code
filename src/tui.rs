@@ -2529,6 +2529,9 @@ impl Tui {
     }
 
     /// `/subagent` [list|help|[worktree|none] <harness> <prompt…>]
+    ///
+    /// Long runs are handed to the agent worker thread (like OAuth) so the TUI
+    /// event loop keeps painting and Ctrl+C can set the cancel flag.
     fn handle_subagent_command(&mut self, args: &[&str]) {
         let cfg = match crate::config::Config::load() {
             Ok(cfg) => cfg,
@@ -2543,6 +2546,19 @@ impl Tui {
             }
         };
         let sub = &cfg.subagents;
+
+        // Kill switch applies to list and run (same message as the tool).
+        if !sub.is_enabled() {
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: "Subagents are disabled (config subagents.enabled=false or CAIRN_SUBAGENTS=0)."
+                    .into(),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        }
+
         if args.is_empty()
             || matches!(
                 args[0].to_ascii_lowercase().as_str(),
@@ -2618,10 +2634,30 @@ impl Tui {
             }
         };
 
+        if self.agent_tx.is_none() {
+            self.output_lines.push(OutputLine {
+                type_: "error".into(),
+                content: "Agent channel not ready; cannot run /subagent.".into(),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        }
+
+        let timeout = harness.timeout_ms.unwrap_or(sub.default_timeout_ms);
+        // Escape prompt for a minimal JSON payload the agent worker understands.
+        let payload = format!(
+            r#"{{"harness":"{}","prompt":"{}","isolation":"{}","timeout_ms":{}}}"#,
+            escape_json_simple(harness_name),
+            escape_json_simple(&prompt),
+            escape_json_simple(isolation.as_str()),
+            timeout
+        );
+
         self.output_lines.push(OutputLine {
             type_: "system".into(),
             content: format!(
-                "Running subagent harness={harness_name} isolation={} (binary={})…",
+                "Running subagent harness={harness_name} isolation={} (binary={})… Ctrl+C to cancel.",
                 isolation.as_str(),
                 harness.command
             ),
@@ -2629,34 +2665,13 @@ impl Tui {
             duration: String::new(),
         });
 
-        let timeout = harness.timeout_ms.unwrap_or(sub.default_timeout_ms);
-        let result = crate::tools::subagent::run_subagent(
-            harness_name,
-            &harness,
-            &prompt,
-            timeout,
-            isolation,
-            None,
-            &[],
-            self.cancel_flag.as_deref(),
-        );
-        match result {
-            Ok(out) => {
-                self.output_lines.push(OutputLine {
-                    type_: "tool_result".into(),
-                    content: out,
-                    tool_name: "subagent".into(),
-                    duration: String::new(),
-                });
-            }
-            Err(e) => {
-                self.output_lines.push(OutputLine {
-                    type_: "error".into(),
-                    content: e,
-                    tool_name: String::new(),
-                    duration: String::new(),
-                });
-            }
+        if let Some(flag) = &self.cancel_flag {
+            flag.store(false, Ordering::Relaxed);
+        }
+        self.expect_turn_notify = true;
+        self.begin_running();
+        if let Some(tx) = &self.agent_tx {
+            let _ = tx.send(format!("__subagent__:{payload}"));
         }
     }
 

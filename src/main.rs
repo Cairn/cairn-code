@@ -327,6 +327,8 @@ fn main() -> ExitCode {
     let cancel2 = cancel.clone();
     let live_mirror = session::new_live_mirror();
     let live_mirror_agent = live_mirror.clone();
+    // Slash /subagent needs config without borrowing agent.config (private).
+    let subagents_cfg = cfg.subagents.clone();
 
     let p_model_for_agent = p_model.clone();
     let p_model_for_print = p_model.clone();
@@ -447,6 +449,25 @@ fn main() -> ExitCode {
                         }
                     }
                 }
+                Ok(cmd) if cmd.starts_with("__subagent__:") => {
+                    // Slash /subagent runs on the agent worker so the TUI keeps
+                    // painting and cancel2 (Ctrl+C) reaches process_runner.
+                    cancel2.store(false, Ordering::Relaxed);
+                    let json = cmd.trim_start_matches("__subagent__:");
+                    match run_slash_subagent(json, &subagents_cfg, &cancel2) {
+                        Ok(out) => {
+                            let _ = event_tx.send(AgentEvent::ToolResult(
+                                "subagent".into(),
+                                String::new(),
+                                out,
+                            ));
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(AgentEvent::Error(e));
+                        }
+                    }
+                    let _ = event_tx.send(AgentEvent::Done);
+                }
                 Ok(prompt) => {
                     cancel2.store(false, Ordering::Relaxed);
                     let _ = agent.run(&prompt, event_tx.clone(), &cancel2, &perm_rx);
@@ -513,6 +534,60 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Parse the slash `/subagent` JSON payload and run the harness (agent worker).
+fn run_slash_subagent(
+    json: &str,
+    sub: &config::SubagentConfig,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    if !sub.is_enabled() {
+        return Err(
+            "Subagents are disabled (config subagents.enabled=false or CAIRN_SUBAGENTS=0)."
+                .into(),
+        );
+    }
+    let val =
+        cairn_code::json::parse(json).map_err(|e| format!("invalid /subagent payload: {e}"))?;
+    let obj = val
+        .as_object()
+        .ok_or("invalid /subagent payload: expected object")?;
+    let harness_name = obj
+        .get("harness")
+        .and_then(|v| v.as_str())
+        .ok_or("harness required")?
+        .trim();
+    if harness_name.is_empty() {
+        return Err("harness required".into());
+    }
+    let prompt = obj
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .ok_or("prompt required")?;
+    if prompt.trim().is_empty() {
+        return Err("prompt required".into());
+    }
+    let isolation = match obj.get("isolation").and_then(|v| v.as_str()) {
+        Some(s) => config::SubagentIsolation::parse(s)
+            .ok_or_else(|| format!("invalid isolation {s:?}"))?,
+        None => sub.default_isolation,
+    };
+    let timeout_ms = obj
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(sub.default_timeout_ms);
+    let harness = tools::subagent::resolve_harness(sub, harness_name)?;
+    tools::subagent::run_subagent(
+        harness_name,
+        &harness,
+        prompt,
+        timeout_ms,
+        isolation,
+        None,
+        &[],
+        Some(cancel),
+    )
 }
 
 fn print_help(version: &str) {
