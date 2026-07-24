@@ -3159,53 +3159,47 @@ impl Tui {
                 cursor_pos = Some((display_width("❯ ") as u16 + display_width(before) as u16, 0));
             }
 
-            // Claude Code / OpenClaude-style status row under the prompt.
-            // Shown when the normal composer is active (not pickers/dialogs).
-            if !self.show_command_picker
-                && !self.show_session_picker
-                && !self.show_model_picker
-                && !self.show_provider_picker
-                && !self.show_theme_picker
-                && self.confirm_remove_provider.is_none()
-                && self.confirm_history_provider.is_none()
-            {
-                chrome.push(Line::from(""));
-                let mut status = Vec::new();
+            // Status row under the prompt (model · cwd · tokens · cost).
+            // Always keep this while the normal composer is visible, including
+            // slash ghost completion. Hiding it when `/` sets show_command_picker
+            // shrinks chrome and drops the prompt to the terminal bottom.
+            // Other pickers/dialogs take earlier branches and never reach here.
+            chrome.push(Line::from(""));
+            let mut status = Vec::new();
+            status.push(Span::styled(
+                format!("{}/{}", self.provider, self.model),
+                dim,
+            ));
+            // Shorten home-ish paths for the footer.
+            let path = self.work_dir.as_str();
+            let short_path = path
+                .rsplit(['/', '\\'])
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(path);
+            status.push(Span::styled(" · ", bold_dim));
+            status.push(Span::styled(short_path, dim));
+            if self.total_usage.input_tokens > 0 || self.total_usage.output_tokens > 0 {
+                let est = crate::cost::estimate_cost(&self.model, &self.total_usage);
+                let cost_str = crate::cost::format_cost(est);
+                status.push(Span::styled(" · ", bold_dim));
                 status.push(Span::styled(
-                    format!("{}/{}", self.provider, self.model),
+                    format!(
+                        "{}↓ {}↑",
+                        self.total_usage.input_tokens, self.total_usage.output_tokens
+                    ),
                     dim,
                 ));
-                // Shorten home-ish paths for the footer.
-                let path = self.work_dir.as_str();
-                let short_path = path
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(path);
-                status.push(Span::styled(" · ", bold_dim));
-                status.push(Span::styled(short_path, dim));
-                if self.total_usage.input_tokens > 0 || self.total_usage.output_tokens > 0 {
-                    let est = crate::cost::estimate_cost(&self.model, &self.total_usage);
-                    let cost_str = crate::cost::format_cost(est);
+                if est > 0.0 {
                     status.push(Span::styled(" · ", bold_dim));
-                    status.push(Span::styled(
-                        format!(
-                            "{}↓ {}↑",
-                            self.total_usage.input_tokens, self.total_usage.output_tokens
-                        ),
-                        dim,
-                    ));
-                    if est > 0.0 {
-                        status.push(Span::styled(" · ", bold_dim));
-                        status.push(Span::styled(cost_str, dim));
-                    }
+                    status.push(Span::styled(cost_str, dim));
                 }
-                if matches!(self.state, State::Idle) && self.input_buf.is_empty() {
-                    status.push(Span::styled(" · ", bold_dim));
-                    status.push(Span::styled("? for shortcuts", bold_dim));
-                }
-                chrome.push(Line::from(status));
             }
+            if matches!(self.state, State::Idle) && self.input_buf.is_empty() {
+                status.push(Span::styled(" · ", bold_dim));
+                status.push(Span::styled("? for shortcuts", bold_dim));
+            }
+            chrome.push(Line::from(status));
         }
 
         let width = area.width as usize;

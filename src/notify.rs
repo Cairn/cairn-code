@@ -1,13 +1,14 @@
 //! Lightweight attention sounds when the agent finishes or needs input.
 //!
-//! Uses the terminal BEL plus a short system beep on Windows/macOS when
-//! available. Disable with `CAIRN_SOUND=0` (or `false` / `off` / `no`).
+//! Primary cue is the terminal BEL (`\x07`), which Windows Terminal maps to
+//! its notification chime. Extra platform tones are only used where they do
+//! not stack a second ugly PC-speaker beep on top of that chime.
+//! Disable with `CAIRN_SOUND=0` (or `false` / `off` / `no`).
 
 use std::io::{self, Write};
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 use std::thread;
-#[cfg(all(unix, not(target_os = "macos")))]
 use std::time::Duration;
 
 /// What kind of cue to play.
@@ -31,57 +32,43 @@ pub fn enabled() -> bool {
 }
 
 /// Fire-and-forget notification. Never blocks the TUI for more than a few ms
-/// of spawn overhead; actual tones run on a detached thread when needed.
+/// of spawn overhead; multi-tone patterns run on a detached thread.
 pub fn play(kind: Kind) {
     if !enabled() {
         return;
     }
-    // Universal: terminal bell (works in most terminals on all platforms).
+    // Terminal BEL: Windows Terminal plays its soft flourish; other terminals
+    // typically map this to their own bell/alert. Do not layer Console.Beep
+    // on Windows — that is the square-wave POST-speaker tone.
     let _ = write!(io::stderr(), "\x07");
     let _ = io::stderr().flush();
 
-    // Richer, non-blocking system beep when we can without new dependencies.
     thread::spawn(move || match kind {
-        Kind::Done => platform_beep_done(),
-        Kind::Attention => platform_beep_attention(),
+        Kind::Done => platform_extra_done(),
+        Kind::Attention => platform_extra_attention(),
     });
 }
 
-#[cfg(windows)]
-fn platform_beep_done() {
-    // Soft mid tone
-    let _ = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "[console]::beep(880,90)",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+fn bell() {
+    let _ = write!(io::stderr(), "\x07");
+    let _ = io::stderr().flush();
 }
 
 #[cfg(windows)]
-fn platform_beep_attention() {
-    // Two-tone: lower then higher (needs attention)
-    let _ = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "[console]::beep(660,80); Start-Sleep -Milliseconds 40; [console]::beep(990,120)",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+fn platform_extra_done() {
+    // BEL alone is enough: Windows Terminal already sounds the nice chime.
+}
+
+#[cfg(windows)]
+fn platform_extra_attention() {
+    // Distinct from Done: a second soft BEL, still no Console.Beep.
+    thread::sleep(Duration::from_millis(120));
+    bell();
 }
 
 #[cfg(target_os = "macos")]
-fn platform_beep_done() {
-    // Glass is short and unobtrusive when available.
+fn platform_extra_done() {
+    // Soft system sound; BEL already fired above for terminals that use it.
     let _ = Command::new("afplay")
         .args(["-v", "0.3", "/System/Library/Sounds/Pop.aiff"])
         .stdin(Stdio::null())
@@ -91,7 +78,7 @@ fn platform_beep_done() {
 }
 
 #[cfg(target_os = "macos")]
-fn platform_beep_attention() {
+fn platform_extra_attention() {
     let _ = Command::new("afplay")
         .args(["-v", "0.35", "/System/Library/Sounds/Funk.aiff"])
         .stdin(Stdio::null())
@@ -101,19 +88,17 @@ fn platform_beep_attention() {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn platform_beep_done() {
+fn platform_extra_done() {
     // Second BEL after a short gap if the terminal supports it.
     thread::sleep(Duration::from_millis(40));
-    let _ = write!(io::stderr(), "\x07");
-    let _ = io::stderr().flush();
+    bell();
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn platform_beep_attention() {
+fn platform_extra_attention() {
     for _ in 0..2 {
-        let _ = write!(io::stderr(), "\x07");
-        let _ = io::stderr().flush();
         thread::sleep(Duration::from_millis(90));
+        bell();
     }
 }
 
