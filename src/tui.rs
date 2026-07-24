@@ -15,7 +15,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
     DefaultTerminal, Frame,
 };
 
@@ -3247,72 +3247,8 @@ impl Tui {
                 0,
             ));
         } else {
-            // Claude Code / OpenClaude: full-width rounded composer box above the
-            // status byline. Inner text is exactly (term_w - 2) display columns so
-            // │ … │ never wraps; caret x = 1 (left border) + width(mark + before).
-            let term_w = (area.width as usize).max(4);
-            let inner_w = term_w.saturating_sub(2).max(1);
-            let box_style = orange_fg;
-            let cursor = self.cursor.min(self.input_buf.len());
-            let (before, after) = self.input_buf.split_at(cursor);
-            let mark = "❯ ";
-
-            let mut body = String::from(mark);
-            let show_idle_hint = self.input_buf.is_empty()
-                && matches!(self.state, State::Idle)
-                && self.idle_suggestion.is_some()
-                && !self.show_permission_prompt
-                && !self.show_recovery_prompt
-                && !self.awaiting_api_key;
-            if show_idle_hint {
-                body.push_str(self.idle_suggestion.as_deref().unwrap_or(""));
-            } else {
-                body.push_str(before);
-                body.push_str(after);
-                if cursor >= self.input_buf.len() {
-                    if let Some(cmd) = self.selected_slash_completion() {
-                        if let Some(suffix) = slash_ghost_suffix(&self.input_buf, cmd) {
-                            body.push_str(&suffix);
-                        }
-                    }
-                }
-            }
-            // Exact inner width: prevents the right border from wrapping to the next line.
-            let body = pad_to_display_width(&body, inner_w);
-            debug_assert_eq!(display_width(&body), inner_w);
-
-            // Caret sits on the cell where the next character will be inserted.
-            let cursor_x = (1usize + display_width(mark) + display_width(before))
-                .min(term_w.saturating_sub(1)) as u16;
-
-            chrome.push(Line::from(Span::styled(
-                format!("╭{}╮", "─".repeat(inner_w)),
-                box_style,
-            )));
-            let prompt_line_idx = chrome.len();
-            // Split padded body into mark + remainder so the ❯ stays accent-colored
-            // without changing display width.
-            let mark_w = display_width(mark);
-            let (mark_part, rest_part) = split_at_display_width(&body, mark_w);
-            let rest_style = if show_idle_hint {
-                bold_dim
-            } else {
-                Style::default()
-            };
-            chrome.push(Line::from(vec![
-                Span::styled("│", box_style),
-                Span::styled(mark_part, orange_fg),
-                Span::styled(rest_part, rest_style),
-                Span::styled("│", box_style),
-            ]));
-            chrome.push(Line::from(Span::styled(
-                format!("╰{}╯", "─".repeat(inner_w)),
-                box_style,
-            )));
-            cursor_pos = Some((cursor_x, prompt_line_idx));
-
-            // Status byline under the box (OpenClaude PromptInput footer).
-            chrome.push(Line::from(""));
+            // Normal composer is drawn later with a ratatui Block (reliable full-width
+            // borders). Here we only build the status byline under it.
             let mut status = Vec::new();
             if self.ctrl_c_exit_armed {
                 status.push(Span::styled(
@@ -3365,27 +3301,60 @@ impl Tui {
                 }
             }
             chrome.push(Line::from(status));
+            // Signal: paint Block composer instead of line-drawn box in chrome.
+            cursor_pos = Some((u16::MAX, usize::MAX));
         }
 
         let width = area.width as usize;
         let body_wrapped = total_wrapped(&lines, width);
-        let chrome_wrapped = total_wrapped(&chrome, width).max(1);
+        // Normal composer uses a separate 3-row Block + status line in chrome.
+        let use_block_composer = cursor_pos == Some((u16::MAX, usize::MAX));
+        let status_h = if use_block_composer {
+            total_wrapped(&chrome, width).max(1) as u16
+        } else {
+            0
+        };
+        let chrome_wrapped = if use_block_composer {
+            // status only (composer is separate)
+            status_h as usize
+        } else {
+            total_wrapped(&chrome, width).max(1)
+        };
         // Keep room for transcript; cap chrome so pickers cannot hide all output.
+        let composer_h: u16 = if use_block_composer { 3 } else { 0 };
         let max_chrome = (area.height as usize)
             .saturating_sub(3)
             .min((area.height as usize).saturating_mul(2) / 3)
             .max(1);
-        let chrome_h = chrome_wrapped.min(max_chrome) as u16;
-        let chrome_scroll = chrome_wrapped.saturating_sub(chrome_h as usize);
+        let chrome_h = if use_block_composer {
+            status_h.min(max_chrome as u16).max(1)
+        } else {
+            chrome_wrapped.min(max_chrome) as u16
+        };
+        let chrome_scroll = if use_block_composer {
+            0
+        } else {
+            chrome_wrapped.saturating_sub(chrome_h as usize)
+        };
 
-        // Claude Code style: always pin the composer/status chrome to the bottom
-        // of the terminal. Transcript fills the space above and scrolls.
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(chrome_h)])
-            .split(area);
-        let body_area = chunks[0];
-        let chrome_area = chunks[1];
+        // Claude Code style: pin composer/status to the bottom.
+        let (body_area, composer_area, chrome_area) = if use_block_composer {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(composer_h),
+                    Constraint::Length(chrome_h),
+                ])
+                .split(area);
+            (chunks[0], Some(chunks[1]), chunks[2])
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(chrome_h)])
+                .split(area);
+            (chunks[0], None, chunks[1])
+        };
 
         // videre-style rowoff: free scroll when not following; pin to bottom when following.
         let body_h = body_area.height as usize;
@@ -3410,12 +3379,82 @@ impl Tui {
                 .scroll((body_scroll as u16, 0)),
             body_area,
         );
-        f.render_widget(
-            Paragraph::new(Text::from(chrome.clone()))
-                .wrap(Wrap { trim: false })
-                .scroll((chrome_scroll as u16, 0)),
-            chrome_area,
-        );
+
+        if let Some(composer_area) = composer_area {
+            // Reliable full-width rounded box via Block (avoids manual │ padding wrap bugs).
+            let cursor = self.cursor.min(self.input_buf.len());
+            let (before, after) = self.input_buf.split_at(cursor);
+            // ASCII ">" is always width-1; ❯ can be ambiguous across fonts/terminals.
+            let mark = "> ";
+            let show_idle_hint = self.input_buf.is_empty()
+                && matches!(self.state, State::Idle)
+                && self.idle_suggestion.is_some()
+                && !self.show_permission_prompt
+                && !self.show_recovery_prompt
+                && !self.awaiting_api_key;
+
+            let mut spans = vec![Span::styled(mark, orange_fg)];
+            if show_idle_hint {
+                spans.push(Span::styled(
+                    self.idle_suggestion.as_deref().unwrap_or(""),
+                    bold_dim,
+                ));
+            } else {
+                // Typed text uses ink (bright), not muted/dim like suggestions.
+                spans.push(Span::styled(before, white));
+                spans.push(Span::styled(after, white));
+                if cursor >= self.input_buf.len() {
+                    if let Some(cmd) = self.selected_slash_completion() {
+                        if let Some(suffix) = slash_ghost_suffix(&self.input_buf, cmd) {
+                            spans.push(Span::styled(suffix, bold_dim));
+                        }
+                    }
+                }
+            }
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(orange_fg);
+            f.render_widget(
+                Paragraph::new(Line::from(spans)).block(block),
+                composer_area,
+            );
+            f.render_widget(
+                Paragraph::new(Text::from(chrome)).wrap(Wrap { trim: false }),
+                chrome_area,
+            );
+
+            // Caret inside the block content area (one cell in from borders).
+            let x = composer_area.x.saturating_add(1).saturating_add(
+                (display_width(mark) + display_width(before))
+                    .min(composer_area.width.saturating_sub(3) as usize) as u16,
+            );
+            let y = composer_area.y.saturating_add(1);
+            f.set_cursor_position(Position { x, y });
+        } else {
+            f.render_widget(
+                Paragraph::new(Text::from(chrome.clone()))
+                    .wrap(Wrap { trim: false })
+                    .scroll((chrome_scroll as u16, 0)),
+                chrome_area,
+            );
+            if let Some((x_off, line_idx)) = cursor_pos {
+                let line_idx = line_idx.min(chrome.len().saturating_sub(1));
+                let wrapped_before = total_wrapped(&chrome[..line_idx], width);
+                let y =
+                    (chrome_area.y as usize + wrapped_before).saturating_sub(chrome_scroll) as u16;
+                let y = y.min(
+                    chrome_area
+                        .y
+                        .saturating_add(chrome_area.height.saturating_sub(1)),
+                );
+                let x = chrome_area
+                    .x
+                    .saturating_add(x_off.min(chrome_area.width.saturating_sub(1)));
+                f.set_cursor_position(Position { x, y });
+            }
+        }
 
         // Scroll position hint when not pinned to bottom (videre shows %).
         // Must fully reset cell style (incl. BOLD from the welcome box border):
@@ -3448,21 +3487,6 @@ impl Tui {
                     },
                 );
             }
-        }
-
-        if let Some((x_off, line_idx)) = cursor_pos {
-            let line_idx = line_idx.min(chrome.len().saturating_sub(1));
-            let wrapped_before = total_wrapped(&chrome[..line_idx], width);
-            let y = (chrome_area.y as usize + wrapped_before).saturating_sub(chrome_scroll) as u16;
-            let y = y.min(
-                chrome_area
-                    .y
-                    .saturating_add(chrome_area.height.saturating_sub(1)),
-            );
-            let x = chrome_area
-                .x
-                .saturating_add(x_off.min(chrome_area.width.saturating_sub(1)));
-            f.set_cursor_position(Position { x, y });
         }
     }
 
@@ -4864,18 +4888,6 @@ fn pad_to_display_width(s: &str, width: usize) -> String {
         out.push_str(&" ".repeat(width - w_used));
     }
     out
-}
-
-/// Split `s` after `at` display columns. Second half may be empty.
-fn split_at_display_width(s: &str, at: usize) -> (String, String) {
-    let mut w = 0;
-    for (i, c) in s.char_indices() {
-        if w >= at {
-            return (s[..i].to_string(), s[i..].to_string());
-        }
-        w += char_width(c);
-    }
-    (s.to_string(), String::new())
 }
 
 fn truncate_summary(summary: &str, max_chars: usize) -> String {
