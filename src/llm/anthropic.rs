@@ -327,6 +327,30 @@ fn build_request_body(
                 Content::Text(text) | Content::Thinking(text) => {
                     serde_json::Value::String(text.clone())
                 }
+                Content::User(blocks) => {
+                    let mut parts = Vec::new();
+                    if !blocks.text.is_empty() {
+                        parts.push(serde_json::json!({
+                            "type": "text",
+                            "text": blocks.text,
+                        }));
+                    }
+                    for img in &blocks.images {
+                        parts.push(serde_json::json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": img.media_type,
+                                "data": img.data_base64,
+                            }
+                        }));
+                    }
+                    if parts.is_empty() {
+                        serde_json::Value::String(String::new())
+                    } else {
+                        serde_json::Value::Array(parts)
+                    }
+                }
                 Content::ToolUse(tool_use) => {
                     let input = serde_json::from_str::<serde_json::Value>(&tool_use.input)
                         .map_err(|e| format!("Invalid input for tool '{}': {e}", tool_use.name))?;

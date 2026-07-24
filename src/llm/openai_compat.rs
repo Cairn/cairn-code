@@ -38,6 +38,35 @@ pub fn build_messages_json(messages: &[Message], system: &str) -> String {
                     msg.role
                 ));
             }
+            Content::User(blocks) => {
+                // OpenAI-compatible multimodal: content is an array of parts.
+                body.push_str(&format!("{{\"role\":\"{}\",\"content\":[", msg.role));
+                let mut first_part = true;
+                if !blocks.text.is_empty() {
+                    let escaped = escape_json_str(&blocks.text);
+                    body.push_str(&format!(
+                        "{{\"type\":\"text\",\"text\":\"{escaped}\"}}"
+                    ));
+                    first_part = false;
+                }
+                for img in &blocks.images {
+                    if !first_part {
+                        body.push(',');
+                    }
+                    first_part = false;
+                    let mt = escape_json_str(&img.media_type);
+                    // data_base64 is already base64 alphabet — no further escape needed.
+                    body.push_str(&format!(
+                        "{{\"type\":\"image_url\",\"image_url\":{{\"url\":\"data:{mt};base64,{}\"}}}}",
+                        img.data_base64
+                    ));
+                }
+                if first_part {
+                    // Empty multimodal → empty text part so the message stays valid.
+                    body.push_str("{\"type\":\"text\",\"text\":\"\"}");
+                }
+                body.push_str("]}");
+            }
             Content::ToolUse(_) => {
                 // Providers return parallel calls as consecutive ToolUse
                 // messages. OpenAI-compatible APIs require those calls in one
@@ -495,6 +524,43 @@ data: [DONE]
         let error = parse_complete_response(raw).unwrap_err();
 
         assert!(error.contains("invalid JSON arguments"), "{error}");
+    }
+
+    #[test]
+    fn test_build_messages_json_user_blocks_multimodal() {
+        let msgs = vec![Message {
+            role: "user".into(),
+            content: Content::User(crate::llm::UserBlocks {
+                text: "describe".into(),
+                images: vec![crate::llm::ImageBlock {
+                    media_type: "image/png".into(),
+                    data_base64: "Zm9v".into(),
+                }],
+            }),
+        }];
+        let body = build_messages_json(&msgs, "");
+        let v = crate::json::parse(&body).unwrap();
+        let arr = v.as_array().unwrap();
+        let content = arr[0]
+            .as_object()
+            .unwrap()
+            .get("content")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(content.len(), 2);
+        let p0 = content[0].as_object().unwrap();
+        assert_eq!(p0.get("type").and_then(|x| x.as_str()), Some("text"));
+        assert_eq!(p0.get("text").and_then(|x| x.as_str()), Some("describe"));
+        let p1 = content[1].as_object().unwrap();
+        assert_eq!(p1.get("type").and_then(|x| x.as_str()), Some("image_url"));
+        let url = p1
+            .get("image_url")
+            .and_then(|x| x.as_object())
+            .and_then(|o| o.get("url"))
+            .and_then(|x| x.as_str())
+            .unwrap();
+        assert!(url.starts_with("data:image/png;base64,Zm9v"));
     }
 
     #[test]

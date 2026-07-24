@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod clipboard_image;
 pub mod config;
 pub mod cost;
 pub mod http_client;

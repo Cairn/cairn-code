@@ -240,6 +240,21 @@ fn main() -> ExitCode {
                     let _ = event_tx.send(AgentEvent::Text(format!("\n{}\n", lines.join("\n"))));
                     let _ = event_tx.send(AgentEvent::Done);
                 }
+                Ok(cmd) if cmd.starts_with("__user_json__:") => {
+                    cancel2.store(false, Ordering::Relaxed);
+                    let json = cmd.trim_start_matches("__user_json__:");
+                    match parse_user_blocks_cmd(json) {
+                        Ok(user) => {
+                            let _ = agent.run_user(user, event_tx.clone(), &cancel2, &perm_rx);
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(AgentEvent::Error(format!(
+                                "Invalid multimodal user message: {e}"
+                            )));
+                            let _ = event_tx.send(AgentEvent::Done);
+                        }
+                    }
+                }
                 Ok(prompt) => {
                     cancel2.store(false, Ordering::Relaxed);
                     let _ = agent.run(&prompt, event_tx.clone(), &cancel2, &perm_rx);
@@ -330,4 +345,44 @@ fn print_help(version: &str) {
     println!("With no PROMPT, cairn-code starts the interactive TUI.");
     println!("With PROMPT but no -p, it starts the TUI and sends PROMPT as the first message.");
     println!("With PROMPT and -p, it runs once non-interactively and exits.");
+}
+
+/// Decode a multimodal user payload from the TUI (`__user_json__:` command).
+fn parse_user_blocks_cmd(json: &str) -> Result<llm::UserBlocks, String> {
+    let val = serde_json::from_str::<serde_json::Value>(json)
+        .map_err(|e| format!("json: {e}"))?;
+    let obj = val.as_object().ok_or_else(|| "expected object".to_string())?;
+    let text = obj
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut images = Vec::new();
+    if let Some(arr) = obj.get("images").and_then(|v| v.as_array()) {
+        for img in arr {
+            let o = img.as_object().ok_or_else(|| "image not object".to_string())?;
+            let media_type = o
+                .get("media_type")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "image missing media_type".to_string())?
+                .to_string();
+            let data = o
+                .get("data")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "image missing data".to_string())?
+                .to_string();
+            if data.is_empty() {
+                return Err("image data empty".into());
+            }
+            images.push(llm::ImageBlock {
+                media_type,
+                data_base64: data,
+            });
+        }
+    }
+    let blocks = llm::UserBlocks { text, images };
+    if blocks.is_empty() {
+        return Err("empty user message".into());
+    }
+    Ok(blocks)
 }
