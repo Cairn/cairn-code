@@ -5,10 +5,12 @@ mod http_client;
 mod json;
 mod llm;
 mod markdown;
+mod mcp;
 mod notify;
 mod oauth;
 mod redact;
 mod session;
+mod skills;
 mod theme;
 mod tools;
 mod tui;
@@ -78,10 +80,59 @@ fn main() {
     let models = chosen_provider.available_models();
     let provider_name_str = chosen_provider.name().to_string();
 
-    let tool_registry = tools::registry::default_registry();
+    // Skills: optional dir override from config, else CAIRN_SKILLS_DIR / defaults.
+    if let Some(dir) = cfg.skills_dir.clone() {
+        std::env::set_var("CAIRN_SKILLS_DIR", dir);
+    }
+    let skills = skills::load_skills();
+    let skills_for_agent = skills.clone();
+    let (tool_registry, mcp_runtime) = tools::registry::build_registry(skills, &cfg.mcp);
+    let mcp_warnings = mcp_runtime.warnings.clone();
+    let mcp_tool_count = mcp_runtime.tool_names.len();
+    let skill_count = skills_for_agent.len();
+    // Keep MCP processes alive for the agent thread lifetime.
+    let _mcp_keepalive = mcp_runtime;
+
     let work_dir = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| ".".to_string());
+
+    if is_print_mode {
+        let prompt = match initial_prompt {
+            Some(p) => p,
+            None => {
+                let mut input = String::new();
+                if std::io::stdin().read_line(&mut input).is_ok() {
+                    input.trim().to_string()
+                } else {
+                    String::new()
+                }
+            }
+        };
+        if !prompt.is_empty() {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let mut agent = Agent::new_with_skills(
+                    chosen_provider,
+                    p_model.clone(),
+                    tool_registry,
+                    cfg,
+                    skills_for_agent,
+                );
+                let _ = tx.send(agent.run_simple(&prompt));
+            });
+            if let Ok(result) = rx.recv() {
+                match result {
+                    Ok(output) => println!("{output}"),
+                    Err(e) => eprintln!("Error: {e}"),
+                }
+            }
+        }
+        return;
+    }
+    let theme_name = cfg.theme.clone();
+    let show_thinking = cfg.show_thinking;
+    let show_suggestions = cfg.show_suggestions;
 
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>();
     let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
@@ -93,12 +144,15 @@ fn main() {
 
     let p_model_for_agent = p_model.clone();
     let p_model_for_print = p_model.clone();
-    let theme_name = cfg.theme.clone();
-    let show_thinking = cfg.show_thinking;
-    let show_suggestions = cfg.show_suggestions;
 
     thread::spawn(move || {
-        let mut agent = Agent::new(chosen_provider, p_model_for_agent, tool_registry, cfg);
+        let mut agent = Agent::new_with_skills(
+            chosen_provider,
+            p_model_for_agent,
+            tool_registry,
+            cfg,
+            skills_for_agent,
+        );
         agent.set_live_mirror(live_mirror_agent);
         loop {
             match cmd_rx.recv() {
@@ -214,54 +268,32 @@ fn main() {
     tui.set_live_mirror(live_mirror);
     tui.set_picker_models(models);
 
-    if is_print_mode {
-        if let Some(prompt) = initial_prompt {
-            // Simple non-streaming mode
-            drop(event_rx);
-            let (tx, rx) = mpsc::channel();
-            thread::spawn(move || {
-                // Recreate for print mode — simplified
-                let mut providers = provider::default_providers();
-                let provider = providers
-                    .remove(&p_name)
-                    .unwrap_or_else(|| provider::default_providers().into_values().next().unwrap());
-                let registry = tools::registry::default_registry();
-                let cfg = Config::load();
-                let pm = p_model_for_print.clone();
-                let mut agent = Agent::new(provider, pm, registry, cfg);
-                let _ = tx.send(agent.run_simple(&prompt));
-            });
-            if let Ok(result) = rx.recv() {
-                match result {
-                    Ok(output) => println!("{output}"),
-                    Err(e) => eprintln!("Error: {e}"),
-                }
-            }
-        } else {
-            let mut input = String::new();
-            if std::io::stdin().read_line(&mut input).is_ok() {
-                let input = input.trim().to_string();
-                let (tx, rx) = mpsc::channel();
-                thread::spawn(move || {
-                    let mut providers = provider::default_providers();
-                    let provider = providers.remove(&p_name).unwrap_or_else(|| {
-                        provider::default_providers().into_values().next().unwrap()
-                    });
-                    let registry = tools::registry::default_registry();
-                    let cfg = Config::load();
-                    let pm = p_model_for_print.clone();
-                    let mut agent = Agent::new(provider, pm, registry, cfg);
-                    let _ = tx.send(agent.run_simple(&input));
-                });
-                if let Ok(result) = rx.recv() {
-                    match result {
-                        Ok(output) => println!("{output}"),
-                        Err(e) => eprintln!("Error: {e}"),
-                    }
-                }
-            }
-        }
-        return;
+    if skill_count > 0 {
+        tui.add_output_line(tui::OutputLine {
+            type_: "system".into(),
+            content: format!(
+                "Loaded {skill_count} skill(s) from {}. Use the skill tool or /skills.",
+                skills::default_skills_dir().display()
+            ),
+            tool_name: String::new(),
+            duration: String::new(),
+        });
+    }
+    if mcp_tool_count > 0 {
+        tui.add_output_line(tui::OutputLine {
+            type_: "system".into(),
+            content: format!("Loaded {mcp_tool_count} MCP tool(s). Use /mcp to list."),
+            tool_name: String::new(),
+            duration: String::new(),
+        });
+    }
+    for w in mcp_warnings {
+        tui.add_output_line(tui::OutputLine {
+            type_: "system".into(),
+            content: w,
+            tool_name: String::new(),
+            duration: String::new(),
+        });
     }
 
     if let Some(prompt) = initial_prompt {

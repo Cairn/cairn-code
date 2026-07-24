@@ -95,6 +95,22 @@ pub fn default_registry() -> Registry {
     r
 }
 
+/// Built-in registry plus optional skill tool and MCP tools from config.
+pub fn build_registry(
+    skills: Vec<crate::skills::Skill>,
+    mcp: &crate::mcp::McpConfig,
+) -> (Registry, crate::mcp::McpRuntime) {
+    let mut r = default_registry();
+    if !skills.is_empty() {
+        r.register(Box::new(crate::tools::skill_tool::SkillTool::new(skills)));
+    } else {
+        // Still register skill tool so the model can discover "no skills" errors cleanly.
+        r.register(Box::new(crate::tools::skill_tool::SkillTool::new(Vec::new())));
+    }
+    let runtime = crate::mcp::register_mcp_tools(&mut r, mcp);
+    (r, runtime)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
