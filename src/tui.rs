@@ -6022,6 +6022,54 @@ fn permission_risk_warning(tool_name: &str) -> Option<&'static str> {
 const PERM_VALUE_MAX_COLS: usize = 96;
 /// Hard cap on preview rows so a multi-KB `file_edit` cannot fill the chrome.
 const PERM_PREVIEW_MAX_LINES: usize = 8;
+/// Fields worth seeing first when a tool has them. This orders the preview; it
+/// does not decide what appears in it. Anything not listed still renders,
+/// alphabetically, after these.
+const PERM_PREFERRED_KEYS: &[&str] = &[
+    "file_path",
+    "path",
+    "command",
+    "query",
+    "url",
+    "pattern",
+    "old_string",
+    "new_string",
+    "content",
+    "replace_all",
+    "args",
+];
+
+/// One-line rendering of any JSON value for the permission preview.
+///
+/// Every arm produces something: a value that cannot be rendered would
+/// otherwise vanish from the prompt without being counted as omitted.
+fn perm_value_display(value: &crate::json::JsonValue) -> String {
+    use crate::json::JsonValue;
+    match value {
+        JsonValue::String(s) => truncate_perm_value(s, PERM_VALUE_MAX_COLS),
+        JsonValue::Bool(b) => b.to_string(),
+        JsonValue::Null => "null".into(),
+        // Numbers are f64 internally, so a whole value would otherwise render
+        // as "60000.0". Tool schemas use integer timeouts, offsets and limits,
+        // and a spurious ".0" reads as a different value than was requested.
+        JsonValue::Number(n) if n.is_finite() && n.fract() == 0.0 => format!("{n:.0}"),
+        JsonValue::Number(_) => truncate_perm_value(&value.to_string(), PERM_VALUE_MAX_COLS),
+        JsonValue::Array(items) => {
+            // Strings unquoted-but-escaped reads best for argv-style lists,
+            // which is what arrays are in every current tool schema.
+            let joined = items
+                .iter()
+                .map(|item| match item.as_str() {
+                    Some(s) => format!("{s:?}"),
+                    None => item.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            truncate_perm_value(&joined, PERM_VALUE_MAX_COLS)
+        }
+        JsonValue::Object(_) => truncate_perm_value(&value.to_string(), PERM_VALUE_MAX_COLS),
+    }
+}
 
 /// Collapse newlines and truncate so permission chrome stays readable.
 fn truncate_perm_value(s: &str, max_cols: usize) -> String {
@@ -6060,66 +6108,39 @@ fn format_permission_tool_input(input: &str) -> Vec<String> {
 
     if let Ok(val) = crate::json::parse(trimmed) {
         if let Some(obj) = val.as_object() {
+            // `PERM_PREFERRED_KEYS` orders the rows; it does not select them.
+            // Every field is shown, because this is the prompt a person
+            // approves an action from — a parameter that is not on screen is a
+            // parameter nobody agreed to. `as_object()` yields a HashMap, so
+            // the remainder is sorted to keep row order stable between runs.
+            let mut remaining: Vec<&String> = obj
+                .keys()
+                .filter(|k| !PERM_PREFERRED_KEYS.contains(&k.as_str()))
+                .collect();
+            remaining.sort();
+            let ordered = PERM_PREFERRED_KEYS
+                .iter()
+                .copied()
+                .filter(|k| obj.get(*k).is_some())
+                .chain(remaining.into_iter().map(String::as_str));
+
             let mut lines = Vec::new();
-            // Prefer a stable field order for common tools.
-            for key in [
-                "file_path",
-                "path",
-                "command",
-                "query",
-                "url",
-                "pattern",
-                "old_string",
-                "new_string",
-                "content",
-                "replace_all",
-                "args",
-            ] {
+            let mut rendered = 0usize;
+            for key in ordered {
                 if lines.len() >= PERM_PREVIEW_MAX_LINES {
                     break;
                 }
                 let Some(v) = obj.get(key) else {
                     continue;
                 };
-                let shown = if let Some(s) = v.as_str() {
-                    truncate_perm_value(s, PERM_VALUE_MAX_COLS)
-                } else if let Some(b) = v.as_bool() {
-                    b.to_string()
-                } else if let Some(n) = v.as_u64() {
-                    n.to_string()
-                } else if let Some(arr) = v.as_array() {
-                    let joined = arr
-                        .iter()
-                        .filter_map(|x| x.as_str())
-                        .map(|x| format!("{x:?}"))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    truncate_perm_value(&joined, PERM_VALUE_MAX_COLS)
-                } else {
-                    continue;
-                };
-                lines.push(format!("{key}: {shown}"));
+                lines.push(format!("{key}: {}", perm_value_display(v)));
+                rendered += 1;
             }
             if !lines.is_empty() {
-                // Note remaining keys if we hit the line cap or skipped unknowns.
-                let shown_keys: usize = [
-                    "file_path",
-                    "path",
-                    "command",
-                    "query",
-                    "url",
-                    "pattern",
-                    "old_string",
-                    "new_string",
-                    "content",
-                    "replace_all",
-                    "args",
-                ]
-                .iter()
-                .filter(|k| obj.get(**k).is_some())
-                .count();
-                if shown_keys > lines.len() {
-                    let extra = shown_keys - lines.len();
+                // Counted against the object's real size, so fields dropped by
+                // the line cap are always reported.
+                if obj.len() > rendered {
+                    let extra = obj.len() - rendered;
                     lines.push(format!("… (+{extra} more field(s))"));
                 }
                 return lines;
@@ -6344,6 +6365,97 @@ mod tool_display_tests {
         let warning = permission_risk_warning("git").unwrap();
         assert!(warning.contains("Shell-equivalent risk"));
         assert!(permission_risk_warning("go").is_none());
+    }
+
+    /// The prompt a person approves an action from must not hide parameters.
+    /// Each case below rendered without the named field before this changed.
+    #[test]
+    fn permission_preview_shows_every_field() {
+        let cases: [(&str, &str, &[&str]); 4] = [
+            // python file mode: `args` was whitelisted, `file` was not, so the
+            // prompt showed the flags and hid which script would run.
+            (
+                "python file mode",
+                r#"{"file":"scripts/deploy.py","args":["--force"],"timeout":60000}"#,
+                &[
+                    "file: scripts/deploy.py",
+                    "args: \"--force\"",
+                    "timeout: 60000",
+                ],
+            ),
+            // python inline: nothing matched, so this fell through to a raw
+            // JSON blob on the one prompt where reading the payload matters.
+            (
+                "python inline",
+                r#"{"code":"import shutil","timeout":60000}"#,
+                &["code: import shutil", "timeout: 60000"],
+            ),
+            // memory: `action` is required by the tool's own schema, and both
+            // the verb and its target were hidden.
+            (
+                "memory save",
+                r#"{"action":"save","key":"api-creds","content":"secret"}"#,
+                &["action: save", "key: api-creds", "content: secret"],
+            ),
+            // MCP servers define their own schemas, so essentially none of
+            // their fields could ever appear in a fixed list.
+            (
+                "third-party mcp tool",
+                r#"{"repository":"acme/app","ref":"main","force":true}"#,
+                &["repository: acme/app", "ref: main", "force: true"],
+            ),
+        ];
+        for (label, input, expected) in cases {
+            let lines = format_permission_tool_input(input);
+            for want in expected {
+                assert!(
+                    lines.iter().any(|l| l == want),
+                    "{label}: missing {want:?} in {lines:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn permission_preview_orders_preferred_keys_first_then_sorts() {
+        let input = r#"{"zeta":"z","command":"ls","alpha":"a","file_path":"p"}"#;
+        let lines = format_permission_tool_input(input);
+        let keys: Vec<&str> = lines.iter().filter_map(|l| l.split(':').next()).collect();
+        // Preferred keys keep their declared order; the rest are alphabetical
+        // so a HashMap's iteration order cannot reshuffle rows between runs.
+        assert_eq!(
+            keys,
+            vec!["file_path", "command", "alpha", "zeta"],
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn permission_preview_counts_omitted_fields_against_the_real_object() {
+        // More fields than the row cap, none of them in the preferred list:
+        // the old counter compared against preferred-key hits and so reported
+        // nothing at all here.
+        let pairs: Vec<String> = (0..12).map(|i| format!("\"k{i:02}\":\"v{i}\"")).collect();
+        let input = format!("{{{}}}", pairs.join(","));
+        let lines = format_permission_tool_input(&input);
+        assert_eq!(lines.len(), PERM_PREVIEW_MAX_LINES + 1, "{lines:?}");
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("… (+4 more field(s))"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn permission_preview_renders_every_json_type() {
+        // No arm may silently drop a value: anything unrenderable would vanish
+        // from the prompt without being counted as omitted.
+        let input = r#"{"s":"t","b":false,"n":7,"nul":null,"arr":["a","b"],"obj":{"k":"v"}}"#;
+        let lines = format_permission_tool_input(input);
+        assert_eq!(lines.len(), 6, "every field must render: {lines:?}");
+        assert!(lines.iter().any(|l| l == "nul: null"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "b: false"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("obj: ")), "{lines:?}");
     }
 
     #[test]
