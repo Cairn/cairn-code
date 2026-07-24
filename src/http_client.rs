@@ -21,6 +21,10 @@ const MAX_RETRIES: u32 = 3;
 const BASE_BACKOFF_MS: u64 = 500;
 const CONNECT_TIMEOUT_SECS: &str = "10";
 const POST_TIMEOUT_SECS: &str = "600";
+/// Upper bound on a raw form-post response (headers + body). OAuth token
+/// responses are a few KB; anything larger is treated as a transport fault so
+/// a hostile endpoint cannot make us buffer an unbounded reply.
+const RAW_RESPONSE_CAP_BYTES: usize = 512 * 1024;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const WATCHDOG_POLL: Duration = Duration::from_millis(200);
 
@@ -496,6 +500,85 @@ pub fn request(req: &HttpRequest) -> Result<HttpResponse, String> {
     }
 }
 
+/// POST an `application/x-www-form-urlencoded` body and return the raw
+/// `(status, body)` for any completed response.
+///
+/// This reuses the hardened [`curl_command`] invocation (first-argument `-q`
+/// so a user's `.curlrc` cannot redirect/proxy/trace the request, plus
+/// connect/total timeouts and curl exit-status validation). Unlike
+/// [`request`], non-2xx responses are returned instead of folded into an
+/// error string, because OAuth flows must read error bodies such as
+/// `authorization_pending`. The response is size-bounded and this path does
+/// not emit debug request logs, so credential-bearing bodies never touch disk.
+pub fn form_post(url: &str, form_body: &str) -> Result<(u16, String), String> {
+    let req = HttpRequest {
+        url: url.to_string(),
+        headers: vec![
+            (
+                "Content-Type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            ),
+            ("Accept".to_string(), "application/json".to_string()),
+        ],
+        body: Some(form_body.to_string()),
+    };
+    let mut attempt = 0;
+    loop {
+        match request_raw_once(&req) {
+            Ok(pair) => return Ok(pair),
+            Err(RequestError::RetryableTransport(_)) if attempt < MAX_RETRIES => {
+                attempt += 1;
+                std::thread::sleep(backoff_delay(attempt));
+            }
+            Err(e) => return Err(e.into_string()),
+        }
+    }
+}
+
+/// Single attempt behind [`form_post`]. Builds the command via [`curl_command`]
+/// directly (rather than [`spawn_curl`]) so credential-bearing OAuth bodies are
+/// never written to the debug request log.
+fn request_raw_once(req: &HttpRequest) -> Result<(u16, String), RequestError> {
+    let mut child = curl_command(req)
+        .spawn()
+        .map_err(|e| RequestError::RetryableTransport(format!("curl: {e}")))?;
+
+    let body = req.body.clone().unwrap_or_default();
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| RequestError::Transport("curl: no stdin".to_string()))?;
+    std::thread::spawn(move || {
+        let _ = stdin.write_all(body.as_bytes());
+    });
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| RequestError::Transport(format!("{e}")))?;
+    if !output.status.success() {
+        return Err(curl_exit_error(output.status, &output.stderr));
+    }
+    if output.stdout.len() > RAW_RESPONSE_CAP_BYTES {
+        return Err(RequestError::Transport(
+            "response exceeded size limit".to_string(),
+        ));
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let split_at = raw
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .or_else(|| raw.find("\n\n").map(|i| i + 2))
+        .unwrap_or(0);
+    let status = raw
+        .get(..split_at)
+        .and_then(|h| h.lines().next())
+        .map(parse_status_line)
+        .unwrap_or(0);
+    let body = raw.get(split_at..).unwrap_or(&raw).to_string();
+    Ok((status, body))
+}
+
 /// GET with optional headers. Used for catalog endpoints like `/v1/models`.
 /// Retries the same transient failures as [`request`]. Caps wall time via curl `--max-time`.
 pub fn request_get(url: &str, headers: &[(String, String)]) -> Result<HttpResponse, String> {
@@ -839,6 +922,28 @@ mod tests {
             err.contains("400"),
             "expected error to mention status 400, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_form_post_returns_raw_body_on_non_2xx() {
+        // OAuth device polling relies on reading the error body of a 400,
+        // so form_post must surface (status, body) instead of an error string.
+        let url = start_mock_server(vec![
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 32\r\nConnection: close\r\n\r\n{\"error\":\"authorization_pending\"}",
+        ]);
+        let (status, body) = form_post(&url, "grant_type=device_code").unwrap();
+        assert_eq!(status, 400);
+        assert!(body.contains("authorization_pending"), "got body: {body}");
+    }
+
+    #[test]
+    fn test_form_post_returns_status_and_body_on_2xx() {
+        let url = start_mock_server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"access_token\":\"x\"}",
+        ]);
+        let (status, body) = form_post(&url, "grant_type=refresh_token").unwrap();
+        assert_eq!(status, 200);
+        assert!(body.contains("access_token"), "got body: {body}");
     }
 
     #[test]
