@@ -2604,24 +2604,68 @@ impl Tui {
 
         let mut lines: Vec<Line> = Vec::new();
 
-        // Welcome header (Claude Code / OpenClaude style: minimal, no heavy box).
+        // Welcome box (Claude Code style: rounded frame in accent orange/red).
+        let w = area.width.saturating_sub(2) as usize;
+        let pw = w.min(58);
+        let pad = |s: &str| {
+            let dw = display_width(s);
+            if dw < pw {
+                format!("{}{}", s, " ".repeat(pw - dw))
+            } else {
+                let mut out = String::with_capacity(pw);
+                let mut w_used = 0;
+                for c in s.chars() {
+                    let cw = char_width(c);
+                    if w_used + cw > pw {
+                        break;
+                    }
+                    out.push(c);
+                    w_used += cw;
+                }
+                if w_used < pw {
+                    out.push_str(&" ".repeat(pw - w_used));
+                }
+                out
+            }
+        };
+        let sp = " ".repeat((area.width as usize).saturating_sub(pw + 4));
+        let box_style = orange;
+
+        lines.push(Line::from(Span::styled(
+            format!("╭{}╮", "─".repeat(pw)),
+            box_style,
+        )));
         lines.push(Line::from(vec![
-            Span::styled("Cairn Code", bright.add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" v{}", self.version), dim),
+            Span::styled("│", box_style),
+            Span::styled(pad(&format!("  ⚡ Cairn Code v{}", self.version)), bright),
+            Span::styled(format!("│{sp}"), box_style),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("│", box_style),
+            Span::styled(pad("  open terminal coding agent  ·  /help"), dim),
+            Span::styled(format!("│{sp}"), box_style),
         ]));
         lines.push(Line::from(Span::styled(
-            "open terminal coding agent  ·  /help for commands",
-            dim,
+            format!("├{}┤", "─".repeat(pw)),
+            box_style,
         )));
-        lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("  cwd   ", bold_dim),
-            Span::styled(self.work_dir.as_str(), dim),
+            Span::styled("│", box_style),
+            Span::styled(
+                pad(&format!("  Model   {} / {}", self.provider, self.model)),
+                dim,
+            ),
+            Span::styled(format!("│{sp}"), box_style),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("  model ", bold_dim),
-            Span::styled(format!("{}/{}", self.provider, self.model), dim),
+            Span::styled("│", box_style),
+            Span::styled(pad(&format!("  Path    {}", self.work_dir)), dim),
+            Span::styled(format!("│{sp}"), box_style),
         ]));
+        lines.push(Line::from(Span::styled(
+            format!("╰{}╯", "─".repeat(pw)),
+            box_style,
+        )));
         lines.push(Line::from(""));
 
         // Output
@@ -3174,39 +3218,22 @@ impl Tui {
             .max(1);
         let chrome_h = chrome_wrapped.min(max_chrome) as u16;
         let chrome_scroll = chrome_wrapped.saturating_sub(chrome_h as usize);
-        let term_h = area.height as usize;
 
-        // Short chats: sit the composer directly under the transcript (top of the
-        // window), not glued to the bottom with a huge empty gap that looks like a
-        // second orphaned prompt.
-        // Long chats: pin chrome to the bottom and scroll the transcript above.
-        let fits = body_wrapped.saturating_add(chrome_h as usize) <= term_h;
-        let (body_area, chrome_area) = if fits {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(body_wrapped.max(1) as u16),
-                    Constraint::Length(chrome_h),
-                    Constraint::Min(0),
-                ])
-                .split(area);
-            (chunks[0], chunks[1])
-        } else {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(chrome_h)])
-                .split(area);
-            (chunks[0], chunks[1])
-        };
+        // Claude Code style: always pin the composer/status chrome to the bottom
+        // of the terminal. Transcript fills the space above and scrolls.
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(chrome_h)])
+            .split(area);
+        let body_area = chunks[0];
+        let chrome_area = chunks[1];
 
         // videre-style rowoff: free scroll when not following; pin to bottom when following.
         let body_h = body_area.height as usize;
         let max_off = body_wrapped.saturating_sub(body_h.max(1));
         self.last_body_h = body_h;
         self.last_body_wrapped = body_wrapped;
-        let body_scroll = if fits {
-            0
-        } else if self.transcript_follow {
+        let body_scroll = if self.transcript_follow {
             self.transcript_rowoff = max_off;
             max_off
         } else {
@@ -3232,7 +3259,7 @@ impl Tui {
         );
 
         // Scroll position hint when not pinned to bottom (videre shows %).
-        if !fits && !self.transcript_follow && max_off > 0 {
+        if !self.transcript_follow && max_off > 0 {
             let pct = (body_scroll * 100) / max_off;
             let hint = format!(" ↑ {pct}% · PgUp/PgDn · wheel · Ctrl+U/D ");
             let hx = body_area
