@@ -15,7 +15,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
     DefaultTerminal, Frame,
 };
 
@@ -47,7 +47,7 @@ enum State {
 
 // Same frames as charmbracelet MiniDot (Grok Build / zero).
 const SPINNER_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-// Claude Code / OpenClaude-style loading verbs (subset of their spinner verb list).
+// Claude Code / OpenClaude-style loading verbs (subset of openclaude spinnerVerbs).
 const SPINNER_VERBS: &[&str] = &[
     "Thinking",
     "Brewing",
@@ -67,6 +67,75 @@ const SPINNER_VERBS: &[&str] = &[
     "Synthesizing",
     "Unraveling",
     "Working",
+    "Architecting",
+    "Bootstrapping",
+    "Calculating",
+    "Cogitating",
+    "Considering",
+    "Contemplating",
+    "Cooking",
+    "Creating",
+    "Crystallizing",
+    "Deliberating",
+    "Determining",
+    "Envisioning",
+    "Herding",
+    "Incubating",
+    "Manifesting",
+    "Marinating",
+    "Moseying",
+    "Percolating",
+    "Reticulating",
+    "Ruminating",
+    "Scheming",
+    "Simmering",
+    "Spelunking",
+    "Transmuting",
+    "Wrangling",
+];
+/// Rows for the `/help` chrome overlay (dismiss with Esc / Enter / ?).
+/// Section headers use an empty keys column; detail rows are key + description.
+const HELP_ROWS: &[(&str, &str)] = &[
+    ("Commands", ""),
+    ("/auth", "login · logout · status · key  (xAI OAuth)"),
+    ("/model", "pick or set model"),
+    ("/provider", "pick or set provider"),
+    ("/clear", "clear conversation"),
+    ("/compact", "summarize older history now"),
+    ("/cost", "token usage and estimated cost"),
+    ("/theme", "TUI theme picker"),
+    ("/thinking", "on|off full thinking blocks"),
+    ("/suggestions", "on|off idle ready-to-send hints"),
+    ("/mouse", "on|off wheel capture"),
+    ("/copy", "copy last assistant message (Ctrl+Y)"),
+    ("/select", "plain-text select mode (Ctrl+O)"),
+    (
+        "/save · /sessions · /resume · /delete",
+        "session management",
+    ),
+    ("/skills · /mcp", "list skills and MCP servers"),
+    (
+        "/reset · /reset apply",
+        "ChatGPT banked rate-limit resets (OpenAI OAuth)",
+    ),
+    ("/exit · /quit · /q", "exit Cairn"),
+    ("", ""),
+    ("Keys", ""),
+    ("Enter", "send message"),
+    ("Tab / →", "accept slash ghost or idle suggestion"),
+    ("Up / Down", "scroll chat when it overflows · else history"),
+    ("Ctrl+P / Ctrl+N", "prompt history"),
+    ("PgUp/PgDn · Ctrl+U/D", "page / half-page scroll"),
+    ("Ctrl+Home / End", "jump to top / bottom"),
+    ("Wheel", "scroll transcript"),
+    ("Ctrl+C", "interrupt · press again to exit when idle"),
+    ("Esc", "cancel pickers / close this help"),
+    ("?", "shortcuts (when composer empty)"),
+    ("", ""),
+    ("Tips", ""),
+    ("Sounds", "CAIRN_SOUND=0 to mute"),
+    ("Skills", "packs as <dir>/<name>/SKILL.md"),
+    ("MCP", "stdio servers in config · tools need permission"),
 ];
 /// Rows for the `?` shortcuts panel (keys must match real bindings in handle_key).
 const SHORTCUT_ROWS: &[(&str, &str)] = &[
@@ -204,6 +273,10 @@ pub struct Tui {
     pending_select: Option<SelectDump>,
     /// Wall clock for the current in-flight thinking stream (for duration labels).
     thinking_started: Option<Instant>,
+    /// When the current agent turn started (Claude-style spinner elapsed time).
+    running_started: Option<Instant>,
+    /// Bottom chrome shows `/help` overlay (like the model picker; Esc closes).
+    show_help: bool,
     /// Bottom chrome shows keyboard shortcuts (`?` when the composer is empty).
     show_shortcuts: bool,
 }
@@ -305,6 +378,8 @@ impl Tui {
             mouse_capture: true,
             pending_select: None,
             thinking_started: None,
+            running_started: None,
+            show_help: false,
             show_shortcuts: false,
         }
     }
@@ -325,6 +400,7 @@ impl Tui {
 
     fn begin_running(&mut self) {
         self.state = State::Running;
+        self.running_started = Some(Instant::now());
         // New verb each turn (Claude Code / OpenClaude spinner style).
         let seed = self
             .spinner_idx
@@ -583,6 +659,7 @@ impl Tui {
                         AgentEvent::Done => {
                             self.flush_streaming();
                             self.state = State::Idle;
+                            self.running_started = None;
                             // Autosave after each finished turn (not only manual /save).
                             self.autosave_session(false);
                             if self.expect_turn_notify {
@@ -865,9 +942,29 @@ impl Tui {
             || self.show_theme_picker
             || self.show_session_picker
             || self.show_permission_prompt
+            || self.show_help
             || self.show_shortcuts
             || self.confirm_remove_provider.is_some()
             || self.confirm_history_provider.is_some();
+        if self.show_help {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => {
+                    self.show_help = false;
+                }
+                KeyCode::PageUp => self.scroll_page(false),
+                KeyCode::PageDown => self.scroll_page(true),
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_transcript(-1);
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_transcript(1);
+                }
+                KeyCode::Up => self.scroll_transcript(-3),
+                KeyCode::Down => self.scroll_transcript(3),
+                _ => {}
+            }
+            return true;
+        }
         if !picker_nav {
             match key.code {
                 KeyCode::PageUp => {
@@ -1275,6 +1372,8 @@ impl Tui {
                         tool_name: String::new(),
                         duration: String::new(),
                     });
+                } else if self.show_help {
+                    self.show_help = false;
                 } else if self.show_shortcuts {
                     self.show_shortcuts = false;
                 } else if self.show_command_picker || !self.cmd_picker_filtered.is_empty() {
@@ -1555,6 +1654,7 @@ impl Tui {
                         && !self.show_provider_picker
                         && !self.show_theme_picker
                         && !self.show_session_picker
+                        && !self.show_help
                         && !self.show_shortcuts)
                 {
                     self.input_buf.insert(self.cursor, ch);
@@ -1757,12 +1857,10 @@ impl Tui {
                 }
             }
             "/help" => {
-                self.output_lines.push(OutputLine {
-                    type_: "system".into(),
-                    content: "Commands: /auth /clear /compact /copy /cost /delete /exit /help /mcp /model /mouse /provider /reset /resume /save /select /sessions /skills /suggestions /theme /thinking\nExtensibility: skills (SKILL.md) + MCP stdio (config mcp.servers or mcpServers)\n/skills · /mcp — list skills and MCP servers\n/reset · /reset apply — redeem ChatGPT Plus/Pro banked rate-limit resets (OpenAI OAuth / Codex login only)\nMouse: wheel scrolls · Shift+drag selects (terminal-native) · /mouse off disables capture\n/select [last|all] or Ctrl+O — plain-text view if you need a full select dump\n/copy or Ctrl+Y — copy last assistant message to clipboard\n/thinking [on|off] · /suggestions [on|off]\nTab completes slash commands · Scroll: wheel · PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End (Up/Down scroll when chat overflows; Ctrl+P/N for prompt history)\nSounds: CAIRN_SOUND=0 to mute · /provider xai — OAuth; /auth login xai".into(),
-                    tool_name: String::new(),
-                    duration: String::new(),
-                });
+                // Model-picker style overlay in bottom chrome; Esc / Enter dismisses.
+                // Do not dump into the transcript (stays until /clear).
+                self.show_shortcuts = false;
+                self.show_help = true;
             }
             "/skills" => {
                 let cfg = match crate::config::Config::load() {
@@ -2173,6 +2271,16 @@ impl Tui {
             self.ctrl_c_exit_armed = false;
             return true;
         }
+        if self.show_help {
+            self.show_help = false;
+            self.ctrl_c_exit_armed = false;
+            return true;
+        }
+        if self.show_shortcuts {
+            self.show_shortcuts = false;
+            self.ctrl_c_exit_armed = false;
+            return true;
+        }
         if self.show_session_picker {
             self.show_session_picker = false;
             self.session_picker_delete = false;
@@ -2229,16 +2337,11 @@ impl Tui {
         }
 
         // Empty idle prompt: second Ctrl+C exits; first arms confirmation.
+        // Claude Code shows the hint in the footer chrome, not as a transcript line.
         if self.ctrl_c_exit_armed {
             return false;
         }
         self.ctrl_c_exit_armed = true;
-        self.output_lines.push(OutputLine {
-            type_: "system".into(),
-            content: "Press Ctrl+C again to exit".into(),
-            tool_name: String::new(),
-            duration: String::new(),
-        });
         true
     }
 
@@ -2747,64 +2850,38 @@ impl Tui {
 
         let mut lines: Vec<Line> = Vec::new();
 
-        // Welcome box (Claude Code style: rounded frame in accent orange/red).
-        let w = area.width.saturating_sub(2) as usize;
-        let pw = w.min(58);
-        let pad = |s: &str| {
-            let dw = display_width(s);
-            if dw < pw {
-                format!("{}{}", s, " ".repeat(pw - dw))
-            } else {
-                let mut out = String::with_capacity(pw);
-                let mut w_used = 0;
-                for c in s.chars() {
-                    let cw = char_width(c);
-                    if w_used + cw > pw {
-                        break;
-                    }
-                    out.push(c);
-                    w_used += cw;
-                }
-                if w_used < pw {
-                    out.push_str(&" ".repeat(pw - w_used));
-                }
-                out
-            }
-        };
-        let sp = " ".repeat((area.width as usize).saturating_sub(pw + 4));
+        // Welcome box (Claude Code style): full terminal width rounded frame.
+        // Inner content width is terminal cols minus the two border glyphs.
+        // Emoji (e.g. 🪨) must use display_width=2 or the right border drops off.
+        let pw = (area.width as usize).saturating_sub(2).max(1);
+        let pad = |s: &str| pad_to_display_width(s, pw);
         let box_style = orange;
+        let box_row = |inner: String, style: Style| {
+            Line::from(vec![
+                Span::styled("│", box_style),
+                Span::styled(inner, style),
+                Span::styled("│", box_style),
+            ])
+        };
 
         lines.push(Line::from(Span::styled(
             format!("╭{}╮", "─".repeat(pw)),
             box_style,
         )));
-        lines.push(Line::from(vec![
-            Span::styled("│", box_style),
-            Span::styled(pad(&format!("  ⚡ Cairn Code v{}", self.version)), bright),
-            Span::styled(format!("│{sp}"), box_style),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("│", box_style),
-            Span::styled(pad("  open terminal coding agent  ·  /help"), dim),
-            Span::styled(format!("│{sp}"), box_style),
-        ]));
+        lines.push(box_row(
+            pad(&format!("  🪨 Cairn Code v{}", self.version)),
+            bright,
+        ));
+        lines.push(box_row(pad("  open terminal coding agent  ·  /help"), dim));
         lines.push(Line::from(Span::styled(
             format!("├{}┤", "─".repeat(pw)),
             box_style,
         )));
-        lines.push(Line::from(vec![
-            Span::styled("│", box_style),
-            Span::styled(
-                pad(&format!("  Model   {} / {}", self.provider, self.model)),
-                dim,
-            ),
-            Span::styled(format!("│{sp}"), box_style),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("│", box_style),
-            Span::styled(pad(&format!("  Path    {}", self.work_dir)), dim),
-            Span::styled(format!("│{sp}"), box_style),
-        ]));
+        lines.push(box_row(
+            pad(&format!("  Model   {} / {}", self.provider, self.model)),
+            dim,
+        ));
+        lines.push(box_row(pad(&format!("  Path    {}", self.work_dir)), dim));
         lines.push(Line::from(Span::styled(
             format!("╰{}╯", "─".repeat(pw)),
             box_style,
@@ -2815,11 +2892,10 @@ impl Tui {
         for line in &self.output_lines {
             match line.type_.as_str() {
                 "user" => {
-                    // Use a different marker than the live composer (❯) so past turns
-                    // are not mistaken for a second prompt.
+                    // Claude Code: past user turns use a quieter marker than the live ❯.
                     lines.push(Line::from(vec![
-                        Span::styled("› ", orange),
-                        Span::raw(&line.content),
+                        Span::styled("> ", orange),
+                        Span::styled(line.content.as_str(), white),
                     ]));
                     lines.push(Line::from(""));
                 }
@@ -2926,17 +3002,25 @@ impl Tui {
         }
         // Spinner while waiting / thinking without answer text. Skip when full
         // thinking body is already on screen (show_thinking on).
-        // OpenClaude-style: glyph + rotating verb + ellipsis.
+        // OpenClaude-style: glyph + rotating verb + elapsed seconds.
         let show_spin = matches!(self.state, State::Running)
             && self.streaming_text.is_empty()
             && !(self.show_thinking && !self.stream_thinking.is_empty());
         if show_spin {
             let spin = SPINNER_CHARS[self.spinner_idx % SPINNER_CHARS.len()];
             let verb = SPINNER_VERBS[self.spinner_verb_idx % SPINNER_VERBS.len()];
-            lines.push(Line::from(vec![
+            let elapsed = self
+                .running_started
+                .map(|t| format_elapsed_compact(t.elapsed()))
+                .unwrap_or_default();
+            let mut spin_spans = vec![
                 Span::styled(spin, orange),
                 Span::styled(format!(" {verb}…"), dim),
-            ]));
+            ];
+            if !elapsed.is_empty() {
+                spin_spans.push(Span::styled(format!(" {elapsed}"), bold_dim));
+            }
+            lines.push(Line::from(spin_spans));
         }
 
         // Composer / pickers live in a fixed bottom chrome region so typing never
@@ -3014,6 +3098,29 @@ impl Tui {
                 "(← → navigate  Enter confirm  Esc cancel)",
                 dim,
             )]));
+        } else if self.show_help {
+            chrome.push(Line::from(vec![
+                Span::styled("── Help ", orange),
+                Span::styled("(Esc or Enter close) ──", bold_dim),
+            ]));
+            for (keys, desc) in HELP_ROWS {
+                if keys.is_empty() && desc.is_empty() {
+                    chrome.push(Line::from(""));
+                    continue;
+                }
+                if desc.is_empty() {
+                    // Section header
+                    chrome.push(Line::from(vec![Span::styled(
+                        format!("  {keys}"),
+                        orange_fg.add_modifier(Modifier::BOLD),
+                    )]));
+                    continue;
+                }
+                chrome.push(Line::from(vec![
+                    Span::styled(format!("  {keys:<28}"), orange_fg),
+                    Span::styled(*desc, dim),
+                ]));
+            }
         } else if self.show_shortcuts {
             // Matches the footer hint "? for shortcuts" on an empty idle prompt.
             chrome.push(Line::from(vec![
@@ -3274,109 +3381,114 @@ impl Tui {
                 0,
             ));
         } else {
-            let cursor = self.cursor.min(self.input_buf.len());
-            let (before, after) = self.input_buf.split_at(cursor);
-            // Grayed ready-to-send prompt when the composer is empty.
-            if self.input_buf.is_empty()
-                && matches!(self.state, State::Idle)
-                && !self.show_permission_prompt
-                && !self.show_recovery_prompt
-                && !self.awaiting_api_key
-            {
-                if let Some(hint) = &self.idle_suggestion {
-                    chrome.push(Line::from(vec![
-                        Span::styled("❯ ", orange_fg),
-                        Span::styled(hint.as_str(), bold_dim),
-                    ]));
-                    cursor_pos = Some((display_width("❯ ") as u16, 0));
-                } else {
-                    chrome.push(Line::from(vec![
-                        Span::styled("❯ ", orange_fg),
-                        Span::raw(before),
-                        Span::raw(after),
-                    ]));
-                    cursor_pos = Some((display_width("❯ ") as u16, 0));
-                }
-            } else {
-                // Inline slash ghost: `/e` shows gray `xit` after the caret (no dropdown).
-                let mut spans = vec![
-                    Span::styled("❯ ", orange_fg),
-                    Span::raw(before),
-                    Span::raw(after),
-                ];
-                if cursor >= self.input_buf.len() {
-                    if let Some(cmd) = self.selected_slash_completion() {
-                        if let Some(suffix) = slash_ghost_suffix(&self.input_buf, cmd) {
-                            spans.push(Span::styled(suffix, bold_dim));
-                        }
-                    }
-                }
-                chrome.push(Line::from(spans));
-                cursor_pos = Some((display_width("❯ ") as u16 + display_width(before) as u16, 0));
-            }
-
-            // Status row under the prompt (model · cwd · tokens · cost).
-            // Always keep this while the normal composer is visible, including
-            // slash ghost completion. Hiding it when `/` sets show_command_picker
-            // shrinks chrome and drops the prompt to the terminal bottom.
-            // Other pickers/dialogs take earlier branches and never reach here.
-            chrome.push(Line::from(""));
+            // Normal composer is drawn later with a ratatui Block (reliable full-width
+            // borders). Here we only build the status byline under it.
             let mut status = Vec::new();
-            status.push(Span::styled(
-                format!("{}/{}", self.provider, self.model),
-                dim,
-            ));
-            // Shorten home-ish paths for the footer.
-            let path = self.work_dir.as_str();
-            let short_path = path
-                .rsplit(['/', '\\'])
-                .next()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(path);
-            status.push(Span::styled(" · ", bold_dim));
-            status.push(Span::styled(short_path, dim));
-            if self.total_usage.input_tokens > 0 || self.total_usage.output_tokens > 0 {
-                let est = crate::cost::estimate_cost(&self.model, &self.total_usage);
-                let cost_str = crate::cost::format_cost(est);
+            if self.ctrl_c_exit_armed {
+                status.push(Span::styled(
+                    "Press Ctrl+C again to exit",
+                    orange_fg.add_modifier(Modifier::BOLD),
+                ));
+            } else if matches!(self.state, State::Running) {
+                status.push(Span::styled("esc to interrupt", bold_dim));
+                if let Some(started) = self.running_started {
+                    status.push(Span::styled(" · ", bold_dim));
+                    status.push(Span::styled(format_elapsed_compact(started.elapsed()), dim));
+                }
                 status.push(Span::styled(" · ", bold_dim));
                 status.push(Span::styled(
-                    format!(
-                        "{}↓ {}↑",
-                        self.total_usage.input_tokens, self.total_usage.output_tokens
-                    ),
+                    format!("{}/{}", self.provider, self.model),
                     dim,
                 ));
-                if est > 0.0 {
+            } else {
+                status.push(Span::styled(
+                    format!("{}/{}", self.provider, self.model),
+                    dim,
+                ));
+                let path = self.work_dir.as_str();
+                let short_path = path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(path);
+                status.push(Span::styled(" · ", bold_dim));
+                status.push(Span::styled(short_path, dim));
+                if self.total_usage.input_tokens > 0 || self.total_usage.output_tokens > 0 {
+                    let est = crate::cost::estimate_cost(&self.model, &self.total_usage);
+                    let cost_str = crate::cost::format_cost(est);
                     status.push(Span::styled(" · ", bold_dim));
-                    status.push(Span::styled(cost_str, dim));
+                    status.push(Span::styled(
+                        format!(
+                            "{}↓ {}↑",
+                            self.total_usage.input_tokens, self.total_usage.output_tokens
+                        ),
+                        dim,
+                    ));
+                    if est > 0.0 {
+                        status.push(Span::styled(" · ", bold_dim));
+                        status.push(Span::styled(cost_str, dim));
+                    }
+                }
+                if self.input_buf.is_empty() {
+                    status.push(Span::styled(" · ", bold_dim));
+                    status.push(Span::styled("? for shortcuts", bold_dim));
                 }
             }
-            if matches!(self.state, State::Idle) && self.input_buf.is_empty() {
-                status.push(Span::styled(" · ", bold_dim));
-                status.push(Span::styled("? for shortcuts", bold_dim));
-            }
             chrome.push(Line::from(status));
+            // Signal: paint Block composer instead of line-drawn box in chrome.
+            cursor_pos = Some((u16::MAX, usize::MAX));
         }
 
         let width = area.width as usize;
         let body_wrapped = total_wrapped(&lines, width);
-        let chrome_wrapped = total_wrapped(&chrome, width).max(1);
+        // Normal composer uses a separate 3-row Block + status line in chrome.
+        let use_block_composer = cursor_pos == Some((u16::MAX, usize::MAX));
+        let status_h = if use_block_composer {
+            total_wrapped(&chrome, width).max(1) as u16
+        } else {
+            0
+        };
+        let chrome_wrapped = if use_block_composer {
+            // status only (composer is separate)
+            status_h as usize
+        } else {
+            total_wrapped(&chrome, width).max(1)
+        };
         // Keep room for transcript; cap chrome so pickers cannot hide all output.
+        let composer_h: u16 = if use_block_composer { 3 } else { 0 };
         let max_chrome = (area.height as usize)
             .saturating_sub(3)
             .min((area.height as usize).saturating_mul(2) / 3)
             .max(1);
-        let chrome_h = chrome_wrapped.min(max_chrome) as u16;
-        let chrome_scroll = chrome_wrapped.saturating_sub(chrome_h as usize);
+        let chrome_h = if use_block_composer {
+            status_h.min(max_chrome as u16).max(1)
+        } else {
+            chrome_wrapped.min(max_chrome) as u16
+        };
+        let chrome_scroll = if use_block_composer {
+            0
+        } else {
+            chrome_wrapped.saturating_sub(chrome_h as usize)
+        };
 
-        // Claude Code style: always pin the composer/status chrome to the bottom
-        // of the terminal. Transcript fills the space above and scrolls.
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(chrome_h)])
-            .split(area);
-        let body_area = chunks[0];
-        let chrome_area = chunks[1];
+        // Claude Code style: pin composer/status to the bottom.
+        let (body_area, composer_area, chrome_area) = if use_block_composer {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(composer_h),
+                    Constraint::Length(chrome_h),
+                ])
+                .split(area);
+            (chunks[0], Some(chunks[1]), chunks[2])
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(chrome_h)])
+                .split(area);
+            (chunks[0], None, chunks[1])
+        };
 
         // videre-style rowoff: free scroll when not following; pin to bottom when following.
         let body_h = body_area.height as usize;
@@ -3401,12 +3513,82 @@ impl Tui {
                 .scroll((body_scroll as u16, 0)),
             body_area,
         );
-        f.render_widget(
-            Paragraph::new(Text::from(chrome.clone()))
-                .wrap(Wrap { trim: false })
-                .scroll((chrome_scroll as u16, 0)),
-            chrome_area,
-        );
+
+        if let Some(composer_area) = composer_area {
+            // Reliable full-width rounded box via Block (avoids manual │ padding wrap bugs).
+            let cursor = self.cursor.min(self.input_buf.len());
+            let (before, after) = self.input_buf.split_at(cursor);
+            // ASCII ">" is always width-1; ❯ can be ambiguous across fonts/terminals.
+            let mark = "> ";
+            let show_idle_hint = self.input_buf.is_empty()
+                && matches!(self.state, State::Idle)
+                && self.idle_suggestion.is_some()
+                && !self.show_permission_prompt
+                && !self.show_recovery_prompt
+                && !self.awaiting_api_key;
+
+            let mut spans = vec![Span::styled(mark, orange_fg)];
+            if show_idle_hint {
+                spans.push(Span::styled(
+                    self.idle_suggestion.as_deref().unwrap_or(""),
+                    bold_dim,
+                ));
+            } else {
+                // Typed text uses ink (bright), not muted/dim like suggestions.
+                spans.push(Span::styled(before, white));
+                spans.push(Span::styled(after, white));
+                if cursor >= self.input_buf.len() {
+                    if let Some(cmd) = self.selected_slash_completion() {
+                        if let Some(suffix) = slash_ghost_suffix(&self.input_buf, cmd) {
+                            spans.push(Span::styled(suffix, bold_dim));
+                        }
+                    }
+                }
+            }
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(orange_fg);
+            f.render_widget(
+                Paragraph::new(Line::from(spans)).block(block),
+                composer_area,
+            );
+            f.render_widget(
+                Paragraph::new(Text::from(chrome)).wrap(Wrap { trim: false }),
+                chrome_area,
+            );
+
+            // Caret inside the block content area (one cell in from borders).
+            let x = composer_area.x.saturating_add(1).saturating_add(
+                (display_width(mark) + display_width(before))
+                    .min(composer_area.width.saturating_sub(3) as usize) as u16,
+            );
+            let y = composer_area.y.saturating_add(1);
+            f.set_cursor_position(Position { x, y });
+        } else {
+            f.render_widget(
+                Paragraph::new(Text::from(chrome.clone()))
+                    .wrap(Wrap { trim: false })
+                    .scroll((chrome_scroll as u16, 0)),
+                chrome_area,
+            );
+            if let Some((x_off, line_idx)) = cursor_pos {
+                let line_idx = line_idx.min(chrome.len().saturating_sub(1));
+                let wrapped_before = total_wrapped(&chrome[..line_idx], width);
+                let y =
+                    (chrome_area.y as usize + wrapped_before).saturating_sub(chrome_scroll) as u16;
+                let y = y.min(
+                    chrome_area
+                        .y
+                        .saturating_add(chrome_area.height.saturating_sub(1)),
+                );
+                let x = chrome_area
+                    .x
+                    .saturating_add(x_off.min(chrome_area.width.saturating_sub(1)));
+                f.set_cursor_position(Position { x, y });
+            }
+        }
 
         // Scroll position hint when not pinned to bottom (videre shows %).
         // Must fully reset cell style (incl. BOLD from the welcome box border):
@@ -3439,21 +3621,6 @@ impl Tui {
                     },
                 );
             }
-        }
-
-        if let Some((x_off, line_idx)) = cursor_pos {
-            let line_idx = line_idx.min(chrome.len().saturating_sub(1));
-            let wrapped_before = total_wrapped(&chrome[..line_idx], width);
-            let y = (chrome_area.y as usize + wrapped_before).saturating_sub(chrome_scroll) as u16;
-            let y = y.min(
-                chrome_area
-                    .y
-                    .saturating_add(chrome_area.height.saturating_sub(1)),
-            );
-            let x = chrome_area
-                .x
-                .saturating_add(x_off.min(chrome_area.width.saturating_sub(1)));
-            f.set_cursor_position(Position { x, y });
         }
     }
 
@@ -4587,6 +4754,75 @@ mod unicode_input_tests {
 }
 
 #[cfg(test)]
+mod help_overlay_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn help_command_opens_overlay_without_transcript_dump() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        let before = tui.output_lines.len();
+        tui.handle_command("/help");
+        assert!(tui.show_help);
+        assert_eq!(
+            tui.output_lines.len(),
+            before,
+            "/help must not dump into the transcript"
+        );
+    }
+
+    #[test]
+    fn esc_and_enter_close_help_overlay() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.show_help = true;
+        tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!tui.show_help);
+
+        tui.show_help = true;
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!tui.show_help);
+    }
+}
+
+#[cfg(test)]
+mod claude_chrome_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn format_elapsed_compact_units() {
+        assert_eq!(format_elapsed_compact(Duration::from_secs(0)), "0s");
+        assert_eq!(format_elapsed_compact(Duration::from_secs(9)), "9s");
+        assert_eq!(format_elapsed_compact(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(format_elapsed_compact(Duration::from_secs(600)), "10m 00s");
+    }
+
+    #[test]
+    fn rock_emoji_is_double_width_for_welcome_pad() {
+        // U+1FAA8 ROCK must count as 2 cols or the welcome right border slips.
+        assert_eq!(char_width('🪨'), 2);
+        // "  " (2) + rock (2) + " Cairn" (6) = 10
+        assert_eq!(display_width("  🪨 Cairn"), 10);
+        let padded = pad_to_display_width("  🪨 Cairn Code v0.1.0", 40);
+        assert_eq!(display_width(&padded), 40);
+    }
+
+    #[test]
+    fn ctrl_c_arms_exit_without_transcript_noise() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        assert!(tui.input_buf.is_empty());
+        assert!(tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(tui.ctrl_c_exit_armed);
+        assert!(
+            !tui.output_lines
+                .iter()
+                .any(|l| l.content.contains("Ctrl+C")),
+            "exit hint belongs in the footer, not the transcript"
+        );
+    }
+}
+
+#[cfg(test)]
 mod completion_tests {
     use super::*;
 
@@ -4743,6 +4979,18 @@ mod completion_tests {
 
 fn char_width(c: char) -> usize {
     let cp = c as u32;
+    // Zero-width: combining marks, variation selectors, ZWJ (emoji sequences).
+    if (0x0300..=0x036F).contains(&cp)
+        || (0x1AB0..=0x1AFF).contains(&cp)
+        || (0x1DC0..=0x1DFF).contains(&cp)
+        || (0x20D0..=0x20FF).contains(&cp)
+        || (0xFE00..=0xFE0F).contains(&cp)
+        || (0xE0100..=0xE01EF).contains(&cp)
+        || cp == 0x200D
+        || cp == 0xFEFF
+    {
+        return 0;
+    }
     if cp < 0x1100 {
         1
     } else if cp <= 0x115F {
@@ -4787,13 +5035,29 @@ fn char_width(c: char) -> usize {
         2
     } else if cp >= 0x1B100 && cp <= 0x1B12F {
         2
+    } else if cp >= 0x1F000 && cp <= 0x1F02F {
+        // Mahjong tiles
+        2
+    } else if cp >= 0x1F0A0 && cp <= 0x1F0FF {
+        // Playing cards
+        2
+    } else if cp >= 0x1F100 && cp <= 0x1F1FF {
+        // Enclosed alphanumerics / regional indicators (flags ~2 each)
+        2
     } else if cp >= 0x1F200 && cp <= 0x1F2FF {
+        2
+    } else if cp >= 0x1F300 && cp <= 0x1F9FF {
+        // Misc symbols & pictographs, emoticons, transport, supplemental
+        2
+    } else if cp >= 0x1FA00 && cp <= 0x1FAFF {
+        // Chess symbols, symbols and pictographs extended-A (includes 🪨 U+1FAA8)
         2
     } else if cp >= 0x20000 && cp <= 0x2FFFD {
         2
     } else if cp >= 0x30000 && cp <= 0x3FFFD {
         2
-    } else if cp >= 0x2600 && cp <= 0x26FF {
+    } else if cp >= 0x2600 && cp <= 0x27BF {
+        // Misc symbols + dingbats
         2
     } else {
         1
@@ -4804,11 +5068,48 @@ fn display_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 
+/// Pad or truncate `s` to exactly `width` terminal columns (display width).
+fn pad_to_display_width(s: &str, width: usize) -> String {
+    let dw = display_width(s);
+    if dw < width {
+        return format!("{}{}", s, " ".repeat(width - dw));
+    }
+    if dw == width {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut w_used = 0;
+    for c in s.chars() {
+        let cw = char_width(c);
+        if w_used + cw > width {
+            break;
+        }
+        out.push(c);
+        w_used += cw;
+    }
+    if w_used < width {
+        out.push_str(&" ".repeat(width - w_used));
+    }
+    out
+}
+
 fn truncate_summary(summary: &str, max_chars: usize) -> String {
     if summary.chars().count() > max_chars {
         format!("{}…", summary.chars().take(max_chars).collect::<String>())
     } else {
         summary.to_string()
+    }
+}
+
+/// Compact elapsed time for spinner / footer (Claude Code style: `3s`, `1m 12s`).
+pub(crate) fn format_elapsed_compact(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        let m = secs / 60;
+        let s = secs % 60;
+        format!("{m}m {s:02}s")
     }
 }
 
