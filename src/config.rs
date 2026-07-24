@@ -335,17 +335,25 @@ fn migrate_plaintext_keys_in_file(path: &std::path::Path) {
         return;
     }
 
+    // Only drop keys that were actually written to the keyring; keep any
+    // whose migration failed so they aren't lost and can be retried later.
+    let mut remaining = keys.clone();
     let mut migrated_any = false;
     for (provider, v) in &keys {
         if let Some(key) = v.as_str() {
             if !key.is_empty() && keyring_set(provider, key).is_ok() {
+                remaining.remove(provider);
                 migrated_any = true;
             }
         }
     }
 
     if migrated_any {
-        obj.remove("api_keys");
+        if remaining.is_empty() {
+            obj.remove("api_keys");
+        } else {
+            obj.insert("api_keys".into(), JsonValue::Object(remaining));
+        }
         let output = crate::json::serialize(&JsonValue::Object(obj));
         let _ = fs::write(path, &output);
     }
@@ -1246,5 +1254,55 @@ mod tests {
         );
 
         let _ = keyring_delete(provider);
+    }
+
+    #[test]
+    fn test_migrate_plaintext_keys_retains_entries_that_fail_to_migrate() {
+        let good_provider = "cairn-code-test-provider-migrate-ok";
+        let bad_provider = "cairn-code-test-provider-migrate-fail";
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.json");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                r#"{{"default_provider":"openrouter","default_model":"m","api_keys":{{"{good_provider}":"sk-good","{bad_provider}":"sk-bad"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        // Force the keyring write for `bad_provider` to fail so the
+        // migration only partially succeeds.
+        let entry = keyring_entry(bad_provider).unwrap();
+        let mock: &keyring_core::mock::Cred = entry.as_any().downcast_ref().unwrap();
+        mock.set_error(keyring_core::Error::NoStorageAccess(Box::new(
+            std::io::Error::other("mock storage failure"),
+        )));
+
+        migrate_plaintext_keys_in_file(&cfg_path);
+
+        // The good provider's key made it into the keyring...
+        assert_eq!(keyring_get(good_provider), Some("sk-good".to_string()));
+        // ...but the bad provider's key was never migrated (the keyring
+        // has nothing for it)...
+        assert_eq!(keyring_get(bad_provider), None);
+
+        // ...and crucially, it must still be present in the file so it
+        // isn't lost forever; only the successfully migrated key is
+        // stripped out.
+        let content = std::fs::read_to_string(&cfg_path).unwrap();
+        let parsed = crate::json::parse(&content).unwrap();
+        let obj = parsed.as_object().unwrap();
+        let remaining_keys = obj
+            .get("api_keys")
+            .and_then(|v| v.as_object())
+            .expect("api_keys must be retained when a migration fails");
+        assert_eq!(remaining_keys.len(), 1);
+        assert_eq!(
+            remaining_keys.get(bad_provider).and_then(|v| v.as_str()),
+            Some("sk-bad")
+        );
+        assert!(remaining_keys.get(good_provider).is_none());
+
+        let _ = keyring_delete(good_provider);
     }
 }
