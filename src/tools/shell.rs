@@ -569,8 +569,8 @@ mod tests {
         let command = format!(
             "Start-Process powershell -ArgumentList @('-NoProfile','-Command','Start-Sleep -Milliseconds 1000; Set-Content -LiteralPath ''{marker_ps}'' -Value survived'); Start-Sleep -Seconds 5"
         );
-        // Paths contain backslashes on Windows; build JSON with a real encoder
-        // so `\U` etc. are not treated as invalid escapes.
+        // marker_ps uses forward slashes for PowerShell -LiteralPath; keep
+        // marker as PathBuf for the filesystem assertion below.
         let input = serde_json::json!({
             "command": command,
             "timeout": 200
