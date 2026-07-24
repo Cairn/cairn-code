@@ -12,6 +12,17 @@ pub trait Tool: Send {
         self.name().to_string()
     }
     fn execute(&self, input: &str) -> Result<String, String>;
+    /// Execute with a cooperative cancellation token. Tools that run
+    /// long-lived subprocesses (shell, git, go) override this so the agent can
+    /// interrupt them; everything else uses this default, which ignores the
+    /// token and runs to completion.
+    fn execute_with_cancel(
+        &self,
+        input: &str,
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<String, String> {
+        self.execute(input)
+    }
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),

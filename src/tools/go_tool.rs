@@ -1,6 +1,16 @@
+use super::process_runner::{self, with_cleanup, RunError, RunOptions};
 use super::registry::Tool;
 use super::workspace::Workspace;
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
+
+/// Generous wall-clock cap so a hung `go` invocation cannot block the agent
+/// forever. Long builds/tests normally finish well within this; the user can
+/// also cancel sooner.
+const GO_TIMEOUT: Duration = Duration::from_secs(600);
+const HEAD_CHARS: usize = 6_000;
+const TAIL_CHARS: usize = 4_000;
 
 pub struct GoTool {
     workspace: Workspace,
@@ -28,26 +38,58 @@ impl Tool for GoTool {
     }
 
     fn execute(&self, input: &str) -> Result<String, String> {
+        self.execute_with_cancel(input, &AtomicBool::new(false))
+    }
+
+    fn execute_with_cancel(&self, input: &str, cancel: &AtomicBool) -> Result<String, String> {
         let args = super::parse_command_args(input)?;
 
-        let output = Command::new("go")
-            .args(&args)
-            .current_dir(self.workspace.root())
-            .output()
-            .map_err(|e| format!("go exec error: {e}"))?;
+        let mut command = Command::new("go");
+        command.args(&args).current_dir(self.workspace.root());
 
-        let result = super::bounded_command_output(&output.stdout, &output.stderr);
+        let options = RunOptions {
+            timeout: Some(GO_TIMEOUT),
+            head_chars: HEAD_CHARS,
+            tail_chars: TAIL_CHARS,
+        };
+        let result = match process_runner::run(command, &options, Some(cancel)) {
+            Ok(result) => result,
+            Err(error) => return Err(format_run_error(error)),
+        };
 
-        if !output.status.success() {
-            let mut error = format!("go exited with {}", output.status.code().unwrap_or(-1));
-            if !result.is_empty() {
+        let body =
+            super::bounded_command_output(result.stdout.as_bytes(), result.stderr.as_bytes());
+
+        if !result.success {
+            let mut error = format!("go exited with {}", result.code);
+            if !body.is_empty() {
                 error.push('\n');
-                error.push_str(&result);
+                error.push_str(&body);
             }
             return Err(error);
         }
 
-        Ok(result)
+        Ok(body)
+    }
+}
+
+fn format_run_error(error: RunError) -> String {
+    match error {
+        RunError::Spawn(message) => format!("go exec error: {message}"),
+        RunError::TimedOut {
+            after_ms,
+            cleanup_error,
+        } => with_cleanup(
+            format!("go command timed out after {after_ms}ms"),
+            &cleanup_error,
+        ),
+        RunError::Cancelled { cleanup_error } => {
+            with_cleanup("go command cancelled".to_string(), &cleanup_error)
+        }
+        RunError::Wait {
+            reason,
+            cleanup_error,
+        } => with_cleanup(format!("go exec error: {reason}"), &cleanup_error),
     }
 }
 
