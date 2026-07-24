@@ -404,6 +404,17 @@ impl Tui {
         self.spinner_verb_idx = seed % SPINNER_VERBS.len();
     }
 
+    /// Current MiniDot braille frame (Grok Build / charmbracelet cadence).
+    fn spinner_glyph(&self) -> &'static str {
+        SPINNER_CHARS[self.spinner_idx % SPINNER_CHARS.len()]
+    }
+
+    /// Whether the transcript shows the waiting verb line vs a trailing glyph.
+    /// Waiting: no answer tokens yet, and not already painting a full thinking body.
+    fn spinner_is_waiting(&self) -> bool {
+        self.streaming_text.is_empty() && !(self.show_thinking && !self.stream_thinking.is_empty())
+    }
+
     pub fn set_show_thinking(&mut self, show: bool) {
         self.show_thinking = show;
     }
@@ -3325,27 +3336,29 @@ impl Tui {
                 orange_fg,
             ));
         }
-        // Spinner while waiting / thinking without answer text. Skip when full
-        // thinking body is already on screen (show_thinking on).
-        // OpenClaude-style: glyph + rotating verb + elapsed seconds.
-        let show_spin = matches!(self.state, State::Running)
-            && self.streaming_text.is_empty()
-            && !(self.show_thinking && !self.stream_thinking.is_empty());
-        if show_spin {
-            let spin = SPINNER_CHARS[self.spinner_idx % SPINNER_CHARS.len()];
-            let verb = SPINNER_VERBS[self.spinner_verb_idx % SPINNER_VERBS.len()];
-            let elapsed = self
-                .running_started
-                .map(|t| format_elapsed_compact(t.elapsed()))
-                .unwrap_or_default();
-            let mut spin_spans = vec![
-                Span::styled(spin, orange),
-                Span::styled(format!(" {verb}…"), dim),
-            ];
-            if !elapsed.is_empty() {
-                spin_spans.push(Span::styled(format!(" {elapsed}"), bold_dim));
+        // Activity spinner for the whole Running turn (not only pre-first-token).
+        // Waiting: OpenClaude-style glyph + verb + elapsed.
+        // Streaming / full thinking on screen: trailing glyph so stream pauses
+        // and long tool gaps still look alive (footer also has the braille).
+        if matches!(self.state, State::Running) {
+            let spin = self.spinner_glyph();
+            if self.spinner_is_waiting() {
+                let verb = SPINNER_VERBS[self.spinner_verb_idx % SPINNER_VERBS.len()];
+                let elapsed = self
+                    .running_started
+                    .map(|t| format_elapsed_compact(t.elapsed()))
+                    .unwrap_or_default();
+                let mut spin_spans = vec![
+                    Span::styled(spin, orange),
+                    Span::styled(format!(" {verb}…"), dim),
+                ];
+                if !elapsed.is_empty() {
+                    spin_spans.push(Span::styled(format!(" {elapsed}"), bold_dim));
+                }
+                lines.push(Line::from(spin_spans));
+            } else {
+                lines.push(Line::from(Span::styled(spin, orange)));
             }
-            lines.push(Line::from(spin_spans));
         }
 
         // Composer / pickers live in a fixed bottom chrome region so typing never
@@ -3754,7 +3767,10 @@ impl Tui {
                     orange_fg.add_modifier(Modifier::BOLD),
                 ));
             } else if matches!(self.state, State::Running) {
-                status.push(Span::styled("esc to interrupt", bold_dim));
+                // Fixed footer braille so activity is visible even when the
+                // transcript spinner is scrolled away or mid-stream.
+                status.push(Span::styled(self.spinner_glyph(), orange));
+                status.push(Span::styled(" esc to interrupt", bold_dim));
                 if let Some(started) = self.running_started {
                     status.push(Span::styled(" · ", bold_dim));
                     status.push(Span::styled(format_elapsed_compact(started.elapsed()), dim));
@@ -5124,6 +5140,39 @@ mod provider_privacy_tests {
             rx.try_recv().is_err(),
             "cancellation must not leave a stale command queued"
         );
+    }
+
+    #[test]
+    fn spinner_waiting_until_answer_or_full_thinking_streams() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.begin_running();
+        assert!(
+            tui.spinner_is_waiting(),
+            "pre-token should use verb spinner"
+        );
+        assert!(
+            SPINNER_CHARS.contains(&tui.spinner_glyph()),
+            "glyph must be a MiniDot frame"
+        );
+
+        // Hidden thinking accumulates: still waiting (spinner verb stays).
+        tui.show_thinking = false;
+        tui.stream_thinking.push_str("secret chain-of-thought");
+        assert!(tui.spinner_is_waiting());
+
+        // Answer tokens: switch to trailing glyph mode.
+        tui.streaming_text.push_str("Hello");
+        assert!(!tui.spinner_is_waiting());
+
+        // Full thinking on screen: also trailing (body is the activity signal).
+        tui.streaming_text.clear();
+        tui.show_thinking = true;
+        tui.stream_thinking = "visible".into();
+        assert!(!tui.spinner_is_waiting());
+
+        // Idle must not matter for the predicate itself; Running is checked at paint.
+        tui.stream_thinking.clear();
+        assert!(tui.spinner_is_waiting());
     }
 }
 
