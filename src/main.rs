@@ -10,14 +10,12 @@ use cairn_code::llm::provider;
 use cairn_code::{http_client, llm, oauth, session, skills, tools, tui};
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
     let version = env!("CARGO_PKG_VERSION");
     let mut is_print_mode = false;
     let mut initial_prompt: Option<String> = None;
 
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
             "-p" | "--print" => is_print_mode = true,
             "-h" | "--help" => {
                 print_help(version);
@@ -28,11 +26,19 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             arg if !arg.starts_with('-') => {
+                if initial_prompt.is_some() {
+                    eprintln!("Error: unexpected positional argument '{arg}'");
+                    eprintln!("Pass the prompt as one quoted argument. See '--help' for usage.");
+                    return ExitCode::FAILURE;
+                }
                 initial_prompt = Some(arg.to_string());
             }
-            _ => {}
+            _ => {
+                eprintln!("Error: unknown option '{arg}'");
+                eprintln!("See '--help' for usage.");
+                return ExitCode::FAILURE;
+            }
         }
-        i += 1;
     }
 
     let cfg = match Config::load() {
@@ -293,8 +299,13 @@ fn main() -> ExitCode {
         let _ = cmd_tx.send(prompt);
     }
 
-    let _ = tui.run(event_rx);
-    ExitCode::SUCCESS
+    match tui.run(event_rx) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn print_help(version: &str) {
@@ -303,6 +314,9 @@ fn print_help(version: &str) {
     println!();
     println!("USAGE:");
     println!("    cairn-code [OPTIONS] [PROMPT]");
+    println!();
+    println!("ARGUMENTS:");
+    println!("    PROMPT             Optional initial prompt; quote prompts containing spaces");
     println!();
     println!("OPTIONS:");
     println!("    -p, --print       Run PROMPT once non-interactively, print the result, and exit");
