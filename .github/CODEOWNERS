@@ -1,3 +1,3 @@
-# Default reviewers for all paths. CODEOWNERS does not grant permissions;
-# GitHub only auto-requests review from people who already have write access.
-* @euxaristia @PierrunoYT
+# Default reviewer for all paths. CODEOWNERS does not grant permissions;
+# GitHub only auto-requests people who already have write access.
+* @euxaristia
