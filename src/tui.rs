@@ -53,6 +53,14 @@ const SPINNER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 12);
 // (60fps); without this, token-rate dirty redraws thrash the terminal around the spinner.
 const MIN_FRAME: Duration = Duration::from_millis(16);
 
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
+}
+
 pub struct Tui {
     output_lines: Vec<OutputLine>,
     input_buf: String,
@@ -427,6 +435,7 @@ impl Tui {
 
     pub fn run(&mut self, rx: mpsc::Receiver<AgentEvent>) -> Result<(), String> {
         let mut terminal = ratatui::init();
+        let _terminal_guard = TerminalGuard;
         terminal.clear().map_err(|e| e.to_string())?;
         // Wheel scroll for transcript history. Shift+drag where supported is
         // handled by the terminal host (selects text without sending events
@@ -678,7 +687,6 @@ impl Tui {
         if self.mouse_capture {
             let _ = execute!(stdout(), DisableMouseCapture);
         }
-        ratatui::restore();
         result
     }
 
