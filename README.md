@@ -182,6 +182,8 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | `/help` | Show available commands |
 | `/clear` | Clear conversation history |
 | `/compact` | Summarize older history into a shorter context now |
+| `/roast-me` | Start the built-in architecture roast skill (optional topic after the command) |
+| `/skills` | List available skill packs (disk + built-in) |
 | `/model` | Show or change the current model |
 | `/cost` | Show token usage for the session |
 | `/provider` | Show or change the current provider (prompts for API key when missing; input is masked) |

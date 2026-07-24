@@ -50,8 +50,8 @@ impl Tool for SkillTool {
 
         if self.skills.is_empty() {
             return Err(
-                "No skills installed. Add SKILL.md packs under the skills directory \
-                 (see CAIRN_SKILLS_DIR or ~/.config/cairn-code/skills)."
+                "No skills available. Built-ins should always load; add custom SKILL.md packs \
+                 under the skills directory (CAIRN_SKILLS_DIR or ~/.config/cairn-code/skills)."
                     .into(),
             );
         }

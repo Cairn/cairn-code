@@ -55,13 +55,42 @@ pub fn agents_skills_dir() -> Option<PathBuf> {
     }
 }
 
-/// Load skills from default roots (primary first; later roots fill name gaps).
+/// Load skills from default roots (primary first; later roots fill name gaps),
+/// then fill remaining name gaps from the built-in pack.
 pub fn load_skills() -> Vec<Skill> {
     let mut roots = vec![default_skills_dir()];
     if let Some(a) = agents_skills_dir() {
         roots.push(a);
     }
-    load_from_roots(&roots)
+    with_builtins(load_from_roots(&roots))
+}
+
+/// Built-in skill packs shipped with the binary (always available).
+///
+/// Disk skills with the same `name` win; builtins only fill gaps.
+pub fn builtin_skills() -> Vec<Skill> {
+    const ROAST_ME: &str = include_str!("../skills/roast-me/SKILL.md");
+    let mut out = Vec::new();
+    if let Some(skill) = parse_skill(
+        ROAST_ME,
+        "roast-me",
+        PathBuf::from("builtin:roast-me/SKILL.md"),
+    ) {
+        out.push(skill);
+    }
+    out
+}
+
+/// Merge disk-loaded skills with builtins. Existing names are kept (disk wins).
+pub fn with_builtins(mut disk: Vec<Skill>) -> Vec<Skill> {
+    let mut seen: std::collections::HashSet<String> = disk.iter().map(|s| s.name.clone()).collect();
+    for skill in builtin_skills() {
+        if seen.insert(skill.name.clone()) {
+            disk.push(skill);
+        }
+    }
+    disk.sort_by(|a, b| a.name.cmp(&b.name));
+    disk
 }
 
 pub fn load_from_roots(roots: &[PathBuf]) -> Vec<Skill> {
@@ -298,5 +327,43 @@ mod tests {
         }];
         assert!(find_skill(&skills, "myskill").is_some());
         assert!(find_skill(&skills, "nope").is_none());
+    }
+
+    #[test]
+    fn builtin_roast_me_present_when_disk_empty() {
+        let skills = with_builtins(Vec::new());
+        let s = find_skill(&skills, "roast-me").expect("builtin roast-me");
+        assert!(s.content.contains("Roast Me") || s.content.contains("# Roast"));
+        assert!(
+            s.description.to_ascii_lowercase().contains("architecture")
+                || s.description.to_ascii_lowercase().contains("constructive")
+        );
+        assert!(s.path.to_string_lossy().starts_with("builtin:"));
+    }
+
+    #[test]
+    fn disk_skill_overrides_builtin_by_name() {
+        let disk = vec![Skill {
+            name: "roast-me".into(),
+            description: "Disk override".into(),
+            content: "Custom disk body for roast-me.".into(),
+            path: PathBuf::from("/tmp/disk-roast-me/SKILL.md"),
+        }];
+        let skills = with_builtins(disk);
+        let s = find_skill(&skills, "roast-me").unwrap();
+        assert_eq!(s.description, "Disk override");
+        assert!(s.content.contains("Custom disk body"));
+        assert!(!s.path.to_string_lossy().starts_with("builtin:"));
+        // Builtin still fills other names only; roast-me must appear once.
+        assert_eq!(skills.iter().filter(|s| s.name == "roast-me").count(), 1);
+    }
+
+    #[test]
+    fn parse_vendored_roast_me_skill_md() {
+        let raw = include_str!("../skills/roast-me/SKILL.md");
+        let s = parse_skill(raw, "roast-me", PathBuf::from("skills/roast-me/SKILL.md")).unwrap();
+        assert_eq!(s.name, "roast-me");
+        assert!(!s.description.is_empty());
+        assert!(s.content.contains("Operating Mode") || s.content.contains("Initial Setup"));
     }
 }
