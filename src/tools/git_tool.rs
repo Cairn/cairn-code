@@ -13,7 +13,7 @@ const HEAD_CHARS: usize = 6_000;
 const TAIL_CHARS: usize = 4_000;
 
 /// GitHub co-author trailer for commits created through Cairn Code.
-/// Format matches Git / GitHub `Co-authored-by` (case-insensitive).
+/// Passed via `git commit --trailer` so it works with `-m`, `-F`, `-C`, etc.
 pub(crate) const CO_AUTHOR_TRAILER: &str =
     "Co-Authored-By: cairn-code <282421612+cairn-code@users.noreply.github.com>";
 
@@ -34,7 +34,7 @@ impl Tool for GitTool {
     fn description(&self) -> &str {
         "Execute Git commands in the workspace. Git can invoke aliases, hooks, helpers, and \
          config-defined commands, so treat it as shell-equivalent execution. \
-         Commits with a message automatically get a Co-Authored-By: cairn-code trailer."
+         Commits automatically get a Co-Authored-By: cairn-code trailer via git --trailer."
     }
     fn needs_permission(&self) -> bool {
         true
@@ -100,23 +100,19 @@ fn format_run_error(error: RunError) -> String {
     }
 }
 
-/// Append the Cairn Code co-author trailer to `git commit` when a message is
-/// provided (`-m` / `--message`). Skips if the trailer is already present, or
-/// when there is no explicit message (editor / `--no-edit` amend).
+/// Append `git commit --trailer <CO_AUTHOR_TRAILER>` for commit invocations.
+///
+/// Using `--trailer` (git 2.32+) is required: message sources `-m`, `-F`, `-C`,
+/// and `-c` are mutually exclusive, so appending another `-m` breaks `-F`/`-C`/`-c`.
+/// `--trailer` works with all of them and deduplicates via git's trailer rules.
 fn with_co_author_trailer(mut args: Vec<String>) -> Vec<String> {
-    let Some(commit_idx) = commit_subcommand_index(&args) else {
-        return args;
-    };
-    let commit_args = &args[commit_idx + 1..];
-    if commit_message_args_contain_co_author(commit_args) {
+    if commit_subcommand_index(&args).is_none() {
         return args;
     }
-    if !commit_has_explicit_message(commit_args) {
+    if already_has_cairn_trailer_flag(&args) {
         return args;
     }
-    // Extra `-m` becomes another paragraph in the commit message, which is the
-    // usual place for Git trailers (blank line separator is added by git).
-    args.push("-m".into());
+    args.push("--trailer".into());
     args.push(CO_AUTHOR_TRAILER.into());
     args
 }
@@ -141,47 +137,26 @@ fn commit_subcommand_index(args: &[String]) -> Option<usize> {
             i = i.saturating_add(2);
             continue;
         }
-        // Combined form: --git-dir=..., -c core.foo=bar, etc.
         i += 1;
     }
     None
 }
 
-fn commit_has_explicit_message(commit_args: &[String]) -> bool {
+fn already_has_cairn_trailer_flag(args: &[String]) -> bool {
     let mut i = 0;
-    while i < commit_args.len() {
-        let arg = commit_args[i].as_str();
-        match arg {
-            "-m" | "--message" | "-F" | "--file" | "-C" | "--reuse-message" | "-c"
-            | "--reedit-message" => return true,
-            s if s.starts_with("--message=")
-                || s.starts_with("--file=")
-                || s.starts_with("--reuse-message=")
-                || s.starts_with("--reedit-message=") =>
-            {
-                return true;
-            }
-            _ => i += 1,
-        }
-    }
-    false
-}
-
-fn commit_message_args_contain_co_author(commit_args: &[String]) -> bool {
-    let mut i = 0;
-    while i < commit_args.len() {
-        let arg = commit_args[i].as_str();
-        if arg == "-m" || arg == "--message" {
-            if let Some(msg) = commit_args.get(i + 1) {
-                if message_has_cairn_co_author(msg) {
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--trailer" {
+            if let Some(value) = args.get(i + 1) {
+                if trailer_is_cairn_co_author(value) {
                     return true;
                 }
             }
             i = i.saturating_add(2);
             continue;
         }
-        if let Some(msg) = arg.strip_prefix("--message=") {
-            if message_has_cairn_co_author(msg) {
+        if let Some(value) = arg.strip_prefix("--trailer=") {
+            if trailer_is_cairn_co_author(value) {
                 return true;
             }
         }
@@ -190,11 +165,9 @@ fn commit_message_args_contain_co_author(commit_args: &[String]) -> bool {
     false
 }
 
-fn message_has_cairn_co_author(message: &str) -> bool {
-    message.lines().any(|line| {
-        let lower = line.trim().to_ascii_lowercase();
-        lower.starts_with("co-authored-by:") && lower.contains("cairn-code")
-    })
+fn trailer_is_cairn_co_author(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    lower.contains("co-authored-by:") && lower.contains("cairn-code")
 }
 
 #[cfg(test)]
@@ -269,7 +242,6 @@ mod tests {
         match tool().execute(r#"{"args":["rev-parse","--is-inside-work-tree"]}"#) {
             Ok(out) => assert!(out.trim().contains("true") || out.contains("true"), "{out}"),
             Err(e) => {
-                // Allow missing git binary in restricted CI.
                 assert!(
                     e.contains("git exec") || e.contains("git exited"),
                     "unexpected error: {e}"
@@ -279,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn injects_co_author_on_commit_with_message() {
+    fn injects_trailer_on_commit_with_message() {
         let args = with_co_author_trailer(vec![
             "commit".to_string(),
             "-m".to_string(),
@@ -291,14 +263,14 @@ mod tests {
                 "commit".to_string(),
                 "-m".to_string(),
                 "fix: something".to_string(),
-                "-m".to_string(),
+                "--trailer".to_string(),
                 CO_AUTHOR_TRAILER.to_string(),
             ]
         );
     }
 
     #[test]
-    fn injects_co_author_after_global_git_options() {
+    fn injects_trailer_after_global_git_options() {
         let args = with_co_author_trailer(vec![
             "-C".to_string(),
             "/tmp/repo".to_string(),
@@ -306,74 +278,13 @@ mod tests {
             "--message".to_string(),
             "chore: note".to_string(),
         ]);
-        assert_eq!(args[args.len() - 2], "-m");
+        assert_eq!(args[args.len() - 2], "--trailer");
         assert_eq!(args[args.len() - 1], CO_AUTHOR_TRAILER);
     }
 
     #[test]
-    fn does_not_duplicate_existing_cairn_co_author() {
-        let message = format!("subject\n\n{CO_AUTHOR_TRAILER}");
-        let args = with_co_author_trailer(vec![
-            "commit".to_string(),
-            "-m".to_string(),
-            message.clone(),
-        ]);
-        // No extra `-m` trailer arg when the message already co-authors cairn-code.
-        assert_eq!(
-            args,
-            vec!["commit".to_string(), "-m".to_string(), message.clone()]
-        );
-        assert!(message_has_cairn_co_author(&message));
-        assert_eq!(args.iter().filter(|a| *a == CO_AUTHOR_TRAILER).count(), 0);
-    }
-
-    #[test]
-    fn leaves_non_commit_commands_alone() {
-        let original = vec!["status".to_string(), "-sb".to_string()];
-        assert_eq!(with_co_author_trailer(original.clone()), original);
-    }
-
-    #[test]
-    fn leaves_commit_without_message_alone() {
-        // Editor / --no-edit amend paths: do not invent a message of only the trailer.
-        let original = vec![
-            "commit".to_string(),
-            "--amend".to_string(),
-            "--no-edit".to_string(),
-        ];
-        assert_eq!(with_co_author_trailer(original.clone()), original);
-    }
-
-    #[test]
-    fn global_c_path_alone_does_not_count_as_commit_message() {
-        // `git -C /repo commit --no-edit` must not treat global -C as --reuse-message.
-        let original = vec![
-            "-C".to_string(),
-            "/tmp/repo".to_string(),
-            "commit".to_string(),
-            "--amend".to_string(),
-            "--no-edit".to_string(),
-        ];
-        assert_eq!(with_co_author_trailer(original.clone()), original);
-    }
-
-    #[test]
-    fn recognizes_equals_message_form() {
-        let args =
-            with_co_author_trailer(vec!["commit".to_string(), "--message=hello".to_string()]);
-        assert_eq!(
-            args,
-            vec![
-                "commit".to_string(),
-                "--message=hello".to_string(),
-                "-m".to_string(),
-                CO_AUTHOR_TRAILER.to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn commit_with_file_message_still_gets_trailer() {
+    fn injects_trailer_with_file_message_without_extra_m() {
+        // Must not append -m (git rejects -m together with -F).
         let args = with_co_author_trailer(vec![
             "commit".to_string(),
             "-F".to_string(),
@@ -385,9 +296,106 @@ mod tests {
                 "commit".to_string(),
                 "-F".to_string(),
                 "msg.txt".to_string(),
-                "-m".to_string(),
+                "--trailer".to_string(),
                 CO_AUTHOR_TRAILER.to_string(),
             ]
         );
+        assert!(!args.iter().any(|a| a == "-m"));
+    }
+
+    #[test]
+    fn injects_trailer_with_reuse_message() {
+        let args = with_co_author_trailer(vec![
+            "commit".to_string(),
+            "-C".to_string(),
+            "HEAD".to_string(),
+        ]);
+        assert_eq!(args[args.len() - 2], "--trailer");
+        assert_eq!(args[args.len() - 1], CO_AUTHOR_TRAILER);
+        assert!(!args.iter().any(|a| a == "-m"));
+    }
+
+    #[test]
+    fn does_not_duplicate_existing_trailer_flag() {
+        let args = with_co_author_trailer(vec![
+            "commit".to_string(),
+            "-m".to_string(),
+            "subject".to_string(),
+            "--trailer".to_string(),
+            CO_AUTHOR_TRAILER.to_string(),
+        ]);
+        assert_eq!(args.iter().filter(|a| a.as_str() == "--trailer").count(), 1);
+    }
+
+    #[test]
+    fn leaves_non_commit_commands_alone() {
+        let original = vec!["status".to_string(), "-sb".to_string()];
+        assert_eq!(with_co_author_trailer(original.clone()), original);
+    }
+
+    #[test]
+    fn real_commit_f_with_trailer_succeeds() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("cairn-git-trailer-{nanos}"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let tool = GitTool::new(Workspace::new(&workspace).unwrap());
+
+        tool.execute(r#"{"args":["init","--quiet"]}"#).unwrap();
+        // Identity required for commit in empty temp repos.
+        let _ = tool.execute(r#"{"args":["config","user.email","test@example.com"]}"#);
+        let _ = tool.execute(r#"{"args":["config","user.name","test"]}"#);
+        std::fs::write(workspace.join("a.txt"), "a\n").unwrap();
+        tool.execute(r#"{"args":["add","a.txt"]}"#).unwrap();
+        std::fs::write(workspace.join("msg.txt"), "feat: from file\n").unwrap();
+        tool.execute(r#"{"args":["commit","-F","msg.txt"]}"#)
+            .unwrap();
+        let log = tool
+            .execute(r#"{"args":["log","-1","--format=%B"]}"#)
+            .unwrap();
+        assert!(
+            log.to_ascii_lowercase().contains("co-authored-by:") && log.contains("cairn-code"),
+            "expected co-author trailer in commit message, got: {log}"
+        );
+        assert!(log.contains("feat: from file"), "{log}");
+
+        drop(tool);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn real_commit_m_with_trailer_succeeds() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("cairn-git-trailer-m-{nanos}"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let tool = GitTool::new(Workspace::new(&workspace).unwrap());
+
+        tool.execute(r#"{"args":["init","--quiet"]}"#).unwrap();
+        let _ = tool.execute(r#"{"args":["config","user.email","test@example.com"]}"#);
+        let _ = tool.execute(r#"{"args":["config","user.name","test"]}"#);
+        std::fs::write(workspace.join("b.txt"), "b\n").unwrap();
+        tool.execute(r#"{"args":["add","b.txt"]}"#).unwrap();
+        tool.execute(r#"{"args":["commit","-m","fix: via -m"]}"#)
+            .unwrap();
+        let log = tool
+            .execute(r#"{"args":["log","-1","--format=%B"]}"#)
+            .unwrap();
+        assert!(log.contains("fix: via -m"), "{log}");
+        assert!(
+            log.to_ascii_lowercase().contains("co-authored-by:") && log.contains("cairn-code"),
+            "{log}"
+        );
+
+        drop(tool);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }
