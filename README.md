@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/banner.png" alt="Cairn Code" width="560">
+</p>
+
 # Cairn Code
 
 [![CI](https://github.com/Cairn/cairn-code/actions/workflows/ci.yml/badge.svg)](https://github.com/Cairn/cairn-code/actions/workflows/ci.yml)
@@ -5,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Providers](https://img.shields.io/badge/LLM-Anthropic%20%7C%20OpenAI%20%7C%20OpenRouter%20%7C%20OpenGateway%20%7C%20xAI%20%7C%20Ollama-blue)](#features)
 [![TUI](https://img.shields.io/badge/TUI-ratatui-yellow)](https://ratatui.rs/)
-[![Tools](https://img.shields.io/badge/tools-14-brightgreen)](#tools)
+[![Tools](https://img.shields.io/badge/tools-15-brightgreen)](#tools)
 
 A Rust-based CLI LLM coding agent, inspired by Claude Code and Zero. Built by Cairn.
 
@@ -13,7 +17,7 @@ A Rust-based CLI LLM coding agent, inspired by Claude Code and Zero. Built by Ca
 
 - **Multi-provider LLM support** — Anthropic, OpenAI, OpenRouter, OpenGateway, xAI/Grok (API key or OAuth device login), Ollama
 - **Agentic tool loop** — The LLM autonomously reads files, writes code, runs commands, and searches your codebase until the task is done
-- **14 built-in tools** — FileRead, FileWrite, FileEdit, FileUndo, Shell, PowerShell, Go, Git, Glob, Grep, Memory, WebSearch, WebFetch, TodoWrite
+- **15 built-in tools** — FileRead, FileWrite, FileEdit, FileUndo, Shell, PowerShell, Python, Go, Git, Glob, Grep, Memory, WebSearch, WebFetch, TodoWrite
 - **Real-time streaming** — Token-by-token output with live tool display and thinking blocks
 - **Ratatui TUI** — Terminal UI with input history, spinner, provider/model pickers, and syntect-highlighted fenced code blocks
 - **Cost tracking** — Per-session and per-tool-call token usage with cache-aware pricing
@@ -26,12 +30,22 @@ A Rust-based CLI LLM coding agent, inspired by Claude Code and Zero. Built by Ca
 ### Prerequisites
 
 - Rust 1.96+
-- [curl](https://curl.se/) installed and on PATH (used by the `web_fetch` and `web_search` tools)
+- [curl](https://curl.se/) installed and on PATH (used for all provider HTTP requests and web tools)
 
 ### Build
 
 ```bash
 cargo build --release
+```
+
+Before submitting changes, run the same core quality checks enforced by CI:
+
+```bash
+rustfmt --edition 2021 --check path/to/changed.rs
+cargo clippy --locked --all-targets --all-features -- -A clippy::approx_constant
+cargo test --locked
+cargo doc --locked --no-deps
+cargo package --locked
 ```
 
 ### Configure
@@ -99,7 +113,7 @@ src/
   agent.rs               Core agentic loop (LLM call -> tool use -> repeat)
   config.rs              Configuration loading and merging (JSON + env vars)
   cost.rs                Model pricing tables and cost estimation
-  http_client.rs         HTTP client via ureq (blocking + streaming)
+  http_client.rs         Provider HTTP transport via curl (blocking + streaming)
   json.rs                Hand-written recursive descent JSON parser
   markdown.rs            Markdown rendering + syntect code-block highlighting
   session.rs             Session persistence (save/load/list)
@@ -120,8 +134,8 @@ src/
     file_history.rs      In-process undo stack for edit/write
     file_undo.rs         Undo last file_edit/file_write
     shell.rs             Shell command execution with timeout
-    go_tool.rs           Go command execution (no shell injection)
-    git_tool.rs          Git command execution (no shell injection)
+    go_tool.rs           Go command execution with direct arguments
+    git_tool.rs          Git command execution (shell-equivalent risk)
     glob_tool.rs         File pattern matching (glob)
     grep_tool.rs         Regex search across codebase
     memory.rs            Cross-session memory storage/retrieval
@@ -151,8 +165,8 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | **file_edit** | Find-and-replace editing | Yes |
 | **file_undo** | Undo last file_edit/file_write in this process | Yes |
 | **shell** | Execute shell commands with timeout | Yes |
-| **go** | Execute Go commands (avoids shell injection) | Yes |
-| **git** | Execute Git commands (avoids shell injection) | Yes |
+| **go** | Execute Go commands with a JSON array of arguments | Yes |
+| **git** | Execute Git commands with a JSON argument array; shell-equivalent risk | Yes |
 | **glob** | File pattern matching | No |
 | **grep** | Regex search across the codebase | No |
 | **memory** | Store and retrieve cross-session information | No |
@@ -193,6 +207,7 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | `permissions.auto_allow` | []string | `[]` | Tools to auto-approve |
 | `permissions.ask` | []string | `[]` | Tools that require confirmation |
 | `permissions.deny` | []string | `[]` | Tools to block |
+| `debug_log_requests` | bool | `false` | Write provider request *metadata* (URL origin only, header names, body size - never URL paths, header values, body content, or secrets) to `~/.config/cairn-code/debug_request.json` for troubleshooting. Also toggled with `CAIRN_DEBUG_HTTP=1`. Any legacy full-request dump is removed at startup. The file is overwritten (never appended) on every request and, on Unix, created with owner-only (`0600`) permissions. |
 
 ## License
 

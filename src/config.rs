@@ -21,6 +21,11 @@ pub struct Config {
     /// When true, show grayed ready-to-send idle prompts in the empty composer.
     /// Default off; enable with `/suggestions on`.
     pub show_suggestions: bool,
+    /// When true, write request metadata (sanitized URL, header names, body
+    /// size — never header values, body content, or secrets) to
+    /// `~/.config/cairn-code/debug_request.json` for troubleshooting.
+    /// Off by default (H-03); can also be enabled with `CAIRN_DEBUG_HTTP=1`.
+    pub debug_log_requests: bool,
 }
 
 impl Default for Config {
@@ -38,6 +43,7 @@ impl Default for Config {
             theme: "dark".to_string(),
             show_thinking: false,
             show_suggestions: false,
+            debug_log_requests: false,
         }
     }
 }
@@ -109,7 +115,9 @@ pub fn env_key_for(provider: &str) -> Option<String> {
     }
     // OpenGateway also accepts the shorter alias used by some setups.
     if provider == "opengateway" {
-        return std::env::var("OPENGATEWAY_API_KEY").ok().filter(|s| !s.is_empty());
+        return std::env::var("OPENGATEWAY_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
     }
     None
 }
@@ -253,7 +261,9 @@ fn keyring_entry(provider: &str) -> Result<keyring::Entry, String> {
 }
 
 fn keyring_set(provider: &str, key: &str) -> Result<(), String> {
-    keyring_entry(provider)?.set_password(key).map_err(|e| e.to_string())
+    keyring_entry(provider)?
+        .set_password(key)
+        .map_err(|e| e.to_string())
 }
 
 fn keyring_get(provider: &str) -> Option<String> {
@@ -276,12 +286,24 @@ fn keyring_delete(provider: &str) -> Result<bool, String> {
 /// and strip them from the file.
 fn migrate_plaintext_keys_in_file(path: &std::path::Path) {
     use crate::json::JsonValue;
-    if !path.exists() { return; }
-    let Ok(content) = fs::read_to_string(path) else { return; };
-    let Ok(val) = crate::json::parse(&content) else { return; };
-    let Some(mut obj) = val.as_object().cloned() else { return; };
-    let Some(keys) = obj.get("api_keys").and_then(|v| v.as_object()).cloned() else { return; };
-    if keys.is_empty() { return; }
+    if !path.exists() {
+        return;
+    }
+    let Ok(content) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(val) = crate::json::parse(&content) else {
+        return;
+    };
+    let Some(mut obj) = val.as_object().cloned() else {
+        return;
+    };
+    let Some(keys) = obj.get("api_keys").and_then(|v| v.as_object()).cloned() else {
+        return;
+    };
+    if keys.is_empty() {
+        return;
+    }
 
     let mut migrated_any = false;
     for (provider, v) in &keys {
@@ -303,7 +325,10 @@ pub fn sessions_dir() -> String {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config/cairn-code/sessions").to_string_lossy().to_string()
+    PathBuf::from(home)
+        .join(".config/cairn-code/sessions")
+        .to_string_lossy()
+        .to_string()
 }
 
 #[cfg_attr(test, allow(dead_code))]
@@ -312,12 +337,19 @@ pub fn save_config(provider: &str, model: &str, api_key: Option<&str>) -> Result
     let path = config_path_or_err()?;
     let mut obj: std::collections::HashMap<String, JsonValue> = if path.exists() {
         let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        crate::json::parse(&content).map_err(|e| e.to_string())?.as_object().cloned().unwrap_or_default()
+        crate::json::parse(&content)
+            .map_err(|e| e.to_string())?
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
     } else {
         std::collections::HashMap::new()
     };
 
-    obj.insert("default_provider".into(), JsonValue::String(provider.into()));
+    obj.insert(
+        "default_provider".into(),
+        JsonValue::String(provider.into()),
+    );
     obj.insert("default_model".into(), JsonValue::String(model.into()));
     // API keys are never written to the config file; they live in the OS keyring.
     obj.remove("api_keys");
@@ -344,7 +376,11 @@ pub fn save_theme(theme: &str) -> Result<(), String> {
     let path = config_path_or_err()?;
     let mut obj: std::collections::HashMap<String, JsonValue> = if path.exists() {
         let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        crate::json::parse(&content).map_err(|e| e.to_string())?.as_object().cloned().unwrap_or_default()
+        crate::json::parse(&content)
+            .map_err(|e| e.to_string())?
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
     } else {
         std::collections::HashMap::new()
     };
@@ -372,7 +408,11 @@ fn save_bool_pref(key: &str, value: bool) -> Result<(), String> {
     let path = config_path_or_err()?;
     let mut obj: std::collections::HashMap<String, JsonValue> = if path.exists() {
         let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        crate::json::parse(&content).map_err(|e| e.to_string())?.as_object().cloned().unwrap_or_default()
+        crate::json::parse(&content)
+            .map_err(|e| e.to_string())?
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
     } else {
         std::collections::HashMap::new()
     };
@@ -403,38 +443,37 @@ fn save_permissions_to_path(path: &Path, cfg: &Config) -> Result<(), String> {
         HashMap::new()
     };
 
-    obj.insert(
-        "permissions".into(),
-        JsonValue::Object(HashMap::from([
-            (
-                "auto_allow".into(),
-                JsonValue::Array(
-                    cfg.auto_allow
-                        .iter()
-                        .map(|s| JsonValue::String(s.clone()))
-                        .collect(),
-                ),
+    let perms = JsonValue::Object(HashMap::from([
+        (
+            "auto_allow".into(),
+            JsonValue::Array(
+                cfg.auto_allow
+                    .iter()
+                    .map(|s| JsonValue::String(s.clone()))
+                    .collect(),
             ),
-            (
-                "ask".into(),
-                JsonValue::Array(
-                    cfg.ask
-                        .iter()
-                        .map(|s| JsonValue::String(s.clone()))
-                        .collect(),
-                ),
+        ),
+        (
+            "ask".into(),
+            JsonValue::Array(
+                cfg.ask
+                    .iter()
+                    .map(|s| JsonValue::String(s.clone()))
+                    .collect(),
             ),
-            (
-                "deny".into(),
-                JsonValue::Array(
-                    cfg.deny
-                        .iter()
-                        .map(|s| JsonValue::String(s.clone()))
-                        .collect(),
-                ),
+        ),
+        (
+            "deny".into(),
+            JsonValue::Array(
+                cfg.deny
+                    .iter()
+                    .map(|s| JsonValue::String(s.clone()))
+                    .collect(),
             ),
-        ])),
-    );
+        ),
+    ]));
+    obj.insert("permissions".into(), perms);
+    obj.remove("api_keys");
     obj.remove("api_keys");
 
     if let Some(parent) = path.parent() {
@@ -560,16 +599,28 @@ fn parse_config(content: &str) -> Result<Config, String> {
     if let Some(v) = obj.get("show_suggestions").and_then(|v| v.as_bool()) {
         cfg.show_suggestions = v;
     }
+    if let Some(v) = obj.get("debug_log_requests").and_then(|v| v.as_bool()) {
+        cfg.debug_log_requests = v;
+    }
 
     if let Some(perms) = obj.get("permissions").and_then(|v| v.as_object()) {
         if let Some(arr) = perms.get("auto_allow").and_then(|v| v.as_array()) {
-            cfg.auto_allow = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            cfg.auto_allow = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
         }
         if let Some(arr) = perms.get("ask").and_then(|v| v.as_array()) {
-            cfg.ask = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            cfg.ask = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
         }
         if let Some(arr) = perms.get("deny").and_then(|v| v.as_array()) {
-            cfg.deny = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            cfg.deny = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
         }
     }
 
@@ -620,8 +671,26 @@ mod tests {
         assert_eq!(cfg.auto_allow.len(), 3);
         assert!(cfg.ask.contains(&"shell".to_string()));
         assert!(cfg.deny.is_empty());
-        assert!(!cfg.show_thinking, "thinking hidden by default (Claude Code-style)");
+        assert!(
+            !cfg.show_thinking,
+            "thinking hidden by default (Claude Code-style)"
+        );
         assert!(!cfg.show_suggestions, "idle suggestions off by default");
+        assert!(
+            !cfg.debug_log_requests,
+            "request debug logging off by default (H-03)"
+        );
+    }
+
+    #[test]
+    fn test_parse_debug_log_requests() {
+        let cfg = parse_config(r#"{"debug_log_requests": true}"#).unwrap();
+        assert!(cfg.debug_log_requests);
+        let cfg = parse_config(r#"{"debug_log_requests": false}"#).unwrap();
+        assert!(!cfg.debug_log_requests);
+        // Absent entirely -> stays off.
+        let cfg = parse_config(r#"{}"#).unwrap();
+        assert!(!cfg.debug_log_requests);
     }
 
     #[test]
@@ -842,15 +911,50 @@ mod tests {
         cfg.deny = vec!["file_write".into()];
         cfg.api_keys.insert("openai".into(), "sk-abc".into());
 
-        let output = crate::json::serialize(&crate::json::JsonValue::Object(std::collections::HashMap::from([
-            ("default_provider".into(), crate::json::JsonValue::String(cfg.default_provider.clone())),
-            ("default_model".into(), crate::json::JsonValue::String(cfg.default_model.clone())),
-            ("permissions".into(), crate::json::JsonValue::Object(std::collections::HashMap::from([
-                ("auto_allow".into(), crate::json::JsonValue::Array(cfg.auto_allow.iter().map(|s| crate::json::JsonValue::String(s.clone())).collect())),
-                ("ask".into(), crate::json::JsonValue::Array(cfg.ask.iter().map(|s| crate::json::JsonValue::String(s.clone())).collect())),
-                ("deny".into(), crate::json::JsonValue::Array(cfg.deny.iter().map(|s| crate::json::JsonValue::String(s.clone())).collect())),
-            ]))),
-        ])));
+        let output = crate::json::serialize(&crate::json::JsonValue::Object(
+            std::collections::HashMap::from([
+                (
+                    "default_provider".into(),
+                    crate::json::JsonValue::String(cfg.default_provider.clone()),
+                ),
+                (
+                    "default_model".into(),
+                    crate::json::JsonValue::String(cfg.default_model.clone()),
+                ),
+                (
+                    "permissions".into(),
+                    crate::json::JsonValue::Object(std::collections::HashMap::from([
+                        (
+                            "auto_allow".into(),
+                            crate::json::JsonValue::Array(
+                                cfg.auto_allow
+                                    .iter()
+                                    .map(|s| crate::json::JsonValue::String(s.clone()))
+                                    .collect(),
+                            ),
+                        ),
+                        (
+                            "ask".into(),
+                            crate::json::JsonValue::Array(
+                                cfg.ask
+                                    .iter()
+                                    .map(|s| crate::json::JsonValue::String(s.clone()))
+                                    .collect(),
+                            ),
+                        ),
+                        (
+                            "deny".into(),
+                            crate::json::JsonValue::Array(
+                                cfg.deny
+                                    .iter()
+                                    .map(|s| crate::json::JsonValue::String(s.clone()))
+                                    .collect(),
+                            ),
+                        ),
+                    ])),
+                ),
+            ]),
+        ));
 
         let parsed = parse_config(&output).unwrap();
         assert_eq!(parsed.default_provider, "openai");
@@ -1004,7 +1108,10 @@ mod tests {
         assert_eq!(mask_secret_display("", 4), "");
         assert_eq!(mask_secret_display("abcd", 4), "••••");
         assert_eq!(mask_secret_display("abcdefghij", 4), "••••••ghij");
-        assert_eq!(mask_secret_display("sk-ant-secretvalue99", 4), "••••••••••••••••ue99");
+        assert_eq!(
+            mask_secret_display("sk-ant-secretvalue99", 4),
+            "••••••••••••••••ue99"
+        );
     }
 
     #[test]
@@ -1050,8 +1157,14 @@ mod tests {
         let content = std::fs::read_to_string(&cfg_path).unwrap();
         let parsed = crate::json::parse(&content).unwrap();
         let obj = parsed.as_object().unwrap();
-        assert!(obj.get("api_keys").is_none(), "api_keys must be stripped from the file after migration");
-        assert_eq!(obj.get("default_provider").and_then(|v| v.as_str()), Some("openrouter"));
+        assert!(
+            obj.get("api_keys").is_none(),
+            "api_keys must be stripped from the file after migration"
+        );
+        assert_eq!(
+            obj.get("default_provider").and_then(|v| v.as_str()),
+            Some("openrouter")
+        );
 
         let _ = keyring_delete(provider);
         let _ = std::fs::remove_file(&cfg_path);

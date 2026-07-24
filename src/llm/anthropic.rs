@@ -108,7 +108,9 @@ impl Provider for AnthropicProvider {
                             match obj.get("type").and_then(|v| v.as_str()) {
                                 Some("content_block_delta") => {
                                     if let Some(delta) = obj.get("delta") {
-                                        if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
+                                        if let Some(text) =
+                                            delta.get("text").and_then(|v| v.as_str())
+                                        {
                                             on_chunk(text, "text");
                                         }
                                         if let Some(text) =
@@ -313,7 +315,10 @@ fn parse_models_page(body: &str) -> Result<ModelsPage, String> {
             max_ctx,
         });
     }
-    let has_more = val.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
+    let has_more = val
+        .get("has_more")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let last_id = val
         .get("last_id")
         .and_then(|v| v.as_str())
@@ -328,10 +333,7 @@ fn parse_models_page(body: &str) -> Result<ModelsPage, String> {
 
 fn display_name_fallback(id: &str) -> String {
     // claude-opus-4-8 → Claude Opus 4.8 (best-effort)
-    let rest = id
-        .strip_prefix("claude-")
-        .unwrap_or(id)
-        .replace('-', " ");
+    let rest = id.strip_prefix("claude-").unwrap_or(id).replace('-', " ");
     let mut out = String::from("Claude");
     for word in rest.split_whitespace() {
         out.push(' ');
@@ -364,65 +366,64 @@ fn build_request_body(
     max_tokens: usize,
     stream: bool,
 ) -> Result<String, String> {
-    let model = crate::llm::openai_compat::escape_json_str(model);
-    let mut body = String::new();
-    body.push_str(&format!(
-        "{{\"model\":\"{model}\",\"max_tokens\":{max_tokens},\"stream\":{stream}"
-    ));
+    let messages = messages
+        .iter()
+        .map(|msg| {
+            let content = match &msg.content {
+                Content::Text(text) | Content::Thinking(text) => {
+                    serde_json::Value::String(text.clone())
+                }
+                Content::ToolUse(tool_use) => {
+                    let input = serde_json::from_str::<serde_json::Value>(&tool_use.input)
+                        .map_err(|e| format!("Invalid input for tool '{}': {e}", tool_use.name))?;
+                    serde_json::json!([{
+                        "type": "tool_use",
+                        "id": tool_use.id,
+                        "name": tool_use.name,
+                        "input": input,
+                    }])
+                }
+                Content::ToolResult(tool_result) => serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": tool_result.tool_use_id,
+                    "content": tool_result.content,
+                }]),
+            };
+            Ok(serde_json::json!({
+                "role": msg.role,
+                "content": content,
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "stream": stream,
+        "messages": messages,
+    });
     if !system.is_empty() {
-        let escaped = system
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n");
-        body.push_str(&format!(",\"system\":\"{escaped}\""));
+        body["system"] = serde_json::Value::String(system.to_string());
     }
-    body.push_str(",\"messages\":[");
-    for (i, msg) in messages.iter().enumerate() {
-        if i > 0 {
-            body.push(',');
-        }
-        body.push_str(&format!("{{\"role\":\"{}\",\"content\":", msg.role));
-        match &msg.content {
-            Content::Text(t) => {
-                let escaped = t.replace('\\', "\\\\").replace('"', "\\\"");
-                body.push_str(&format!("\"{escaped}\""));
-            }
-            Content::ToolUse(tu) => {
-                body.push_str(&format!(
-                    "[{{\"type\":\"tool_use\",\"id\":\"{}\",\"name\":\"{}\",\"input\":{}}}]",
-                    tu.id, tu.name, tu.input
-                ));
-            }
-            Content::ToolResult(tr) => {
-                let escaped = tr.content.replace('\\', "\\\\").replace('"', "\\\"");
-                body.push_str(&format!(
-                    "[{{\"type\":\"tool_result\",\"tool_use_id\":\"{}\",\"content\":\"{escaped}\"}}]",
-                    tr.tool_use_id
-                ));
-            }
-            Content::Thinking(t) => {
-                let escaped = t.replace('\\', "\\\\").replace('"', "\\\"");
-                body.push_str(&format!("\"{escaped}\""));
-            }
-        }
-        body.push('}');
-    }
-    body.push(']');
     if !tools.is_empty() {
-        body.push_str(",\"tools\":[");
-        for (i, tool) in tools.iter().enumerate() {
-            if i > 0 {
-                body.push(',');
-            }
-            body.push_str(&format!(
-                "{{\"name\":\"{}\",\"description\":\"{}\",\"input_schema\":{}}}",
-                tool.name, tool.description, tool.input_schema
-            ));
-        }
-        body.push(']');
+        body["tools"] = serde_json::Value::Array(
+            tools
+                .iter()
+                .map(|tool| {
+                    let input_schema = serde_json::from_str::<serde_json::Value>(
+                        &tool.input_schema,
+                    )
+                    .map_err(|e| format!("Invalid input schema for tool '{}': {e}", tool.name))?;
+                    Ok(serde_json::json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": input_schema,
+                    }))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        );
     }
-    body.push('}');
-    Ok(body)
+    serde_json::to_string(&body).map_err(|e| format!("Failed to serialize Anthropic request: {e}"))
 }
 
 #[derive(Debug)]
@@ -526,9 +527,12 @@ fn parse_anthropic_response_value(val: &json::JsonValue) -> Result<AnthropicResp
                 let name = block.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
                     "Invalid Anthropic response: tool_use block missing name".to_string()
                 })?;
-                let input = block.get("input").ok_or_else(|| {
-                    "Invalid Anthropic response: tool_use block missing input".to_string()
-                })?;
+                let input = block
+                    .get("input")
+                    .filter(|value| value.as_object().is_some())
+                    .ok_or_else(|| {
+                        "Invalid Anthropic response: tool_use input must be an object".to_string()
+                    })?;
                 content.push(AnthropicContentBlock::ToolUse {
                     id: id.to_string(),
                     name: name.to_string(),
@@ -548,27 +552,25 @@ fn parse_anthropic_response_value(val: &json::JsonValue) -> Result<AnthropicResp
         }
     }
 
-    let usage = obj
-        .get("usage")
-        .ok_or_else(|| "Invalid Anthropic response: missing usage".to_string())?;
+    let usage = obj.get("usage");
     Ok(AnthropicResponse {
         role,
         content,
         usage: AnthropicUsage {
             input_tokens: usage
-                .get("input_tokens")
+                .and_then(|value| value.get("input_tokens"))
                 .and_then(|v| v.as_u64())
-                .ok_or_else(|| "Invalid Anthropic response: missing input_tokens".to_string())?,
+                .unwrap_or(0),
             output_tokens: usage
-                .get("output_tokens")
+                .and_then(|value| value.get("output_tokens"))
                 .and_then(|v| v.as_u64())
-                .ok_or_else(|| "Invalid Anthropic response: missing output_tokens".to_string())?,
+                .unwrap_or(0),
             cache_read_input_tokens: usage
-                .get("cache_read_input_tokens")
+                .and_then(|value| value.get("cache_read_input_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             cache_creation_input_tokens: usage
-                .get("cache_creation_input_tokens")
+                .and_then(|value| value.get("cache_creation_input_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
         },
@@ -593,7 +595,8 @@ fn parse_anthropic_streaming_response(raw: &str) -> Result<(Vec<Message>, Usage)
                             if let Some(block) = obj.get("content_block") {
                                 match block.get("type").and_then(|v| v.as_str()) {
                                     Some("text") => {
-                                        if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                                        if let Some(t) = block.get("text").and_then(|v| v.as_str())
+                                        {
                                             text_accum = t.to_string();
                                         }
                                     }
@@ -735,6 +738,99 @@ mod tests {
     }
 
     #[test]
+    fn request_body_serializes_special_characters_and_structured_tool_input() {
+        let messages = vec![
+            Message {
+                role: "user\"role".into(),
+                content: Content::Text("line 1\nline 2\r\t\0 café 🎉".into()),
+            },
+            Message {
+                role: "assistant".into(),
+                content: Content::ToolUse(ToolUse {
+                    id: "tool\"id".into(),
+                    name: "tool\nname".into(),
+                    input: r#"{"text":"quoted \"value\"","items":[1,true]}"#.into(),
+                }),
+            },
+            Message {
+                role: "user".into(),
+                content: Content::ToolResult(ToolResult {
+                    tool_use_id: "tool\"id".into(),
+                    content: "result\nwith\u{0008} control".into(),
+                }),
+            },
+        ];
+        let tools = vec![ToolDefinition {
+            name: "tool\nname".into(),
+            description: "description with \"quotes\" and café".into(),
+            input_schema: r#"{"type":"object","properties":{"quoted\"key":{"type":"string"}}}"#
+                .into(),
+        }];
+
+        let body = build_request_body(
+            &messages,
+            &tools,
+            "system\nwith\tcontrols and 日本語",
+            "claude\"model",
+            1024,
+            true,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(value["model"], "claude\"model");
+        assert_eq!(value["system"], "system\nwith\tcontrols and 日本語");
+        assert_eq!(value["messages"][0]["role"], "user\"role");
+        assert_eq!(
+            value["messages"][0]["content"],
+            "line 1\nline 2\r\t\0 café 🎉"
+        );
+        assert_eq!(value["messages"][1]["content"][0]["id"], "tool\"id");
+        assert_eq!(
+            value["messages"][1]["content"][0]["input"]["text"],
+            "quoted \"value\""
+        );
+        assert_eq!(
+            value["tools"][0]["input_schema"]["properties"]["quoted\"key"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn request_body_rejects_malformed_tool_input() {
+        let messages = vec![Message {
+            role: "assistant".into(),
+            content: Content::ToolUse(ToolUse {
+                id: "toolu_1".into(),
+                name: "shell".into(),
+                input: r#"{"command":"cargo test"},"role":"user""#.into(),
+            }),
+        }];
+
+        let error =
+            build_request_body(&messages, &[], "", "claude-sonnet-5", 1024, false).unwrap_err();
+
+        assert!(error.contains("Invalid input for tool 'shell'"), "{error}");
+    }
+
+    #[test]
+    fn request_body_rejects_malformed_tool_schema() {
+        let tools = vec![ToolDefinition {
+            name: "broken".into(),
+            description: String::new(),
+            input_schema: r#"{"type":"object"#.into(),
+        }];
+
+        let error =
+            build_request_body(&[], &tools, "", "claude-sonnet-5", 1024, false).unwrap_err();
+
+        assert!(
+            error.contains("Invalid input schema for tool 'broken'"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn test_streaming_tool_use_reconstructs_args_from_input_json_delta() {
         // Mirrors what Anthropic actually sends: content_block_start's `input`
         // is `{}`, then the real arguments arrive as input_json_delta fragments.
@@ -829,6 +925,45 @@ mod tests {
     }
 
     #[test]
+    fn test_complete_response_preserves_escaped_tool_input() {
+        let raw = r#"{
+            "type":"message","role":"assistant",
+            "content":[{"type":"tool_use","id":"toolu_1","name":"shell","input":{
+                "command":"printf \"hello\"\n","path":"C:\\tmp","control":"tab\tand\u0001"
+            }}]
+        }"#;
+        let (messages, _) = parse_anthropic_complete_response(raw).unwrap();
+        let Content::ToolUse(tool_use) = &messages[0].content else {
+            panic!("expected ToolUse content");
+        };
+
+        let input = json::parse(&tool_use.input).unwrap();
+        assert_eq!(
+            input.get("command").and_then(|v| v.as_str()),
+            Some("printf \"hello\"\n")
+        );
+        assert_eq!(input.get("path").and_then(|v| v.as_str()), Some("C:\\tmp"));
+        assert_eq!(
+            input.get("control").and_then(|v| v.as_str()),
+            Some("tab\tand\u{0001}")
+        );
+    }
+
+    #[test]
+    fn test_complete_response_rejects_non_object_tool_input() {
+        for input in ["null", "\"bad\"", "[]"] {
+            let raw = format!(
+                r#"{{"type":"message","role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"shell","input":{input}}}]}}"#
+            );
+            let error = parse_anthropic_complete_response(&raw).unwrap_err();
+            assert!(
+                error.contains("input must be an object"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn test_complete_response_parses_usage_including_cache_tokens() {
         let raw = r#"{
             "type":"message","role":"assistant","content":[],
@@ -843,6 +978,38 @@ mod tests {
         assert_eq!(usage.output_tokens, 25);
         assert_eq!(usage.cache_read, 80);
         assert_eq!(usage.cache_create, 10);
+    }
+
+    #[test]
+    fn test_complete_response_defaults_missing_usage() {
+        let raw = r#"{
+            "type":"message","role":"assistant",
+            "content":[{"type":"text","text":"usable"}]
+        }"#;
+        let (messages, usage) = parse_anthropic_complete_response(raw).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.cache_read, 0);
+        assert_eq!(usage.cache_create, 0);
+    }
+
+    #[test]
+    fn test_complete_response_defaults_invalid_usage_fields_independently() {
+        let raw = r#"{
+            "type":"message","role":"assistant","content":[],
+            "usage":{
+                "input_tokens":"unknown","output_tokens":7,
+                "cache_read_input_tokens":-1,"cache_creation_input_tokens":3
+            }
+        }"#;
+        let (_, usage) = parse_anthropic_complete_response(raw).unwrap();
+
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cache_read, 0);
+        assert_eq!(usage.cache_create, 3);
     }
 
     #[test]

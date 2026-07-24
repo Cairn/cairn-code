@@ -52,7 +52,10 @@ fn presets_allowed() -> bool {
     match std::env::var("CAIRN_OAUTH_ALLOW_PRESETS")
         .or_else(|_| std::env::var("ZERO_OAUTH_ALLOW_PRESETS"))
     {
-        Ok(v) => !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Ok(v) => !matches!(
+            v.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
         Err(_) => true,
     }
 }
@@ -127,13 +130,7 @@ fn form_post(url: &str, body: &str) -> Result<(u16, String), String> {
 fn form_encode(pairs: &[(&str, &str)]) -> String {
     pairs
         .iter()
-        .map(|(k, v)| {
-            format!(
-                "{}={}",
-                urlencoding_minimal(k),
-                urlencoding_minimal(v)
-            )
-        })
+        .map(|(k, v)| format!("{}={}", urlencoding_minimal(k), urlencoding_minimal(v)))
         .collect::<Vec<_>>()
         .join("&")
 }
@@ -154,19 +151,20 @@ fn urlencoding_minimal(s: &str) -> String {
 
 pub fn request_xai_device_code() -> Result<DeviceAuth, String> {
     let client_id = xai_client_id()?;
-    let body = form_encode(&[
-        ("client_id", &client_id),
-        ("scope", XAI_SCOPES),
-    ]);
+    let body = form_encode(&[("client_id", &client_id), ("scope", XAI_SCOPES)]);
     let (status, resp) = form_post(XAI_DEVICE_URL, &body)?;
     let val = json::parse(&resp).map_err(|e| format!("oauth device response: {e}"))?;
-    let obj = val.as_object().ok_or("oauth device response not an object")?;
+    let obj = val
+        .as_object()
+        .ok_or("oauth device response not an object")?;
     if status < 200 || status >= 300 {
         let err = obj
             .get("error")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        return Err(format!("oauth device authorization failed: {err} (HTTP {status})"));
+        return Err(format!(
+            "oauth device authorization failed: {err} (HTTP {status})"
+        ));
     }
     let device_code = obj
         .get("device_code")
@@ -241,7 +239,9 @@ pub fn poll_xai_device_token(auth: &DeviceAuth, cancelled: &AtomicBool) -> Resul
             return Err("oauth: cancelled".into());
         }
         let val = json::parse(&resp).map_err(|e| format!("oauth token response: {e}"))?;
-        let obj = val.as_object().ok_or("oauth token response not an object")?;
+        let obj = val
+            .as_object()
+            .ok_or("oauth token response not an object")?;
         if let Some(access) = obj.get("access_token").and_then(|v| v.as_str()) {
             if !access.is_empty() {
                 let expires_in = obj.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -333,7 +333,8 @@ pub fn load_token(provider: &str) -> Option<Token> {
 }
 
 pub fn delete_token(provider: &str) -> Result<bool, String> {
-    let entry = keyring::Entry::new("cairn-code", &keyring_user(provider)).map_err(|e| e.to_string())?;
+    let entry =
+        keyring::Entry::new("cairn-code", &keyring_user(provider)).map_err(|e| e.to_string())?;
     match entry.delete_credential() {
         Ok(()) => Ok(true),
         Err(keyring::Error::NoEntry) => Ok(false),
@@ -433,7 +434,11 @@ pub fn status_line(provider: &str) -> String {
             };
             format!(
                 "{provider}: OAuth login present ({exp}, refresh={})",
-                if t.refresh_token.is_empty() { "no" } else { "yes" }
+                if t.refresh_token.is_empty() {
+                    "no"
+                } else {
+                    "yes"
+                }
             )
         }
         None => format!("{provider}: no OAuth login"),
@@ -474,7 +479,9 @@ fn json_escape(s: &str) -> String {
 /// Parse a successful OAuth token JSON body into a [`Token`] (shared by device + refresh).
 pub fn token_from_json_response(resp: &str, fallback_refresh: &str) -> Result<Token, String> {
     let val = json::parse(resp).map_err(|e| format!("oauth token response: {e}"))?;
-    let obj = val.as_object().ok_or("oauth token response not an object")?;
+    let obj = val
+        .as_object()
+        .ok_or("oauth token response not an object")?;
     let access = obj
         .get("access_token")
         .and_then(|v| v.as_str())

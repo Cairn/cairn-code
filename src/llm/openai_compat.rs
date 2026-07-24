@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use super::provider::*;
 use crate::json;
+use std::collections::HashMap;
 
 /// Shared parsing/serialization for OpenAI-compatible chat-completions APIs
 /// (openai, ollama, openrouter, and opengateway all speak this dialect).
@@ -18,18 +18,25 @@ pub fn build_messages_json(messages: &[Message], system: &str) -> String {
     let mut first = true;
     if !system.is_empty() {
         let escaped = escape_json_str(system);
-        body.push_str(&format!("{{\"role\":\"system\",\"content\":\"{escaped}\"}}"));
+        body.push_str(&format!(
+            "{{\"role\":\"system\",\"content\":\"{escaped}\"}}"
+        ));
         first = false;
     }
     let mut index = 0;
     while index < messages.len() {
         let msg = &messages[index];
-        if !first { body.push(','); }
+        if !first {
+            body.push(',');
+        }
         first = false;
         match &msg.content {
             Content::Text(t) => {
                 let escaped = escape_json_str(t);
-                body.push_str(&format!("{{\"role\":\"{}\",\"content\":\"{escaped}\"}}", msg.role));
+                body.push_str(&format!(
+                    "{{\"role\":\"{}\",\"content\":\"{escaped}\"}}",
+                    msg.role
+                ));
             }
             Content::ToolUse(_) => {
                 // Providers return parallel calls as consecutive ToolUse
@@ -38,8 +45,12 @@ pub fn build_messages_json(messages: &[Message], system: &str) -> String {
                 body.push_str("{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[");
                 let mut first_call = true;
                 while index < messages.len() {
-                    let Content::ToolUse(tu) = &messages[index].content else { break; };
-                    if !first_call { body.push(','); }
+                    let Content::ToolUse(tu) = &messages[index].content else {
+                        break;
+                    };
+                    if !first_call {
+                        body.push(',');
+                    }
                     first_call = false;
                     let id = escape_json_str(&tu.id);
                     let name = escape_json_str(&tu.name);
@@ -61,7 +72,9 @@ pub fn build_messages_json(messages: &[Message], system: &str) -> String {
             }
             Content::Thinking(t) => {
                 let escaped = escape_json_str(t);
-                body.push_str(&format!("{{\"role\":\"assistant\",\"content\":\"{escaped}\"}}"));
+                body.push_str(&format!(
+                    "{{\"role\":\"assistant\",\"content\":\"{escaped}\"}}"
+                ));
             }
         }
         index += 1;
@@ -73,10 +86,14 @@ pub fn build_messages_json(messages: &[Message], system: &str) -> String {
 /// Returns an empty string when there are no tools, otherwise a
 /// `,"tools":[...]` fragment ready to be appended to a request body.
 pub fn build_tools_json(tools: &[ToolDefinition]) -> String {
-    if tools.is_empty() { return String::new(); }
+    if tools.is_empty() {
+        return String::new();
+    }
     let mut body = String::from(",\"tools\":[");
     for (i, tool) in tools.iter().enumerate() {
-        if i > 0 { body.push(','); }
+        if i > 0 {
+            body.push(',');
+        }
         let name_esc = escape_json_str(&tool.name);
         let desc_esc = escape_json_str(&tool.description);
         body.push_str(&format!(
@@ -109,7 +126,9 @@ pub fn parse_streaming_response(raw: &str) -> Result<(Vec<Message>, Usage), Stri
     let mut tool_calls: HashMap<u64, (String, String, String)> = HashMap::new();
     for line in raw.lines() {
         if let Some(data) = line.strip_prefix("data: ") {
-            if data == "[DONE]" { continue; }
+            if data == "[DONE]" {
+                continue;
+            }
             if let Ok(val) = json::parse(data) {
                 if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
                     if let Some(choice) = choices.first() {
@@ -117,18 +136,29 @@ pub fn parse_streaming_response(raw: &str) -> Result<(Vec<Message>, Usage), Stri
                             if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
                                 collected.push_str(text);
                             }
-                            if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                            if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array())
+                            {
                                 for tc in tc_arr {
                                     let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                                    let entry = tool_calls.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
+                                    let entry = tool_calls.entry(idx).or_insert_with(|| {
+                                        (String::new(), String::new(), String::new())
+                                    });
                                     if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                                        if !id.is_empty() { entry.0 = id.to_string(); }
+                                        if !id.is_empty() {
+                                            entry.0 = id.to_string();
+                                        }
                                     }
                                     if let Some(func) = tc.get("function") {
-                                        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                                            if !name.is_empty() { entry.1 = name.to_string(); }
+                                        if let Some(name) =
+                                            func.get("name").and_then(|v| v.as_str())
+                                        {
+                                            if !name.is_empty() {
+                                                entry.1 = name.to_string();
+                                            }
                                         }
-                                        if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                        if let Some(args) =
+                                            func.get("arguments").and_then(|v| v.as_str())
+                                        {
                                             entry.2.push_str(args);
                                         }
                                     }
@@ -138,21 +168,35 @@ pub fn parse_streaming_response(raw: &str) -> Result<(Vec<Message>, Usage), Stri
                     }
                 }
                 if let Some(u) = val.get("usage") {
-                    usage.input_tokens = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    usage.output_tokens = u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    usage.input_tokens =
+                        u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    usage.output_tokens = u
+                        .get("completion_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                 }
             }
         }
     }
     if !collected.is_empty() {
-        messages.push(Message { role: "assistant".into(), content: Content::Text(collected) });
+        messages.push(Message {
+            role: "assistant".into(),
+            content: Content::Text(collected),
+        });
     }
     if !tool_calls.is_empty() {
         let mut calls: Vec<_> = tool_calls.into_iter().collect();
         calls.sort_by_key(|(idx, _)| *idx);
         for (_, (id, name, args)) in calls {
-            let input = if args.is_empty() { "{}".to_string() } else { args };
-            messages.push(Message { role: "assistant".into(), content: Content::ToolUse(ToolUse { id, name, input }) });
+            let input = if args.is_empty() {
+                "{}".to_string()
+            } else {
+                args
+            };
+            messages.push(Message {
+                role: "assistant".into(),
+                content: Content::ToolUse(ToolUse { id, name, input }),
+            });
         }
     }
     Ok((messages, usage))
@@ -167,29 +211,63 @@ pub fn parse_complete_response(raw: &str) -> Result<(Vec<Message>, Usage), Strin
     if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
         if let Some(choice) = choices.first() {
             if let Some(msg) = choice.get("message") {
-                let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("assistant").to_string();
+                let role = msg
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("assistant")
+                    .to_string();
                 if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
                     if !text.is_empty() {
-                        messages.push(Message { role: role.clone(), content: Content::Text(text.to_string()) });
+                        messages.push(Message {
+                            role: role.clone(),
+                            content: Content::Text(text.to_string()),
+                        });
                     }
                 }
                 if let Some(tc_arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
                     for tc in tc_arr {
-                        let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let name = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let args = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}").to_string();
-                        messages.push(Message { role: role.clone(), content: Content::ToolUse(ToolUse { id, name, input: args }) });
+                        let id = tc
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let args = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}")
+                            .to_string();
+                        messages.push(Message {
+                            role: role.clone(),
+                            content: Content::ToolUse(ToolUse {
+                                id,
+                                name,
+                                input: args,
+                            }),
+                        });
                     }
                 }
                 if messages.is_empty() {
-                    messages.push(Message { role, content: Content::Text(String::new()) });
+                    messages.push(Message {
+                        role,
+                        content: Content::Text(String::new()),
+                    });
                 }
             }
         }
     }
     if let Some(u) = val.get("usage") {
         usage.input_tokens = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        usage.output_tokens = u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        usage.output_tokens = u
+            .get("completion_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
     }
     Ok((messages, usage))
 }
@@ -258,22 +336,35 @@ mod tests {
     fn test_build_messages_json_tool_result_is_role_tool_not_content_block() {
         let msgs = vec![Message {
             role: "user".into(),
-            content: Content::ToolResult(ToolResult { tool_use_id: "call_1".into(), content: "line1\nline2".into() }),
+            content: Content::ToolResult(ToolResult {
+                tool_use_id: "call_1".into(),
+                content: "line1\nline2".into(),
+            }),
         }];
         let body = build_messages_json(&msgs, "");
         let v = crate::json::parse(&body).unwrap();
         let arr = v.as_array().unwrap();
         let obj = arr[0].as_object().unwrap();
         assert_eq!(obj.get("role").and_then(|v| v.as_str()), Some("tool"));
-        assert_eq!(obj.get("tool_call_id").and_then(|v| v.as_str()), Some("call_1"));
-        assert_eq!(obj.get("content").and_then(|v| v.as_str()), Some("line1\nline2"));
+        assert_eq!(
+            obj.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_1")
+        );
+        assert_eq!(
+            obj.get("content").and_then(|v| v.as_str()),
+            Some("line1\nline2")
+        );
     }
 
     #[test]
     fn test_build_messages_json_tool_use_has_tool_calls_field() {
         let msgs = vec![Message {
             role: "assistant".into(),
-            content: Content::ToolUse(ToolUse { id: "call_1".into(), name: "glob".into(), input: "{\"pattern\":\"*.rs\"}".into() }),
+            content: Content::ToolUse(ToolUse {
+                id: "call_1".into(),
+                name: "glob".into(),
+                input: "{\"pattern\":\"*.rs\"}".into(),
+            }),
         }];
         let body = build_messages_json(&msgs, "");
         let v = crate::json::parse(&body).unwrap();
@@ -321,11 +412,24 @@ mod tests {
 
         let parsed = crate::json::parse(&build_messages_json(&msgs, "")).unwrap();
         let messages = parsed.as_array().unwrap();
-        assert_eq!(messages.len(), 3, "one assistant turn plus two tool results");
-        let calls = messages[0].get("tool_calls").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            messages.len(),
+            3,
+            "one assistant turn plus two tool results"
+        );
+        let calls = messages[0]
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .unwrap();
         assert_eq!(calls.len(), 2);
-        assert_eq!(messages[1].get("tool_call_id").and_then(|v| v.as_str()), Some("call_1"));
-        assert_eq!(messages[2].get("tool_call_id").and_then(|v| v.as_str()), Some("call_2"));
+        assert_eq!(
+            messages[1].get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_1")
+        );
+        assert_eq!(
+            messages[2].get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_2")
+        );
     }
 
     #[test]

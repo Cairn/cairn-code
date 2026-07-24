@@ -1,6 +1,24 @@
 use std::collections::HashMap;
 use std::fmt;
 
+fn write_string(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
+    f.write_str("\"")?;
+    for character in value.chars() {
+        match character {
+            '"' => f.write_str("\\\"")?,
+            '\\' => f.write_str("\\\\")?,
+            '\u{08}' => f.write_str("\\b")?,
+            '\u{0c}' => f.write_str("\\f")?,
+            '\n' => f.write_str("\\n")?,
+            '\r' => f.write_str("\\r")?,
+            '\t' => f.write_str("\\t")?,
+            character if character <= '\u{1f}' => write!(f, "\\u{:04x}", character as u32)?,
+            character => write!(f, "{character}")?,
+        }
+    }
+    f.write_str("\"")
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsonValue {
     Null,
@@ -16,12 +34,18 @@ impl fmt::Display for JsonValue {
         match self {
             JsonValue::Null => write!(f, "null"),
             JsonValue::Bool(b) => write!(f, "{b}"),
-            JsonValue::Number(n) => write!(f, "{n}"),
-            JsonValue::String(s) => write!(f, "\"{s}\""),
+            JsonValue::Number(n) => {
+                write!(f, "{}", serde_json::to_string(n).map_err(|_| fmt::Error)?)
+            }
+            JsonValue::String(s) => {
+                write!(f, "{}", serde_json::to_string(s).map_err(|_| fmt::Error)?)
+            }
             JsonValue::Array(arr) => {
                 write!(f, "[")?;
                 for (i, v) in arr.iter().enumerate() {
-                    if i > 0 { write!(f, ",")?; }
+                    if i > 0 {
+                        write!(f, ",")?;
+                    }
                     write!(f, "{v}")?;
                 }
                 write!(f, "]")
@@ -30,9 +54,15 @@ impl fmt::Display for JsonValue {
                 write!(f, "{{")?;
                 let mut first = true;
                 for (k, v) in obj {
-                    if !first { write!(f, ",")?; }
+                    if !first {
+                        write!(f, ",")?;
+                    }
                     first = false;
-                    write!(f, "\"{k}\":{v}")?;
+                    write!(
+                        f,
+                        "{}:{v}",
+                        serde_json::to_string(k).map_err(|_| fmt::Error)?
+                    )?;
                 }
                 write!(f, "}}")
             }
@@ -123,15 +153,11 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> Result<JsonValue, JsonError> {
-        self.skip_whitespace();
-        if self.pos >= self.input.len() {
-            return Err(self.err("unexpected end of input"));
-        }
-        let val = self.parse_value()?;
-        self.skip_whitespace();
-        Ok(val)
+        let input = std::str::from_utf8(&self.input).map_err(|_| self.err("invalid UTF-8"))?;
+        parse_standard(input)
     }
 
+    #[allow(dead_code)]
     fn parse_value(&mut self) -> Result<JsonValue, JsonError> {
         self.skip_whitespace();
         if self.pos >= self.input.len() {
@@ -170,6 +196,8 @@ impl Parser {
                         b'"' => s.push('"'),
                         b'\\' => s.push('\\'),
                         b'/' => s.push('/'),
+                        b'b' => s.push('\u{08}'),
+                        b'f' => s.push('\u{0c}'),
                         b'n' => s.push('\n'),
                         b'r' => s.push('\r'),
                         b't' => s.push('\t'),
@@ -178,8 +206,10 @@ impl Parser {
                                 return Err(self.err("unterminated \\u escape"));
                             }
                             let hex_str = &self.input[self.pos + 1..self.pos + 5];
-                            let hex_str = std::str::from_utf8(hex_str).map_err(|_| self.err("invalid \\u escape"))?;
-                            let code = u32::from_str_radix(hex_str, 16).map_err(|_| self.err("invalid \\u hex"))?;
+                            let hex_str = std::str::from_utf8(hex_str)
+                                .map_err(|_| self.err("invalid \\u escape"))?;
+                            let code = u32::from_str_radix(hex_str, 16)
+                                .map_err(|_| self.err("invalid \\u hex"))?;
                             if let Some(ch) = char::from_u32(code) {
                                 s.push(ch);
                             }
@@ -191,10 +221,15 @@ impl Parser {
                 }
                 _ if c & 0x80 == 0 => s.push(c as char),
                 _ => {
-                    let n = if c & 0xE0 == 0xC0 { 2 }
-                        else if c & 0xF0 == 0xE0 { 3 }
-                        else if c & 0xF8 == 0xF0 { 4 }
-                        else { return Err(self.err("invalid UTF-8 start byte")); };
+                    let n = if c & 0xE0 == 0xC0 {
+                        2
+                    } else if c & 0xF0 == 0xE0 {
+                        3
+                    } else if c & 0xF8 == 0xF0 {
+                        4
+                    } else {
+                        return Err(self.err("invalid UTF-8 start byte"));
+                    };
                     if self.pos + n > self.input.len() + 1 {
                         return Err(self.err("truncated UTF-8 sequence"));
                     }
@@ -231,9 +266,13 @@ impl Parser {
                 self.pos += 1;
             }
         }
-        if self.pos < self.input.len() && (self.input[self.pos] == b'e' || self.input[self.pos] == b'E') {
+        if self.pos < self.input.len()
+            && (self.input[self.pos] == b'e' || self.input[self.pos] == b'E')
+        {
             self.pos += 1;
-            if self.pos < self.input.len() && (self.input[self.pos] == b'+' || self.input[self.pos] == b'-') {
+            if self.pos < self.input.len()
+                && (self.input[self.pos] == b'+' || self.input[self.pos] == b'-')
+            {
                 self.pos += 1;
             }
             while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
@@ -250,7 +289,9 @@ impl Parser {
         if self.pos + 4 <= self.input.len() && &self.input[self.pos..self.pos + 4] == b"true" {
             self.pos += 4;
             Ok(JsonValue::Bool(true))
-        } else if self.pos + 5 <= self.input.len() && &self.input[self.pos..self.pos + 5] == b"false" {
+        } else if self.pos + 5 <= self.input.len()
+            && &self.input[self.pos..self.pos + 5] == b"false"
+        {
             self.pos += 5;
             Ok(JsonValue::Bool(false))
         } else {
@@ -347,6 +388,46 @@ pub fn parse(input: &str) -> Result<JsonValue, JsonError> {
     Parser::new(input).parse()
 }
 
+fn parse_standard(input: &str) -> Result<JsonValue, JsonError> {
+    const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+
+    if input.len() > MAX_INPUT_BYTES {
+        return Err(JsonError {
+            message: format!("input exceeds {MAX_INPUT_BYTES} byte limit"),
+            pos: MAX_INPUT_BYTES,
+        });
+    }
+
+    let value = serde_json::from_str(input).map_err(|error| JsonError {
+        message: error.to_string(),
+        pos: input
+            .split_inclusive('\n')
+            .take(error.line().saturating_sub(1))
+            .map(str::len)
+            .sum::<usize>()
+            + error.column().saturating_sub(1),
+    })?;
+    Ok(from_serde_json(value))
+}
+
+fn from_serde_json(value: serde_json::Value) -> JsonValue {
+    match value {
+        serde_json::Value::Null => JsonValue::Null,
+        serde_json::Value::Bool(value) => JsonValue::Bool(value),
+        serde_json::Value::Number(value) => JsonValue::Number(value.as_f64().unwrap()),
+        serde_json::Value::String(value) => JsonValue::String(value),
+        serde_json::Value::Array(values) => {
+            JsonValue::Array(values.into_iter().map(from_serde_json).collect())
+        }
+        serde_json::Value::Object(values) => JsonValue::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, from_serde_json(value)))
+                .collect(),
+        ),
+    }
+}
+
 pub fn serialize(val: &JsonValue) -> String {
     val.to_string()
 }
@@ -376,7 +457,10 @@ mod tests {
 
     #[test]
     fn test_parse_string() {
-        assert_eq!(parse("\"hello\"").unwrap(), JsonValue::String("hello".into()));
+        assert_eq!(
+            parse("\"hello\"").unwrap(),
+            JsonValue::String("hello".into())
+        );
         assert_eq!(parse("\"\"").unwrap(), JsonValue::String("".into()));
     }
 
@@ -389,11 +473,14 @@ mod tests {
     #[test]
     fn test_parse_array() {
         let v = parse("[1,2,3]").unwrap();
-        assert_eq!(v, JsonValue::Array(vec![
-            JsonValue::Number(1.0),
-            JsonValue::Number(2.0),
-            JsonValue::Number(3.0),
-        ]));
+        assert_eq!(
+            v,
+            JsonValue::Array(vec![
+                JsonValue::Number(1.0),
+                JsonValue::Number(2.0),
+                JsonValue::Number(3.0),
+            ])
+        );
     }
 
     #[test]
@@ -404,10 +491,13 @@ mod tests {
     #[test]
     fn test_parse_nested_array() {
         let v = parse("[[1,2],[3,4]]").unwrap();
-        assert_eq!(v, JsonValue::Array(vec![
-            JsonValue::Array(vec![JsonValue::Number(1.0), JsonValue::Number(2.0)]),
-            JsonValue::Array(vec![JsonValue::Number(3.0), JsonValue::Number(4.0)]),
-        ]));
+        assert_eq!(
+            v,
+            JsonValue::Array(vec![
+                JsonValue::Array(vec![JsonValue::Number(1.0), JsonValue::Number(2.0)]),
+                JsonValue::Array(vec![JsonValue::Number(3.0), JsonValue::Number(4.0)]),
+            ])
+        );
     }
 
     #[test]
@@ -453,6 +543,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_rejects_trailing_data() {
+        assert!(parse("null true").is_err());
+    }
+
+    #[test]
+    fn test_parse_rejects_excessive_nesting() {
+        let input = format!("{}null{}", "[".repeat(128), "]".repeat(128));
+        assert!(parse(&input).is_err());
+    }
+
+    #[test]
+    fn test_parse_rejects_oversized_input() {
+        let input = format!(r#""{}""#, "a".repeat(16 * 1024 * 1024));
+        assert!(parse(&input).is_err());
+    }
+
+    #[test]
     fn test_roundtrip_null() {
         let v = JsonValue::Null;
         let s = serialize(&v);
@@ -471,6 +578,63 @@ mod tests {
         let s = serialize(&v);
         let back = parse(&s).unwrap();
         assert_eq!(v, back);
+    }
+
+    #[test]
+    fn test_serialize_escapes_string_characters() {
+        let value = JsonValue::String(
+            "quote\" slash\\ line\nreturn\rtab\tbackspace\u{0008}formfeed\u{000c}nul\u{0000}"
+                .into(),
+        );
+
+        let serialized = serialize(&value);
+
+        assert_eq!(
+            serialized,
+            r#""quote\" slash\\ line\nreturn\rtab\tbackspace\bformfeed\fnul\u0000""#
+        );
+        assert_eq!(parse(&serialized).unwrap(), value);
+        assert!(serde_json::from_str::<serde_json::Value>(&serialized).is_ok());
+    }
+
+    #[test]
+    fn test_serialize_escapes_object_keys() {
+        let key = "quote\" slash\\ line\ncontrol\u{0001}";
+        let value = JsonValue::Object(HashMap::from([(
+            key.into(),
+            JsonValue::String("value".into()),
+        )]));
+
+        let serialized = serialize(&value);
+
+        assert_eq!(
+            serialized,
+            r#"{"quote\" slash\\ line\ncontrol\u0001":"value"}"#
+        );
+        assert_eq!(parse(&serialized).unwrap(), value);
+        assert!(serde_json::from_str::<serde_json::Value>(&serialized).is_ok());
+    }
+
+    #[test]
+    fn test_serialize_non_finite_numbers_as_null() {
+        assert_eq!(serialize(&JsonValue::Number(f64::NAN)), "null");
+        assert_eq!(serialize(&JsonValue::Number(f64::INFINITY)), "null");
+        assert_eq!(serialize(&JsonValue::Number(f64::NEG_INFINITY)), "null");
+    }
+
+    #[test]
+    fn test_roundtrip_escaped_object_keys_and_values() {
+        let mut obj = HashMap::new();
+        obj.insert(
+            "key\"\\\n\t\u{0001}".into(),
+            JsonValue::String("value\"\\\n\r\t\u{0008}\u{000c}\u{001f}".into()),
+        );
+        let value = JsonValue::Object(obj);
+
+        let serialized = serialize(&value);
+        let parsed = parse(&serialized).unwrap();
+
+        assert_eq!(parsed, value);
     }
 
     #[test]
@@ -518,7 +682,11 @@ mod tests {
     fn test_deeply_nested() {
         let input = r#"{"a":{"b":{"c":{"d":[1,2,3]}}}}"#;
         let v = parse(input).unwrap();
-        let d = v.get("a").and_then(|v| v.get("b")).and_then(|v| v.get("c")).and_then(|v| v.get("d"));
+        let d = v
+            .get("a")
+            .and_then(|v| v.get("b"))
+            .and_then(|v| v.get("c"))
+            .and_then(|v| v.get("d"));
         assert!(d.is_some());
         let arr = d.unwrap().as_array().unwrap();
         assert_eq!(arr.len(), 3);
