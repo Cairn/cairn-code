@@ -114,7 +114,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "session management",
     ),
     ("/skills · /mcp", "list skills and MCP servers"),
-    ("/subagent", "list or run external harnesses (claude, agy, …)"),
+    (
+        "/subagent",
+        "list or run external harnesses (claude, agy, …)",
+    ),
     (
         "/reset · /reset apply",
         "ChatGPT banked rate-limit resets (OpenAI OAuth)",
@@ -138,7 +141,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Sounds", "CAIRN_SOUND=0 to mute"),
     ("Skills", "packs as <dir>/<name>/SKILL.md"),
     ("MCP", "stdio servers in config · tools need permission"),
-    ("Subagent", "headless external harnesses; see /subagent list"),
+    (
+        "Subagent",
+        "headless external harnesses; see /subagent list",
+    ),
 ];
 /// Rows for the `?` shortcuts panel (keys must match real bindings in handle_key).
 const SHORTCUT_ROWS: &[(&str, &str)] = &[
@@ -2551,8 +2557,9 @@ impl Tui {
         if !sub.is_enabled() {
             self.output_lines.push(OutputLine {
                 type_: "system".into(),
-                content: "Subagents are disabled (config subagents.enabled=false or CAIRN_SUBAGENTS=0)."
-                    .into(),
+                content:
+                    "Subagents are disabled (config subagents.enabled=false or CAIRN_SUBAGENTS=0)."
+                        .into(),
                 tool_name: String::new(),
                 duration: String::new(),
             });

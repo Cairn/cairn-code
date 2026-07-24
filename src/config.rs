@@ -948,10 +948,7 @@ mod tests {
         );
         assert!(cfg.subagents.enabled, "subagents on by default");
         assert_eq!(cfg.subagents.default_timeout_ms, 600_000);
-        assert_eq!(
-            cfg.subagents.default_isolation,
-            SubagentIsolation::Worktree
-        );
+        assert_eq!(cfg.subagents.default_isolation, SubagentIsolation::Worktree);
     }
 
     #[test]

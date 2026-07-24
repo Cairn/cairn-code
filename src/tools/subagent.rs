@@ -11,7 +11,7 @@ use crate::config::{HarnessConfig, HarnessPromptMode, SubagentConfig, SubagentIs
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_OUTPUT_CHARS: usize = 12_000;
@@ -93,10 +93,7 @@ struct RunRequest {
     extra_args: Vec<String>,
 }
 
-fn parse_request(
-    input: &str,
-    default_isolation: SubagentIsolation,
-) -> Result<RunRequest, String> {
+fn parse_request(input: &str, default_isolation: SubagentIsolation) -> Result<RunRequest, String> {
     let val = crate::json::parse(input).map_err(|e| format!("invalid input: {e}"))?;
     let obj = val.as_object().ok_or("expected object")?;
     let harness = obj
@@ -341,13 +338,12 @@ fn git_capture(cwd: &Path, args: &[&str]) -> Result<String, String> {
 
 /// Create an isolated git worktree under `<repo>/.cairn/worktrees/<id>`.
 pub fn create_worktree(base_cwd: &Path) -> Result<WorktreeInfo, String> {
-    let repo_root = git_capture(base_cwd, &["rev-parse", "--show-toplevel"])
-        .map_err(|e| {
-            format!(
-                "isolation=worktree requires a git repository ({e}). \
+    let repo_root = git_capture(base_cwd, &["rev-parse", "--show-toplevel"]).map_err(|e| {
+        format!(
+            "isolation=worktree requires a git repository ({e}). \
                  Use isolation=none or run from a git checkout."
-            )
-        })?;
+        )
+    })?;
     let repo_root = PathBuf::from(repo_root);
     let id = unique_worktree_id();
     let branch = format!("cairn/subagent-{id}");
@@ -549,10 +545,7 @@ pub fn run_harness(
     if result.success {
         Ok(body)
     } else {
-        Err(format!(
-            "{body}Harness exited with code {}.",
-            result.code
-        ))
+        Err(format!("{body}Harness exited with code {}.", result.code))
     }
 }
 
@@ -748,12 +741,7 @@ mod tests {
         // Cleanup
         let _ = git_capture(
             &root,
-            &[
-                "worktree",
-                "remove",
-                "--force",
-                &wt.path.to_string_lossy(),
-            ],
+            &["worktree", "remove", "--force", &wt.path.to_string_lossy()],
         );
         let _ = git_capture(&root, &["branch", "-D", &wt.branch]);
         let _ = fs::remove_dir_all(&root);
@@ -897,7 +885,10 @@ mod tests {
                 timeout_ms: None,
             },
         );
-        let names: Vec<_> = list_harnesses(&cfg).into_iter().map(|(n, _, _)| n).collect();
+        let names: Vec<_> = list_harnesses(&cfg)
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .collect();
         assert!(names.contains(&"claude".into()));
         assert!(names.contains(&"reviewer".into()));
     }

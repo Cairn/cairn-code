@@ -544,8 +544,7 @@ fn run_slash_subagent(
 ) -> Result<String, String> {
     if !sub.is_enabled() {
         return Err(
-            "Subagents are disabled (config subagents.enabled=false or CAIRN_SUBAGENTS=0)."
-                .into(),
+            "Subagents are disabled (config subagents.enabled=false or CAIRN_SUBAGENTS=0).".into(),
         );
     }
     let val =
@@ -569,8 +568,9 @@ fn run_slash_subagent(
         return Err("prompt required".into());
     }
     let isolation = match obj.get("isolation").and_then(|v| v.as_str()) {
-        Some(s) => config::SubagentIsolation::parse(s)
-            .ok_or_else(|| format!("invalid isolation {s:?}"))?,
+        Some(s) => {
+            config::SubagentIsolation::parse(s).ok_or_else(|| format!("invalid isolation {s:?}"))?
+        }
         None => sub.default_isolation,
     };
     let timeout_ms = obj
