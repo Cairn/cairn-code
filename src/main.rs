@@ -52,7 +52,13 @@ fn main() -> ExitCode {
         i += 1;
     }
 
-    let cfg = Config::load();
+    let cfg = match Config::load() {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            eprintln!("Error loading configuration: {error}");
+            std::process::exit(1);
+        }
+    };
     // Off by default (H-03): only write request metadata to disk when the
     // user has explicitly opted in via config or CAIRN_DEBUG_HTTP=1.
     http_client::set_debug_logging_enabled(cfg.debug_log_requests);

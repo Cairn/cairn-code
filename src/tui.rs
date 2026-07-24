@@ -1198,11 +1198,11 @@ impl Tui {
                     if self.picker_sel < self.picker_models.len() {
                         let selected_model = self.picker_models[self.picker_sel].id.clone();
                         self.show_model_picker = false;
-                        if let Some(provider) = self.pending_provider_selection.take() {
-                            self.provider = provider;
-                        }
-                        self.model = selected_model;
-                        self.finish_provider_model_selection();
+                        let provider = self
+                            .pending_provider_selection
+                            .take()
+                            .unwrap_or_else(|| self.provider.clone());
+                        self.finish_provider_model_selection(provider, selected_model);
                     } else {
                         self.show_model_picker = false;
                         self.cancel_pending_provider_selection();
@@ -1230,16 +1230,18 @@ impl Tui {
 
                 if self.show_theme_picker {
                     if self.theme_picker_sel < self.theme_picker_list.len() {
-                        self.theme = self.theme_picker_list[self.theme_picker_sel].clone();
-                        let name = self.theme.name.to_string();
-                        let label = self.theme.label.to_string();
-                        let _ = crate::config::save_theme(&name);
-                        self.output_lines.push(OutputLine {
-                            type_: "system".into(),
-                            content: format!("Theme set to: {label} ({name})"),
-                            tool_name: String::new(),
-                            duration: String::new(),
-                        });
+                        let selected = self.theme_picker_list[self.theme_picker_sel].clone();
+                        let name = selected.name.to_string();
+                        let previous = self
+                            .theme_before_picker
+                            .as_deref()
+                            .map(theme::lookup)
+                            .unwrap_or_else(|| self.theme.clone());
+                        self.apply_theme_preference(
+                            selected,
+                            previous,
+                            crate::config::save_theme(&name),
+                        );
                     }
                     self.show_theme_picker = false;
                     self.theme_before_picker = None;
@@ -1454,7 +1456,7 @@ impl Tui {
             }
             "/thinking" => {
                 let arg = parts.get(1).map(|s| s.to_ascii_lowercase());
-                self.show_thinking = match arg.as_deref() {
+                let next = match arg.as_deref() {
                     Some("on" | "true" | "1" | "show") => true,
                     Some("off" | "false" | "0" | "hide") => false,
                     Some(other) => {
@@ -1470,19 +1472,7 @@ impl Tui {
                     }
                     None => !self.show_thinking,
                 };
-                let _ = crate::config::save_show_thinking(self.show_thinking);
-                let state = if self.show_thinking { "on" } else { "off" };
-                let detail = if self.show_thinking {
-                    "Full thinking streams and is kept in the transcript."
-                } else {
-                    "Thinking is hidden; a short \"Thought for …\" line is kept (Claude Code default)."
-                };
-                self.output_lines.push(OutputLine {
-                    type_: "system".into(),
-                    content: format!("Thinking display: {state}. {detail}"),
-                    tool_name: String::new(),
-                    duration: String::new(),
-                });
+                self.apply_thinking_preference(next, crate::config::save_show_thinking(next));
             }
             "/suggestions" => {
                 let arg = parts.get(1).map(|s| s.to_ascii_lowercase());
@@ -1502,20 +1492,7 @@ impl Tui {
                     }
                     None => !self.show_suggestions,
                 };
-                self.set_show_suggestions(next);
-                let _ = crate::config::save_show_suggestions(self.show_suggestions);
-                let state = if self.show_suggestions { "on" } else { "off" };
-                let detail = if self.show_suggestions {
-                    "Grayed ready-to-send prompts appear when the composer is empty (Tab/→ to accept)."
-                } else {
-                    "Idle composer stays blank (default)."
-                };
-                self.output_lines.push(OutputLine {
-                    type_: "system".into(),
-                    content: format!("Suggestions: {state}. {detail}"),
-                    tool_name: String::new(),
-                    duration: String::new(),
-                });
+                self.apply_suggestions_preference(next, crate::config::save_show_suggestions(next));
             }
             "/mouse" => {
                 let arg = parts.get(1).map(|s| s.to_ascii_lowercase());
@@ -1572,8 +1549,10 @@ impl Tui {
             }
             "/model" => {
                 if parts.len() > 1 {
-                    self.model = parts[1..].join(" ");
-                    self.finish_provider_model_selection();
+                    self.finish_provider_model_selection(
+                        self.provider.clone(),
+                        parts[1..].join(" "),
+                    );
                 } else {
                     self.open_model_picker();
                 }
@@ -1628,7 +1607,18 @@ impl Tui {
                 });
             }
             "/skills" => {
-                let cfg = crate::config::Config::load();
+                let cfg = match crate::config::Config::load() {
+                    Ok(cfg) => cfg,
+                    Err(error) => {
+                        self.output_lines.push(OutputLine {
+                            type_: "error".into(),
+                            content: format!("Error loading configuration: {error}"),
+                            tool_name: String::new(),
+                            duration: String::new(),
+                        });
+                        return true;
+                    }
+                };
                 if let Some(ref d) = cfg.skills_dir {
                     std::env::set_var("CAIRN_SKILLS_DIR", d);
                 }
@@ -1663,7 +1653,18 @@ impl Tui {
                 }
             }
             "/mcp" => {
-                let cfg = crate::config::Config::load();
+                let cfg = match crate::config::Config::load() {
+                    Ok(cfg) => cfg,
+                    Err(error) => {
+                        self.output_lines.push(OutputLine {
+                            type_: "error".into(),
+                            content: format!("Error loading configuration: {error}"),
+                            tool_name: String::new(),
+                            duration: String::new(),
+                        });
+                        return true;
+                    }
+                };
                 if cfg.mcp.servers.is_empty() {
                     self.output_lines.push(OutputLine {
                         type_: "system".into(),
@@ -1752,15 +1753,11 @@ impl Tui {
                     let name = parts[1..].join("-");
                     let t = theme::lookup(&name);
                     let applied = t.name.to_string();
-                    let label = t.label.to_string();
-                    self.theme = t;
-                    let _ = crate::config::save_theme(&applied);
-                    self.output_lines.push(OutputLine {
-                        type_: "system".into(),
-                        content: format!("Theme set to: {label} ({applied})"),
-                        tool_name: String::new(),
-                        duration: String::new(),
-                    });
+                    self.apply_theme_preference(
+                        t,
+                        self.theme.clone(),
+                        crate::config::save_theme(&applied),
+                    );
                 } else {
                     self.open_theme_picker();
                 }
@@ -2141,29 +2138,110 @@ impl Tui {
     }
 
     /// Finish provider/model selection and synchronize the Agent.
-    fn finish_provider_model_selection(&mut self) {
-        Self::persist_provider_model(&self.provider, &self.model);
-        self.output_lines.push(OutputLine {
-            type_: "system".into(),
-            content: format!(
-                "Provider set to: {}\nModel set to: {}",
-                self.provider, self.model
-            ),
-            tool_name: String::new(),
-            duration: String::new(),
-        });
+    fn finish_provider_model_selection(&mut self, provider: String, model: String) {
+        let result = Self::persist_provider_model(&provider, &model);
+        self.apply_provider_model_selection(provider, model, result);
+    }
+
+    fn apply_provider_model_selection(
+        &mut self,
+        provider: String,
+        model: String,
+        result: Result<(), String>,
+    ) {
+        if !self.report_config_save(
+            result,
+            format!("Provider set to: {provider}\nModel set to: {model}"),
+            "provider and model selection",
+        ) {
+            return;
+        }
+        self.provider = provider;
+        self.model = model;
         if let Some(tx) = &self.agent_tx {
             let _ = tx.send(format!("__switch__:{}:{}", self.provider, self.model));
         }
     }
 
     #[cfg(not(test))]
-    fn persist_provider_model(provider: &str, model: &str) {
-        let _ = crate::config::save_config(provider, model, None);
+    fn persist_provider_model(provider: &str, model: &str) -> Result<(), String> {
+        crate::config::save_config(provider, model, None)
     }
 
     #[cfg(test)]
-    fn persist_provider_model(_provider: &str, _model: &str) {}
+    fn persist_provider_model(_provider: &str, _model: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn report_config_save(
+        &mut self,
+        result: Result<(), String>,
+        success: String,
+        context: &str,
+    ) -> bool {
+        let (type_, content, saved) = match result {
+            Ok(()) => ("system", success, true),
+            Err(error) => ("error", format!("Failed to save {context}: {error}"), false),
+        };
+        self.output_lines.push(OutputLine {
+            type_: type_.into(),
+            content,
+            tool_name: String::new(),
+            duration: String::new(),
+        });
+        saved
+    }
+
+    fn apply_theme_preference(
+        &mut self,
+        selected: Theme,
+        previous: Theme,
+        result: Result<(), String>,
+    ) {
+        let name = selected.name;
+        let label = selected.label;
+        if self.report_config_save(
+            result,
+            format!("Theme set to: {label} ({name})"),
+            "theme preference",
+        ) {
+            self.theme = selected;
+        } else {
+            self.theme = previous;
+        }
+    }
+
+    fn apply_thinking_preference(&mut self, next: bool, result: Result<(), String>) {
+        let state = if next { "on" } else { "off" };
+        let detail = if next {
+            "Full thinking streams and is kept in the transcript."
+        } else {
+            "Thinking is hidden; a short \"Thought for …\" line is kept (Claude Code default)."
+        };
+        if self.report_config_save(
+            result,
+            format!("Thinking display: {state}. {detail}"),
+            "thinking preference",
+        ) {
+            self.show_thinking = next;
+        }
+    }
+
+    fn apply_suggestions_preference(&mut self, next: bool, result: Result<(), String>) {
+        let state = if next { "on" } else { "off" };
+        let detail = if next {
+            "Grayed ready-to-send prompts appear when the composer is empty (Tab/→ to accept)."
+        } else {
+            "Idle composer stays blank (default)."
+        };
+        if self.report_config_save(
+            result,
+            format!("Suggestions: {state}. {detail}"),
+            "suggestions preference",
+        ) {
+            self.set_show_suggestions(next);
+        }
+    }
 
     /// Prefer the agent's full transcript (tools included); fall back to TUI lines.
     fn session_snapshot(&self) -> (Vec<llm::Message>, u64, u64) {
@@ -3855,6 +3933,28 @@ mod provider_privacy_tests {
     }
 
     #[test]
+    fn provider_model_write_failure_does_not_switch_or_claim_success() {
+        let mut tui = Tui::new("test", "old-model", "ollama", ".");
+        let (tx, rx) = mpsc::channel();
+        tui.agent_tx = Some(tx);
+
+        tui.apply_provider_model_selection(
+            "openai".into(),
+            "new-model".into(),
+            Err("disk full".into()),
+        );
+
+        assert_eq!(tui.provider, "ollama");
+        assert_eq!(tui.model, "old-model");
+        assert!(rx.try_recv().is_err());
+        let line = tui.output_lines.last().unwrap();
+        assert_eq!(line.type_, "error");
+        assert!(line.content.contains("provider and model selection"));
+        assert!(line.content.contains("disk full"));
+        assert!(!line.content.contains("Provider set to"));
+    }
+
+    #[test]
     fn interrupt_waits_for_worker_done_before_becoming_idle() {
         let mut tui = Tui::new("test", "llama3.2", "ollama", ".");
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -3871,6 +3971,58 @@ mod provider_privacy_tests {
             rx.try_recv().is_err(),
             "cancellation must not leave a stale command queued"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_persistence_error_tests {
+    use super::*;
+
+    fn assert_last_save_error(tui: &Tui, context: &str) {
+        let line = tui.output_lines.last().unwrap();
+        assert_eq!(line.type_, "error");
+        assert!(line.content.contains(context), "{}", line.content);
+        assert!(
+            line.content.contains("permission denied"),
+            "{}",
+            line.content
+        );
+        assert!(!line.content.contains(" set to:"));
+    }
+
+    #[test]
+    fn theme_write_failure_restores_previous_theme_and_reports_error() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        let previous = tui.theme.clone();
+        let selected = theme::lookup("dune");
+        tui.theme = selected.clone();
+
+        tui.apply_theme_preference(selected, previous.clone(), Err("permission denied".into()));
+
+        assert_eq!(tui.theme.name, previous.name);
+        assert_last_save_error(&tui, "theme preference");
+    }
+
+    #[test]
+    fn thinking_write_failure_preserves_state_and_reports_error() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        assert!(!tui.show_thinking);
+
+        tui.apply_thinking_preference(true, Err("permission denied".into()));
+
+        assert!(!tui.show_thinking);
+        assert_last_save_error(&tui, "thinking preference");
+    }
+
+    #[test]
+    fn suggestions_write_failure_preserves_state_and_reports_error() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        assert!(!tui.show_suggestions);
+
+        tui.apply_suggestions_preference(true, Err("permission denied".into()));
+
+        assert!(!tui.show_suggestions);
+        assert_last_save_error(&tui, "suggestions preference");
     }
 }
 
