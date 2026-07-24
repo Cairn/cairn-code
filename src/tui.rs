@@ -47,7 +47,7 @@ enum State {
 
 // Same frames as charmbracelet MiniDot (Grok Build / zero).
 const SPINNER_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-// Claude Code / OpenClaude-style loading verbs (subset of their spinner verb list).
+// Claude Code / OpenClaude-style loading verbs (subset of openclaude spinnerVerbs).
 const SPINNER_VERBS: &[&str] = &[
     "Thinking",
     "Brewing",
@@ -67,6 +67,31 @@ const SPINNER_VERBS: &[&str] = &[
     "Synthesizing",
     "Unraveling",
     "Working",
+    "Architecting",
+    "Bootstrapping",
+    "Calculating",
+    "Cogitating",
+    "Considering",
+    "Contemplating",
+    "Cooking",
+    "Creating",
+    "Crystallizing",
+    "Deliberating",
+    "Determining",
+    "Envisioning",
+    "Herding",
+    "Incubating",
+    "Manifesting",
+    "Marinating",
+    "Moseying",
+    "Percolating",
+    "Reticulating",
+    "Ruminating",
+    "Scheming",
+    "Simmering",
+    "Spelunking",
+    "Transmuting",
+    "Wrangling",
 ];
 // MiniDot FPS is time.Second/12 (~83ms). Faster ticks look like flicker; slower feels sticky.
 const SPINNER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 12);
@@ -178,6 +203,8 @@ pub struct Tui {
     pending_select: Option<SelectDump>,
     /// Wall clock for the current in-flight thinking stream (for duration labels).
     thinking_started: Option<Instant>,
+    /// When the current agent turn started (Claude-style spinner elapsed time).
+    running_started: Option<Instant>,
 }
 
 impl Tui {
@@ -276,6 +303,7 @@ impl Tui {
             mouse_capture: true,
             pending_select: None,
             thinking_started: None,
+            running_started: None,
         }
     }
 
@@ -295,6 +323,7 @@ impl Tui {
 
     fn begin_running(&mut self) {
         self.state = State::Running;
+        self.running_started = Some(Instant::now());
         // New verb each turn (Claude Code / OpenClaude spinner style).
         let seed = self
             .spinner_idx
@@ -552,6 +581,7 @@ impl Tui {
                         AgentEvent::Done => {
                             self.flush_streaming();
                             self.state = State::Idle;
+                            self.running_started = None;
                             // Autosave after each finished turn (not only manual /save).
                             self.autosave_session(false);
                             if self.expect_turn_notify {
@@ -2121,16 +2151,11 @@ impl Tui {
         }
 
         // Empty idle prompt: second Ctrl+C exits; first arms confirmation.
+        // Claude Code shows the hint in the footer chrome, not as a transcript line.
         if self.ctrl_c_exit_armed {
             return false;
         }
         self.ctrl_c_exit_armed = true;
-        self.output_lines.push(OutputLine {
-            type_: "system".into(),
-            content: "Press Ctrl+C again to exit".into(),
-            tool_name: String::new(),
-            duration: String::new(),
-        });
         true
     }
 
@@ -2707,11 +2732,10 @@ impl Tui {
         for line in &self.output_lines {
             match line.type_.as_str() {
                 "user" => {
-                    // Use a different marker than the live composer (❯) so past turns
-                    // are not mistaken for a second prompt.
+                    // Claude Code: past user turns use a quieter marker than the live ❯.
                     lines.push(Line::from(vec![
-                        Span::styled("› ", orange),
-                        Span::raw(&line.content),
+                        Span::styled("> ", orange),
+                        Span::styled(line.content.as_str(), white),
                     ]));
                     lines.push(Line::from(""));
                 }
@@ -2818,17 +2842,25 @@ impl Tui {
         }
         // Spinner while waiting / thinking without answer text. Skip when full
         // thinking body is already on screen (show_thinking on).
-        // OpenClaude-style: glyph + rotating verb + ellipsis.
+        // OpenClaude-style: glyph + rotating verb + elapsed seconds.
         let show_spin = matches!(self.state, State::Running)
             && self.streaming_text.is_empty()
             && !(self.show_thinking && !self.stream_thinking.is_empty());
         if show_spin {
             let spin = SPINNER_CHARS[self.spinner_idx % SPINNER_CHARS.len()];
             let verb = SPINNER_VERBS[self.spinner_verb_idx % SPINNER_VERBS.len()];
-            lines.push(Line::from(vec![
+            let elapsed = self
+                .running_started
+                .map(|t| format_elapsed_compact(t.elapsed()))
+                .unwrap_or_default();
+            let mut spin_spans = vec![
                 Span::styled(spin, orange),
                 Span::styled(format!(" {verb}…"), dim),
-            ]));
+            ];
+            if !elapsed.is_empty() {
+                spin_spans.push(Span::styled(format!(" {elapsed}"), bold_dim));
+            }
+            lines.push(Line::from(spin_spans));
         }
 
         // Composer / pickers live in a fixed bottom chrome region so typing never
@@ -3149,9 +3181,17 @@ impl Tui {
                 0,
             ));
         } else {
+            // Claude Code / OpenClaude: prompt lives in a rounded box above the
+            // status byline (model · cwd · tokens · hints).
+            let box_w = (area.width as usize).saturating_sub(0).max(8);
+            let inner_w = box_w.saturating_sub(2);
+            let box_style = orange_fg;
             let cursor = self.cursor.min(self.input_buf.len());
             let (before, after) = self.input_buf.split_at(cursor);
-            // Grayed ready-to-send prompt when the composer is empty.
+
+            // Build the prompt content spans (inside the box).
+            let mut prompt_spans: Vec<Span> = vec![Span::styled("❯ ", orange_fg)];
+            let mut cursor_x_in_prompt = display_width("❯ ") as u16;
             if self.input_buf.is_empty()
                 && matches!(self.state, State::Idle)
                 && !self.show_permission_prompt
@@ -3159,76 +3199,103 @@ impl Tui {
                 && !self.awaiting_api_key
             {
                 if let Some(hint) = &self.idle_suggestion {
-                    chrome.push(Line::from(vec![
-                        Span::styled("❯ ", orange_fg),
-                        Span::styled(hint.as_str(), bold_dim),
-                    ]));
-                    cursor_pos = Some((display_width("❯ ") as u16, 0));
-                } else {
-                    chrome.push(Line::from(vec![
-                        Span::styled("❯ ", orange_fg),
-                        Span::raw(before),
-                        Span::raw(after),
-                    ]));
-                    cursor_pos = Some((display_width("❯ ") as u16, 0));
+                    prompt_spans.push(Span::styled(hint.as_str(), bold_dim));
                 }
             } else {
-                // Inline slash ghost: `/e` shows gray `xit` after the caret (no dropdown).
-                let mut spans = vec![
-                    Span::styled("❯ ", orange_fg),
-                    Span::raw(before),
-                    Span::raw(after),
-                ];
+                prompt_spans.push(Span::raw(before));
+                prompt_spans.push(Span::raw(after));
                 if cursor >= self.input_buf.len() {
                     if let Some(cmd) = self.selected_slash_completion() {
                         if let Some(suffix) = slash_ghost_suffix(&self.input_buf, cmd) {
-                            spans.push(Span::styled(suffix, bold_dim));
+                            prompt_spans.push(Span::styled(suffix, bold_dim));
                         }
                     }
                 }
-                chrome.push(Line::from(spans));
-                cursor_pos = Some((display_width("❯ ") as u16 + display_width(before) as u16, 0));
+                cursor_x_in_prompt =
+                    display_width("❯ ") as u16 + display_width(before) as u16;
             }
 
-            // Status row under the prompt (model · cwd · tokens · cost).
-            // Always keep this while the normal composer is visible, including
-            // slash ghost completion. Hiding it when `/` sets show_command_picker
-            // shrinks chrome and drops the prompt to the terminal bottom.
-            // Other pickers/dialogs take earlier branches and never reach here.
+            chrome.push(Line::from(Span::styled(
+                format!("╭{}╮", "─".repeat(inner_w)),
+                box_style,
+            )));
+            // │ + content (width = inner_w) + │  (Claude-style padded prompt row)
+            let mut content_spans: Vec<Span> = vec![Span::raw(" ")];
+            content_spans.extend(prompt_spans);
+            let used = spans_display_width(&content_spans);
+            if used < inner_w {
+                content_spans.push(Span::raw(" ".repeat(inner_w - used)));
+            }
+            let mut row = vec![Span::styled("│", box_style)];
+            row.extend(content_spans);
+            row.push(Span::styled("│", box_style));
+            let prompt_line_idx = chrome.len();
+            chrome.push(Line::from(row));
+            chrome.push(Line::from(Span::styled(
+                format!("╰{}╯", "─".repeat(inner_w)),
+                box_style,
+            )));
+            // Cursor: after left border + space + prompt offset.
+            cursor_pos = Some((
+                1 + 1 + cursor_x_in_prompt.min(inner_w.saturating_sub(3) as u16),
+                prompt_line_idx,
+            ));
+
+            // Status byline under the box (OpenClaude PromptInput footer).
             chrome.push(Line::from(""));
             let mut status = Vec::new();
-            status.push(Span::styled(
-                format!("{}/{}", self.provider, self.model),
-                dim,
-            ));
-            // Shorten home-ish paths for the footer.
-            let path = self.work_dir.as_str();
-            let short_path = path
-                .rsplit(['/', '\\'])
-                .next()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(path);
-            status.push(Span::styled(" · ", bold_dim));
-            status.push(Span::styled(short_path, dim));
-            if self.total_usage.input_tokens > 0 || self.total_usage.output_tokens > 0 {
-                let est = crate::cost::estimate_cost(&self.model, &self.total_usage);
-                let cost_str = crate::cost::format_cost(est);
+            if self.ctrl_c_exit_armed {
+                status.push(Span::styled(
+                    "Press Ctrl+C again to exit",
+                    orange_fg.add_modifier(Modifier::BOLD),
+                ));
+            } else if matches!(self.state, State::Running) {
+                status.push(Span::styled("esc to interrupt", bold_dim));
+                if let Some(started) = self.running_started {
+                    status.push(Span::styled(" · ", bold_dim));
+                    status.push(Span::styled(
+                        format_elapsed_compact(started.elapsed()),
+                        dim,
+                    ));
+                }
                 status.push(Span::styled(" · ", bold_dim));
                 status.push(Span::styled(
-                    format!(
-                        "{}↓ {}↑",
-                        self.total_usage.input_tokens, self.total_usage.output_tokens
-                    ),
+                    format!("{}/{}", self.provider, self.model),
                     dim,
                 ));
-                if est > 0.0 {
-                    status.push(Span::styled(" · ", bold_dim));
-                    status.push(Span::styled(cost_str, dim));
-                }
-            }
-            if matches!(self.state, State::Idle) && self.input_buf.is_empty() {
+            } else {
+                status.push(Span::styled(
+                    format!("{}/{}", self.provider, self.model),
+                    dim,
+                ));
+                let path = self.work_dir.as_str();
+                let short_path = path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(path);
                 status.push(Span::styled(" · ", bold_dim));
-                status.push(Span::styled("? for shortcuts", bold_dim));
+                status.push(Span::styled(short_path, dim));
+                if self.total_usage.input_tokens > 0 || self.total_usage.output_tokens > 0 {
+                    let est = crate::cost::estimate_cost(&self.model, &self.total_usage);
+                    let cost_str = crate::cost::format_cost(est);
+                    status.push(Span::styled(" · ", bold_dim));
+                    status.push(Span::styled(
+                        format!(
+                            "{}↓ {}↑",
+                            self.total_usage.input_tokens, self.total_usage.output_tokens
+                        ),
+                        dim,
+                    ));
+                    if est > 0.0 {
+                        status.push(Span::styled(" · ", bold_dim));
+                        status.push(Span::styled(cost_str, dim));
+                    }
+                }
+                if self.input_buf.is_empty() {
+                    status.push(Span::styled(" · ", bold_dim));
+                    status.push(Span::styled("? for shortcuts", bold_dim));
+                }
             }
             chrome.push(Line::from(status));
         }
@@ -4405,6 +4472,37 @@ mod unicode_input_tests {
 }
 
 #[cfg(test)]
+mod claude_chrome_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn format_elapsed_compact_units() {
+        assert_eq!(format_elapsed_compact(Duration::from_secs(0)), "0s");
+        assert_eq!(format_elapsed_compact(Duration::from_secs(9)), "9s");
+        assert_eq!(format_elapsed_compact(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(format_elapsed_compact(Duration::from_secs(600)), "10m 00s");
+    }
+
+    #[test]
+    fn ctrl_c_arms_exit_without_transcript_noise() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        assert!(tui.input_buf.is_empty());
+        assert!(tui.handle_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(tui.ctrl_c_exit_armed);
+        assert!(
+            !tui.output_lines
+                .iter()
+                .any(|l| l.content.contains("Ctrl+C")),
+            "exit hint belongs in the footer, not the transcript"
+        );
+    }
+}
+
+#[cfg(test)]
 mod completion_tests {
     use super::*;
 
@@ -4615,6 +4713,23 @@ fn truncate_summary(summary: &str, max_chars: usize) -> String {
         format!("{}…", summary.chars().take(max_chars).collect::<String>())
     } else {
         summary.to_string()
+    }
+}
+
+/// Display width of consecutive spans (no wrap).
+fn spans_display_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|s| display_width(&s.content)).sum()
+}
+
+/// Compact elapsed time for spinner / footer (Claude Code style: `3s`, `1m 12s`).
+pub(crate) fn format_elapsed_compact(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        let m = secs / 60;
+        let s = secs % 60;
+        format!("{m}m {s:02}s")
     }
 }
 
