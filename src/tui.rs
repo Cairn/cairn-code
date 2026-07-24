@@ -93,6 +93,43 @@ const SPINNER_VERBS: &[&str] = &[
     "Transmuting",
     "Wrangling",
 ];
+/// Rows for the `/help` chrome overlay (dismiss with Esc / Enter / ?).
+/// Section headers use an empty keys column; detail rows are key + description.
+const HELP_ROWS: &[(&str, &str)] = &[
+    ("Commands", ""),
+    ("/auth", "login · logout · status · key  (xAI OAuth)"),
+    ("/model", "pick or set model"),
+    ("/provider", "pick or set provider"),
+    ("/clear", "clear conversation"),
+    ("/compact", "summarize older history now"),
+    ("/cost", "token usage and estimated cost"),
+    ("/theme", "TUI theme picker"),
+    ("/thinking", "on|off full thinking blocks"),
+    ("/suggestions", "on|off idle ready-to-send hints"),
+    ("/mouse", "on|off wheel capture"),
+    ("/copy", "copy last assistant message (Ctrl+Y)"),
+    ("/select", "plain-text select mode (Ctrl+O)"),
+    ("/save · /sessions · /resume · /delete", "session management"),
+    ("/skills · /mcp", "list skills and MCP servers"),
+    ("/exit · /quit · /q", "exit Cairn"),
+    ("", ""),
+    ("Keys", ""),
+    ("Enter", "send message"),
+    ("Tab / →", "accept slash ghost or idle suggestion"),
+    ("Up / Down", "scroll chat when it overflows · else history"),
+    ("Ctrl+P / Ctrl+N", "prompt history"),
+    ("PgUp/PgDn · Ctrl+U/D", "page / half-page scroll"),
+    ("Ctrl+Home / End", "jump to top / bottom"),
+    ("Wheel", "scroll transcript"),
+    ("Ctrl+C", "interrupt · press again to exit when idle"),
+    ("Esc", "cancel pickers / close this help"),
+    ("?", "shortcuts (when composer empty)"),
+    ("", ""),
+    ("Tips", ""),
+    ("Sounds", "CAIRN_SOUND=0 to mute"),
+    ("Skills", "packs as <dir>/<name>/SKILL.md"),
+    ("MCP", "stdio servers in config · tools need permission"),
+];
 // MiniDot FPS is time.Second/12 (~83ms). Faster ticks look like flicker; slower feels sticky.
 const SPINNER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 12);
 // Cap full-frame redraws while the agent runs. Zero coalesces stream text to ~16ms
@@ -205,6 +242,8 @@ pub struct Tui {
     thinking_started: Option<Instant>,
     /// When the current agent turn started (Claude-style spinner elapsed time).
     running_started: Option<Instant>,
+    /// Bottom chrome shows `/help` overlay (like the model picker; Esc closes).
+    show_help: bool,
 }
 
 impl Tui {
@@ -304,6 +343,7 @@ impl Tui {
             pending_select: None,
             thinking_started: None,
             running_started: None,
+            show_help: false,
         }
     }
 
@@ -865,8 +905,28 @@ impl Tui {
             || self.show_theme_picker
             || self.show_session_picker
             || self.show_permission_prompt
+            || self.show_help
             || self.confirm_remove_provider.is_some()
             || self.confirm_history_provider.is_some();
+        if self.show_help {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => {
+                    self.show_help = false;
+                }
+                KeyCode::PageUp => self.scroll_page(false),
+                KeyCode::PageDown => self.scroll_page(true),
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_transcript(-1);
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_transcript(1);
+                }
+                KeyCode::Up => self.scroll_transcript(-3),
+                KeyCode::Down => self.scroll_transcript(3),
+                _ => {}
+            }
+            return true;
+        }
         if !picker_nav {
             match key.code {
                 KeyCode::PageUp => {
@@ -1243,6 +1303,8 @@ impl Tui {
                         tool_name: String::new(),
                         duration: String::new(),
                     });
+                } else if self.show_help {
+                    self.show_help = false;
                 } else if self.show_command_picker || !self.cmd_picker_filtered.is_empty() {
                     self.show_command_picker = false;
                     self.cmd_picker_filtered.clear();
@@ -1502,7 +1564,8 @@ impl Tui {
                     || (!self.show_model_picker
                         && !self.show_provider_picker
                         && !self.show_theme_picker
-                        && !self.show_session_picker)
+                        && !self.show_session_picker
+                        && !self.show_help)
                 {
                     self.input_buf.insert(self.cursor, ch);
                     self.cursor += ch.len_utf8();
@@ -1704,11 +1767,9 @@ impl Tui {
                 }
             }
             "/help" => {
-                self.output_lines.push(OutputLine {
-                    type_: "system".into(),
-                    content: "Commands: /auth /clear /compact /copy /cost /delete /exit /help /mcp /model /mouse /provider /resume /save /select /sessions /skills /suggestions /theme /thinking\nExtensibility: skills (SKILL.md) + MCP stdio (config mcp.servers or mcpServers)\n/skills · /mcp — list skills and MCP servers\nMouse: wheel scrolls · Shift+drag selects (terminal-native) · /mouse off disables capture\n/select [last|all] or Ctrl+O — plain-text view if you need a full select dump\n/copy or Ctrl+Y — copy last assistant message to clipboard\n/thinking [on|off] · /suggestions [on|off]\nTab completes slash commands · Scroll: wheel · PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End (Up/Down scroll when chat overflows; Ctrl+P/N for prompt history)\nSounds: CAIRN_SOUND=0 to mute · /provider xai — OAuth; /auth login xai".into(),
-                    tool_name: String::new(), duration: String::new(),
-                });
+                // Model-picker style overlay in bottom chrome; Esc / Enter dismisses.
+                // Do not dump into the transcript (stays until /clear).
+                self.show_help = true;
             }
             "/skills" => {
                 let cfg = match crate::config::Config::load() {
@@ -2092,6 +2153,11 @@ impl Tui {
         if self.show_model_picker {
             self.show_model_picker = false;
             self.cancel_pending_provider_selection();
+            self.ctrl_c_exit_armed = false;
+            return true;
+        }
+        if self.show_help {
+            self.show_help = false;
             self.ctrl_c_exit_armed = false;
             return true;
         }
@@ -2938,6 +3004,29 @@ impl Tui {
                 "(← → navigate  Enter confirm  Esc cancel)",
                 dim,
             )]));
+        } else if self.show_help {
+            chrome.push(Line::from(vec![
+                Span::styled("── Help ", orange),
+                Span::styled("(Esc or Enter close) ──", bold_dim),
+            ]));
+            for (keys, desc) in HELP_ROWS {
+                if keys.is_empty() && desc.is_empty() {
+                    chrome.push(Line::from(""));
+                    continue;
+                }
+                if desc.is_empty() {
+                    // Section header
+                    chrome.push(Line::from(vec![Span::styled(
+                        format!("  {keys}"),
+                        orange_fg.add_modifier(Modifier::BOLD),
+                    )]));
+                    continue;
+                }
+                chrome.push(Line::from(vec![
+                    Span::styled(format!("  {keys:<28}"), orange_fg),
+                    Span::styled(*desc, dim),
+                ]));
+            }
         } else if self.show_provider_picker {
             chrome.push(Line::from(vec![
                 Span::styled("── Provider ", orange),
@@ -4468,6 +4557,37 @@ mod unicode_input_tests {
         press(&mut tui, KeyCode::Char('🙂'));
         assert_eq!(tui.input_buf, "é界🙂");
         assert_eq!(tui.cursor, tui.input_buf.len());
+    }
+}
+
+#[cfg(test)]
+mod help_overlay_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn help_command_opens_overlay_without_transcript_dump() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        let before = tui.output_lines.len();
+        tui.handle_command("/help");
+        assert!(tui.show_help);
+        assert_eq!(
+            tui.output_lines.len(),
+            before,
+            "/help must not dump into the transcript"
+        );
+    }
+
+    #[test]
+    fn esc_and_enter_close_help_overlay() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.show_help = true;
+        tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!tui.show_help);
+
+        tui.show_help = true;
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!tui.show_help);
     }
 }
 
