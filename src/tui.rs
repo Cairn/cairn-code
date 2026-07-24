@@ -129,10 +129,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Ctrl+Home / End", "jump to top / bottom"),
     ("Wheel", "scroll transcript"),
     ("Ctrl+C", "interrupt · press again to exit when idle"),
-    (
-        "paste image",
-        "Win Alt+V · Linux Ctrl+V · macOS Cmd+V",
-    ),
+    ("paste image", "Win Alt+V · Linux Ctrl+V · macOS Cmd+V"),
     ("Esc", "cancel pickers / close this help"),
     ("?", "shortcuts (when composer empty)"),
     ("", ""),
@@ -145,10 +142,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
 const SHORTCUT_ROWS: &[(&str, &str)] = &[
     ("Ctrl+C", "interrupt turn · press again to exit when idle"),
     ("Enter", "send message"),
-    (
-        "Alt+V / Ctrl+V / Cmd+V",
-        "paste clipboard image (platform)",
-    ),
+    ("Alt+V / Ctrl+V / Cmd+V", "paste clipboard image (platform)"),
     ("Tab / →", "accept slash ghost or idle suggestion"),
     (
         "Up / Down",
@@ -4569,10 +4563,7 @@ mod user_blocks_label_tests {
 
     #[test]
     fn display_label_covers_text_and_images() {
-        assert_eq!(
-            llm::UserBlocks::text_only("hi").display_label(),
-            "hi"
-        );
+        assert_eq!(llm::UserBlocks::text_only("hi").display_label(), "hi");
         assert_eq!(
             llm::UserBlocks {
                 text: String::new(),

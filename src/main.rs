@@ -349,9 +349,10 @@ fn print_help(version: &str) {
 
 /// Decode a multimodal user payload from the TUI (`__user_json__:` command).
 fn parse_user_blocks_cmd(json: &str) -> Result<llm::UserBlocks, String> {
-    let val = serde_json::from_str::<serde_json::Value>(json)
-        .map_err(|e| format!("json: {e}"))?;
-    let obj = val.as_object().ok_or_else(|| "expected object".to_string())?;
+    let val = serde_json::from_str::<serde_json::Value>(json).map_err(|e| format!("json: {e}"))?;
+    let obj = val
+        .as_object()
+        .ok_or_else(|| "expected object".to_string())?;
     let text = obj
         .get("text")
         .and_then(|v| v.as_str())
@@ -360,7 +361,9 @@ fn parse_user_blocks_cmd(json: &str) -> Result<llm::UserBlocks, String> {
     let mut images = Vec::new();
     if let Some(arr) = obj.get("images").and_then(|v| v.as_array()) {
         for img in arr {
-            let o = img.as_object().ok_or_else(|| "image not object".to_string())?;
+            let o = img
+                .as_object()
+                .ok_or_else(|| "image not object".to_string())?;
             let media_type = o
                 .get("media_type")
                 .and_then(|v| v.as_str())

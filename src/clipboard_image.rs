@@ -120,9 +120,7 @@ fn sniff_media_type(bytes: &[u8]) -> Option<&'static str> {
     if bytes.len() >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff {
         return Some("image/jpeg");
     }
-    if bytes.len() >= 6
-        && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"))
-    {
+    if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
         return Some("image/gif");
     }
     if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
@@ -286,9 +284,7 @@ fn read_linux() -> Result<ClipboardImage, String> {
     ) {
         return Ok(img);
     }
-    Err(
-        "no image on the clipboard (install wl-paste or xclip for image paste support)".into(),
-    )
+    Err("no image on the clipboard (install wl-paste or xclip for image paste support)".into())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]

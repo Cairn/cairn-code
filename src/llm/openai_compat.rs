@@ -44,9 +44,7 @@ pub fn build_messages_json(messages: &[Message], system: &str) -> String {
                 let mut first_part = true;
                 if !blocks.text.is_empty() {
                     let escaped = escape_json_str(&blocks.text);
-                    body.push_str(&format!(
-                        "{{\"type\":\"text\",\"text\":\"{escaped}\"}}"
-                    ));
+                    body.push_str(&format!("{{\"type\":\"text\",\"text\":\"{escaped}\"}}"));
                     first_part = false;
                 }
                 for img in &blocks.images {

@@ -255,12 +255,7 @@ impl Agent {
         cancel: &AtomicBool,
         perm_rx: &mpsc::Receiver<String>,
     ) -> Result<(), String> {
-        self.run_user(
-            llm::UserBlocks::text_only(input),
-            tx,
-            cancel,
-            perm_rx,
-        )
+        self.run_user(llm::UserBlocks::text_only(input), tx, cancel, perm_rx)
     }
 
     /// Run a user turn that may include pasted clipboard images.
