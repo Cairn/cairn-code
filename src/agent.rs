@@ -269,10 +269,21 @@ impl Agent {
         cancel: &AtomicBool,
         perm_rx: &mpsc::Receiver<String>,
     ) -> Result<(), String> {
-        self.messages.push(llm::Message {
-            role: "user".into(),
-            content: llm::Content::Text(input.to_string()),
-        });
+        self.run_user(llm::UserBlocks::text_only(input), tx, cancel, perm_rx)
+    }
+
+    /// Run a user turn that may include pasted clipboard images.
+    pub fn run_user(
+        &mut self,
+        user: llm::UserBlocks,
+        tx: mpsc::Sender<AgentEvent>,
+        cancel: &AtomicBool,
+        perm_rx: &mpsc::Receiver<String>,
+    ) -> Result<(), String> {
+        if user.is_empty() {
+            return Err("empty user message".into());
+        }
+        self.messages.push(llm::Message::user_blocks(user));
         // Persist the user prompt immediately so a crash during the first LLM
         // call does not lose the start of the turn.
         self.checkpoint(Some(&tx));
@@ -671,6 +682,7 @@ fn render_transcript(messages: &[llm::Message]) -> String {
         .iter()
         .map(|m| match &m.content {
             llm::Content::Text(t) => format!("{}: {t}", m.role),
+            llm::Content::User(blocks) => format!("{}: {}", m.role, blocks.display_label()),
             llm::Content::Thinking(t) => format!("{} [thinking]: {t}", m.role),
             llm::Content::ToolUse(tu) => {
                 format!("assistant [tool call]: {}({})", tu.name, tu.input)
@@ -766,12 +778,23 @@ mod tests {
     fn render_transcript_covers_content_kinds() {
         let msgs = vec![
             text("user", "hello"),
+            Message {
+                role: "user".into(),
+                content: Content::User(crate::llm::UserBlocks {
+                    text: "cap".into(),
+                    images: vec![crate::llm::ImageBlock {
+                        media_type: "image/png".into(),
+                        data_base64: "x".into(),
+                    }],
+                }),
+            },
             text("assistant", "hi"),
             tool_use("grep", r#"{"q":"x"}"#),
             tool_result("matches"),
         ];
         let t = render_transcript(&msgs);
         assert!(t.contains("user: hello"));
+        assert!(t.contains("user: cap\n[image]"));
         assert!(t.contains("assistant: hi"));
         assert!(t.contains("assistant [tool call]: grep("));
         assert!(t.contains("tool result: matches"));

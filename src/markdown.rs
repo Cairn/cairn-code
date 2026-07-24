@@ -39,6 +39,8 @@ fn syntect_theme() -> &'static SyntectTheme {
 /// and list chrome match the composer prompt colour (and friends).
 #[derive(Clone, Copy)]
 struct MdStyles {
+    /// Default paragraph / narration body colour.
+    body: Style,
     /// Inline `` `code` `` / file paths — same as prompt `❯` (accent_fg).
     inline_code: Style,
     /// Unordered bullet and ordered list prefix.
@@ -57,7 +59,12 @@ struct MdStyles {
 
 impl MdStyles {
     fn from_theme(theme: &Theme) -> Self {
+        Self::from_theme_with_body(theme, theme.ink)
+    }
+
+    fn from_theme_with_body(theme: &Theme, body: Style) -> Self {
         Self {
+            body,
             // Match composer prompt colour so listed files read as themed chrome.
             inline_code: theme.accent_fg,
             list_marker: theme.accent_fg,
@@ -76,6 +83,12 @@ impl MdStyles {
 /// Render markdown using the active TUI theme for inline chrome (code, lists, links).
 pub fn render(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     render_with(text, MdStyles::from_theme(theme))
+}
+
+/// Like [`render`], but plain paragraph text uses `body` (e.g. accent for
+/// interim status narration between tool calls).
+pub fn render_with_body(text: &str, theme: &Theme, body: Style) -> Vec<Line<'static>> {
+    render_with(text, MdStyles::from_theme_with_body(theme, body))
 }
 
 fn render_with(text: &str, styles: MdStyles) -> Vec<Line<'static>> {
@@ -123,7 +136,7 @@ fn render_with(text: &str, styles: MdStyles) -> Vec<Line<'static>> {
             continue;
         }
 
-        lines.push(render_inline(raw_line, Style::default(), styles));
+        lines.push(render_inline(raw_line, styles.body, styles));
     }
 
     if in_code_block {
@@ -181,7 +194,7 @@ fn render_list_item(line: &str, styles: MdStyles) -> Option<Line<'static>> {
             spans.push(Span::raw(" ".repeat(indent)));
         }
         spans.push(Span::styled("• ", styles.list_marker));
-        spans.extend(parse_inline_spans(content, Style::default(), styles));
+        spans.extend(parse_inline_spans(content, styles.body, styles));
         return Some(Line::from(spans));
     }
     if let Some(rest) = trimmed.strip_prefix(|c: char| c.is_ascii_digit()) {
@@ -193,7 +206,7 @@ fn render_list_item(line: &str, styles: MdStyles) -> Option<Line<'static>> {
                 spans.push(Span::raw(" ".repeat(indent)));
             }
             spans.push(Span::styled(format!("{num}. "), styles.list_marker));
-            spans.extend(parse_inline_spans(content, Style::default(), styles));
+            spans.extend(parse_inline_spans(content, styles.body, styles));
             return Some(Line::from(spans));
         }
     }
@@ -529,5 +542,23 @@ mod tests {
     fn test_multiline_paragraph() {
         let lines = render_test("line one\n\nline two");
         assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn test_render_with_body_tints_plain_paragraphs() {
+        let theme = crate::theme::default_theme();
+        let body = theme.accent_fg;
+        let expected_fg = body.fg;
+        let lines = render_with_body("plain status line", &theme, body);
+        assert_eq!(lines.len(), 1);
+        let joined: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "plain status line");
+        assert!(
+            lines[0].spans.iter().all(|s| s.style.fg == expected_fg),
+            "expected body accent on plain text, got {:?}",
+            lines[0].spans
+        );
+        let code = render_with_body("see `path.rs` please", &theme, body);
+        assert!(code[0].spans.iter().any(|s| s.content.contains("path.rs")));
     }
 }

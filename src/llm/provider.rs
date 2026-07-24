@@ -34,9 +34,52 @@ pub struct ToolResult {
     pub content: String,
 }
 
+/// Image bytes already base64-encoded for provider APIs (no data: prefix).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageBlock {
+    pub media_type: String,
+    pub data_base64: String,
+}
+
+/// Multimodal user turn: optional text plus zero or more images.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserBlocks {
+    pub text: String,
+    pub images: Vec<ImageBlock>,
+}
+
+impl UserBlocks {
+    pub fn text_only(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.images.is_empty()
+    }
+
+    /// Short label for TUI transcript lines (not the full base64 payload).
+    pub fn display_label(&self) -> String {
+        let n = self.images.len();
+        let t = self.text.trim();
+        match (t.is_empty(), n) {
+            (true, 0) => String::new(),
+            (true, 1) => "[image]".into(),
+            (true, n) => format!("[{n} images]"),
+            (false, 0) => t.to_string(),
+            (false, 1) => format!("{t}\n[image]"),
+            (false, n) => format!("{t}\n[{n} images]"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Content {
     Text(String),
+    /// User message that may include pasted clipboard images.
+    User(UserBlocks),
     ToolUse(ToolUse),
     ToolResult(ToolResult),
     Thinking(String),
@@ -46,6 +89,26 @@ pub enum Content {
 pub struct Message {
     pub role: String,
     pub content: Content,
+}
+
+impl Message {
+    pub fn user_text(text: impl Into<String>) -> Self {
+        Self {
+            role: "user".into(),
+            content: Content::Text(text.into()),
+        }
+    }
+
+    pub fn user_blocks(blocks: UserBlocks) -> Self {
+        if blocks.images.is_empty() {
+            Self::user_text(blocks.text)
+        } else {
+            Self {
+                role: "user".into(),
+                content: Content::User(blocks),
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

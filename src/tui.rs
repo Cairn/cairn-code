@@ -129,6 +129,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Ctrl+Home / End", "jump to top / bottom"),
     ("Wheel", "scroll transcript"),
     ("Ctrl+C", "interrupt · press again to exit when idle"),
+    ("paste image", "Win Alt+V · Linux Ctrl+V · macOS Cmd+V"),
     ("Esc", "cancel pickers / close this help"),
     ("?", "shortcuts (when composer empty)"),
     ("", ""),
@@ -141,6 +142,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
 const SHORTCUT_ROWS: &[(&str, &str)] = &[
     ("Ctrl+C", "interrupt turn · press again to exit when idle"),
     ("Enter", "send message"),
+    ("Alt+V / Ctrl+V / Cmd+V", "paste clipboard image (platform)"),
     ("Tab / →", "accept slash ghost or idle suggestion"),
     (
         "Up / Down",
@@ -262,6 +264,8 @@ pub struct Tui {
     last_checkpoint_save: Option<Instant>,
     /// Full agent transcript (tools included) for session files.
     live_mirror: Option<session::LiveMirror>,
+    /// Clipboard images attached to the next user send (cleared on send/clear).
+    pending_images: Vec<llm::ImageBlock>,
     /// When true, the next `Done` event is a finished agent turn (play sound + refresh hint).
     expect_turn_notify: bool,
     /// Grayed-out ready-to-send prompt shown when the composer is empty (Tab/→ accepts).
@@ -357,6 +361,7 @@ impl Tui {
             session_created_at: 0,
             last_checkpoint_save: None,
             live_mirror: None,
+            pending_images: Vec::new(),
             expect_turn_notify: false,
             idle_suggestion: None,
             show_thinking: false,
@@ -675,7 +680,7 @@ impl Tui {
                                     .clone()
                                     .unwrap_or_else(|| self.provider.clone());
                                 if crate::config::has_usable_credential(&target) {
-                                    // Signed in — now pick a model (live catalog available).
+                                    // Signed in - now pick a model (live catalog available).
                                     self.pending_model_after_auth = false;
                                     self.output_lines.push(OutputLine {
                                         type_: "system".into(),
@@ -1028,6 +1033,11 @@ impl Tui {
         }
         if is_ctrl_c {
             return self.handle_ctrl_c();
+        }
+
+        if self.is_image_paste_chord(key) {
+            self.paste_clipboard_image();
+            return true;
         }
 
         // Transcript scroll (videre-style Page / Ctrl-U/D + arrows with Ctrl).
@@ -1703,18 +1713,22 @@ impl Tui {
                 }
 
                 let input = self.input_buf.trim().to_string();
-                self.input_buf.clear();
-                self.cursor = 0;
-                if input.is_empty() {
+                if input.is_empty() && self.pending_images.is_empty() {
                     return true;
                 }
 
-                if input.starts_with('/') {
+                if !input.is_empty() && input.starts_with('/') && self.pending_images.is_empty() {
+                    self.input_buf.clear();
+                    self.cursor = 0;
                     return self.handle_command(&input);
                 }
 
-                self.history.push(input.clone());
-                self.hist_idx = self.history.len();
+                self.input_buf.clear();
+                self.cursor = 0;
+                if !input.is_empty() {
+                    self.history.push(input.clone());
+                    self.hist_idx = self.history.len();
+                }
                 self.show_recovery_prompt = false;
                 // New turn: pin transcript to bottom (follow latest output).
                 self.transcript_follow = true;
@@ -1723,15 +1737,29 @@ impl Tui {
                 // Stable id for the whole conversation so mid-turn checkpoints
                 // and the final save share one file from the first prompt.
                 self.ensure_session_identity();
+                let images = std::mem::take(&mut self.pending_images);
+                let label = if images.is_empty() {
+                    input.clone()
+                } else {
+                    llm::UserBlocks {
+                        text: input.clone(),
+                        images: images.clone(),
+                    }
+                    .display_label()
+                };
                 self.output_lines.push(OutputLine {
                     type_: "user".into(),
-                    content: input.clone(),
+                    content: label,
                     tool_name: String::new(),
                     duration: String::new(),
                 });
                 self.begin_running();
                 if let Some(tx) = &self.agent_tx {
-                    let _ = tx.send(input);
+                    if images.is_empty() {
+                        let _ = tx.send(input);
+                    } else {
+                        let _ = tx.send(encode_user_json_cmd(&input, &images));
+                    }
                 }
                 true
             }
@@ -1839,6 +1867,7 @@ impl Tui {
                 self.thinking_started = None;
                 self.current_session_id = None;
                 self.session_created_at = 0;
+                self.pending_images.clear();
                 self.last_checkpoint_save = None;
                 self.total_usage = llm::Usage::default();
                 if let Some(tx) = &self.agent_tx {
@@ -2044,7 +2073,7 @@ impl Tui {
                 } else {
                     let mut body = format!("Skills ({}) from {}:\n", list.len(), dir.display());
                     for s in &list {
-                        body.push_str(&format!("  {} — {}\n", s.name, s.description));
+                        body.push_str(&format!("  {} - {}\n", s.name, s.description));
                     }
                     body.push_str("Load in-chat with the skill tool: {\"name\":\"...\"}");
                     self.output_lines.push(OutputLine {
@@ -2092,7 +2121,7 @@ impl Tui {
                         } else {
                             format!(" {}", crate::redact::redact_secrets(&s.args.join(" ")))
                         };
-                        body.push_str(&format!("  {n} [{state}] — {}{args_str}\n", s.command));
+                        body.push_str(&format!("  {n} [{state}] - {}{args_str}\n", s.command));
                     }
                     body.push_str(
                         "Tools register at startup as mcp_<server>_<tool> (permission required).",
@@ -2732,6 +2761,96 @@ impl Tui {
         )
     }
 
+    /// Platform paste chord for clipboard images:
+    /// - Windows: Alt+V
+    /// - Linux / other Unix: Ctrl+V
+    /// - macOS: Cmd (SUPER)+V
+    fn is_image_paste_chord(&self, key: ratatui::crossterm::event::KeyEvent) -> bool {
+        if !matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) {
+            return false;
+        }
+        #[cfg(windows)]
+        {
+            return key.modifiers.contains(KeyModifiers::ALT)
+                && !key.modifiers.contains(KeyModifiers::CONTROL);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            return key.modifiers.contains(KeyModifiers::SUPER);
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            return key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT);
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = key;
+            false
+        }
+    }
+
+    fn paste_clipboard_image(&mut self) {
+        if self.awaiting_api_key
+            || self.show_model_picker
+            || self.show_provider_picker
+            || self.show_theme_picker
+            || self.show_session_picker
+            || self.show_permission_prompt
+            || self.show_recovery_prompt
+            || self.show_help
+            || self.show_shortcuts
+            || self.confirm_remove_provider.is_some()
+            || self.confirm_history_provider.is_some()
+        {
+            return;
+        }
+        if !matches!(self.state, State::Idle) {
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: "Wait for the current turn to finish before pasting an image.".into(),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        }
+        const MAX_PENDING_IMAGES: usize = 4;
+        if self.pending_images.len() >= MAX_PENDING_IMAGES {
+            self.output_lines.push(OutputLine {
+                type_: "error".into(),
+                content: format!(
+                    "At most {MAX_PENDING_IMAGES} images can be attached to one message."
+                ),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        }
+        match crate::clipboard_image::read_clipboard_image() {
+            Ok(img) => {
+                let media = img.media_type.clone();
+                let bytes = img.bytes.len();
+                self.pending_images.push(img.into_block());
+                self.output_lines.push(OutputLine {
+                    type_: "system".into(),
+                    content: format!(
+                        "Attached clipboard image ({media}, {bytes} bytes). Add a caption in the composer and press Enter - or paste more images."
+                    ),
+                    tool_name: String::new(),
+                    duration: String::new(),
+                });
+            }
+            Err(e) => {
+                self.output_lines.push(OutputLine {
+                    type_: "error".into(),
+                    content: format!("Clipboard image paste failed: {e}"),
+                    tool_name: String::new(),
+                    duration: String::new(),
+                });
+            }
+        }
+    }
+
     /// Mid-turn durable checkpoint. Throttled so rapid tool loops do not hammer
     /// the disk, but always writes at least every few seconds while history grows.
     fn checkpoint_session(&mut self) {
@@ -2766,7 +2885,7 @@ impl Tui {
             if announce {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Nothing to save — no conversation yet.".into(),
+                    content: "Nothing to save - no conversation yet.".into(),
                     tool_name: String::new(),
                     duration: String::new(),
                 });
@@ -2907,6 +3026,14 @@ impl Tui {
                                     "text".into()
                                 },
                                 content: t.clone(),
+                                tool_name: String::new(),
+                                duration: String::new(),
+                            });
+                        }
+                        llm::Content::User(blocks) => {
+                            lines.push(OutputLine {
+                                type_: "user".into(),
+                                content: blocks.display_label(),
                                 tool_name: String::new(),
                                 duration: String::new(),
                             });
@@ -3072,7 +3199,20 @@ impl Tui {
                     lines.push(Line::from(""));
                 }
                 "text" => {
-                    lines.extend(crate::markdown::render(&line.content, &self.theme));
+                    // Interim assistant narration (plans / status between tools):
+                    // blank line above and below + accent colour so it separates
+                    // from dense tool chrome without looking like user prompts.
+                    if lines.last().is_none_or(|l| !line_is_blank(l)) {
+                        lines.push(Line::from(""));
+                    }
+                    lines.extend(crate::markdown::render_with_body(
+                        &line.content,
+                        &self.theme,
+                        orange_fg,
+                    ));
+                    if lines.last().is_none_or(|l| !line_is_blank(l)) {
+                        lines.push(Line::from(""));
+                    }
                 }
                 "tool_use" => {
                     // One line: name + short arg hint (no multi-line JSON dump).
@@ -3170,7 +3310,15 @@ impl Tui {
             }
         }
         if !self.streaming_text.is_empty() {
-            lines.extend(crate::markdown::render(&self.streaming_text, &self.theme));
+            // Match finished assistant text: accent body + breathing room.
+            if lines.last().is_none_or(|l| !line_is_blank(l)) {
+                lines.push(Line::from(""));
+            }
+            lines.extend(crate::markdown::render_with_body(
+                &self.streaming_text,
+                &self.theme,
+                orange_fg,
+            ));
         }
         // Spinner while waiting / thinking without answer text. Skip when full
         // thinking body is already on screen (show_thinking on).
@@ -3612,6 +3760,18 @@ impl Tui {
                     dim,
                 ));
             } else {
+                if !self.pending_images.is_empty() {
+                    let n = self.pending_images.len();
+                    status.push(Span::styled(
+                        if n == 1 {
+                            "1 image attached".to_string()
+                        } else {
+                            format!("{n} images attached")
+                        },
+                        orange_fg.add_modifier(Modifier::BOLD),
+                    ));
+                    status.push(Span::styled(" · ", bold_dim));
+                }
                 status.push(Span::styled(
                     format!("{}/{}", self.provider, self.model),
                     dim,
@@ -4227,7 +4387,7 @@ fn enter_plain_select_mode(terminal: &mut DefaultTerminal, text: &str) -> Result
     );
     let text = sanitize_terminal_output(text);
     let _ = writeln!(out, "{text}");
-    let _ = writeln!(out, "\n======== end — press Enter to return ========\n");
+    let _ = writeln!(out, "\n======== end - press Enter to return ========\n");
     let _ = out.flush();
 
     // stdin is cooked again after disable_raw_mode; block until Enter.
@@ -4289,6 +4449,42 @@ mod terminal_output_tests {
         let input = "Grüße from 東京 🏔️\n\tcafé\n";
         assert_eq!(sanitize_terminal_output(input), input);
     }
+}
+
+/// Wire format for multimodal user turns on the agent command channel.
+fn encode_user_json_cmd(text: &str, images: &[llm::ImageBlock]) -> String {
+    let mut imgs = String::from("[");
+    for (i, img) in images.iter().enumerate() {
+        if i > 0 {
+            imgs.push(',');
+        }
+        imgs.push_str(&format!(
+            "{{\"media_type\":\"{}\",\"data\":\"{}\"}}",
+            escape_json_simple(&img.media_type),
+            escape_json_simple(&img.data_base64)
+        ));
+    }
+    imgs.push(']');
+    format!(
+        "__user_json__:{{\"text\":\"{}\",\"images\":{imgs}}}",
+        escape_json_simple(text)
+    )
+}
+
+fn escape_json_simple(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Best-effort clipboard write: Windows PowerShell first, then OSC 52.
@@ -4384,6 +4580,61 @@ mod clipboard_tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn encode_user_json_cmd_roundtrips_shape() {
+        let cmd = encode_user_json_cmd(
+            "see this",
+            &[llm::ImageBlock {
+                media_type: "image/png".into(),
+                data_base64: "Zm9v".into(),
+            }],
+        );
+        assert!(cmd.starts_with("__user_json__:"));
+        let json = cmd.trim_start_matches("__user_json__:");
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(v["text"], "see this");
+        assert_eq!(v["images"][0]["media_type"], "image/png");
+        assert_eq!(v["images"][0]["data"], "Zm9v");
+    }
+}
+
+#[cfg(test)]
+mod user_blocks_label_tests {
+    use super::*;
+
+    #[test]
+    fn display_label_covers_text_and_images() {
+        assert_eq!(llm::UserBlocks::text_only("hi").display_label(), "hi");
+        assert_eq!(
+            llm::UserBlocks {
+                text: String::new(),
+                images: vec![llm::ImageBlock {
+                    media_type: "image/png".into(),
+                    data_base64: "x".into(),
+                }],
+            }
+            .display_label(),
+            "[image]"
+        );
+        assert_eq!(
+            llm::UserBlocks {
+                text: "look".into(),
+                images: vec![
+                    llm::ImageBlock {
+                        media_type: "image/png".into(),
+                        data_base64: "a".into(),
+                    },
+                    llm::ImageBlock {
+                        media_type: "image/jpeg".into(),
+                        data_base64: "b".into(),
+                    },
+                ],
+            }
+            .display_label(),
+            "look\n[2 images]"
+        );
     }
 }
 
@@ -4483,7 +4734,7 @@ pub(crate) fn fuzzy_score(candidate: &str, query: &str) -> Option<i32> {
     if cand.starts_with(&q) {
         score += 40;
     }
-    // Between two matches the tighter one is the better guess — but only once
+    // Between two matches the tighter one is the better guess - but only once
     // the query says something. A bare `/` matches everything equally well, and
     // length is then the only differing term, which would silently re-sort the
     // whole command list by name length.
@@ -5610,6 +5861,10 @@ fn char_width(c: char) -> usize {
     } else {
         1
     }
+}
+
+fn line_is_blank(line: &Line<'_>) -> bool {
+    line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty())
 }
 
 fn display_width(s: &str) -> usize {

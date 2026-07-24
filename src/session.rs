@@ -214,6 +214,7 @@ pub fn list(sessions_dir: &str) -> Result<Vec<SessionSummary>, String> {
                         .first()
                         .and_then(|m| match &m.content {
                             crate::llm::Content::Text(t) => Some(t.clone()),
+                            crate::llm::Content::User(b) => Some(b.display_label()),
                             _ => None,
                         })
                         .unwrap_or_default(),
@@ -285,6 +286,31 @@ fn json_value_to_json(value: &serde_json::Value) -> String {
 fn message_to_json(msg: &Message) -> Result<String, String> {
     let content = match &msg.content {
         crate::llm::Content::Text(t) => format!("\"{}\"", json_escape(t)),
+        crate::llm::Content::User(blocks) => {
+            let mut parts = String::from("[");
+            let mut first = true;
+            if !blocks.text.is_empty() {
+                parts.push_str(&format!(
+                    "{{\"type\":\"text\",\"text\":\"{}\"}}",
+                    json_escape(&blocks.text)
+                ));
+                first = false;
+            }
+            for img in &blocks.images {
+                if !first {
+                    parts.push(',');
+                }
+                first = false;
+                // data_base64 is restricted alphabet; still escape for safety.
+                parts.push_str(&format!(
+                    "{{\"type\":\"image\",\"media_type\":\"{}\",\"data\":\"{}\"}}",
+                    json_escape(&img.media_type),
+                    json_escape(&img.data_base64)
+                ));
+            }
+            parts.push(']');
+            format!("{{\"type\":\"user_blocks\",\"parts\":{parts}}}")
+        }
         crate::llm::Content::ToolUse(tu) => {
             let input = if tu.input.trim().is_empty() {
                 serde_json::json!({})
@@ -385,6 +411,51 @@ fn message_from_json(val: &serde_json::Value) -> Result<Message, String> {
             .and_then(|v| v.as_str())
             .ok_or("no content type")?;
         match type_str {
+            "user_blocks" => {
+                let parts = o
+                    .get("parts")
+                    .and_then(|v| v.as_array())
+                    .ok_or("user_blocks missing parts")?;
+                let mut text = String::new();
+                let mut images = Vec::new();
+                for part in parts {
+                    let p = part.as_object().ok_or("user_blocks part not object")?;
+                    let pt = p
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .ok_or("user_blocks part missing type")?;
+                    match pt {
+                        "text" => {
+                            let t = p
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .ok_or("user_blocks text missing")?;
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(t);
+                        }
+                        "image" => {
+                            let media_type = p
+                                .get("media_type")
+                                .and_then(|v| v.as_str())
+                                .ok_or("image missing media_type")?
+                                .to_string();
+                            let data = p
+                                .get("data")
+                                .and_then(|v| v.as_str())
+                                .ok_or("image missing data")?
+                                .to_string();
+                            images.push(crate::llm::ImageBlock {
+                                media_type,
+                                data_base64: data,
+                            });
+                        }
+                        other => return Err(format!("unknown user_blocks part: {other}")),
+                    }
+                }
+                crate::llm::Content::User(crate::llm::UserBlocks { text, images })
+            }
             "tool_use" => {
                 let name = o
                     .get("name")
@@ -901,6 +972,47 @@ mod tests {
         assert!(save(&dir_str, &session).is_err());
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_roundtrip_user_blocks_with_image() {
+        let test_id = format!("test-{}", new_id());
+        let dir = std::env::temp_dir().join(format!("cairn-test-session-img-{}", new_id()));
+        let dir_str = dir.to_string_lossy().to_string();
+        fs::create_dir_all(&dir).unwrap();
+        let session = Session {
+            id: test_id.clone(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: crate::llm::Content::User(crate::llm::UserBlocks {
+                    text: "what is this?".into(),
+                    images: vec![crate::llm::ImageBlock {
+                        media_type: "image/png".into(),
+                        data_base64: "Zm9vYmFy".into(),
+                    }],
+                }),
+            }],
+            model: "mock".into(),
+            provider: "mock".into(),
+            tokens_in: 1,
+            tokens_out: 0,
+            created_at: 1,
+            updated_at: 2,
+        };
+        save(&dir_str, &session).unwrap();
+        let loaded = load(&dir_str, &test_id).unwrap();
+        match &loaded.messages[0].content {
+            crate::llm::Content::User(b) => {
+                assert_eq!(b.text, "what is this?");
+                assert_eq!(b.images.len(), 1);
+                assert_eq!(b.images[0].media_type, "image/png");
+                assert_eq!(b.images[0].data_base64, "Zm9vYmFy");
+            }
+            _ => panic!("expected User blocks"),
+        }
+        let listed = list(&dir_str).unwrap();
+        assert!(listed[0].summary.contains("image"));
         let _ = fs::remove_dir_all(&dir);
     }
 
