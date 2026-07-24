@@ -189,7 +189,10 @@ pub fn chatgpt_account_id_from_jwt(jwt: &str) -> Option<String> {
     let val = json::parse(&text).ok()?;
     let obj = val.as_object()?;
     // Nested under https://api.openai.com/auth in ChatGPT id tokens.
-    if let Some(auth) = obj.get("https://api.openai.com/auth").and_then(|v| v.as_object()) {
+    if let Some(auth) = obj
+        .get("https://api.openai.com/auth")
+        .and_then(|v| v.as_object())
+    {
         if let Some(id) = auth
             .get("chatgpt_account_id")
             .and_then(|v| v.as_str())
@@ -506,8 +509,7 @@ pub fn format_credits_summary(details: &ResetCreditsDetails, source: AuthSource)
         }
     }
     lines.push(
-        "Commands: `/reset` list · `/reset apply` redeem next · `/reset apply <credit_id>`"
-            .into(),
+        "Commands: `/reset` list · `/reset apply` redeem next · `/reset apply <credit_id>`".into(),
     );
     lines.join("\n")
 }
@@ -648,10 +650,7 @@ mod tests {
         let payload =
             "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoid3MtOSJ9fQ";
         let jwt = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
-        assert_eq!(
-            chatgpt_account_id_from_jwt(&jwt).as_deref(),
-            Some("ws-9")
-        );
+        assert_eq!(chatgpt_account_id_from_jwt(&jwt).as_deref(), Some("ws-9"));
     }
 
     #[test]
