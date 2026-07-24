@@ -13,7 +13,7 @@ use ratatui::{
         execute,
     },
     layout::{Constraint, Direction, Layout, Position},
-    style::Modifier,
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Paragraph, Wrap},
     DefaultTerminal, Frame,
@@ -742,12 +742,16 @@ impl Tui {
         }
     }
 
+    /// Max transcript scroll offset from the last paint (0 = everything fits).
+    fn transcript_max_off(&self) -> usize {
+        self.last_body_wrapped
+            .saturating_sub(self.last_body_h.max(1))
+    }
+
     /// Scroll the transcript by `delta` wrapped lines (negative = up / older).
     /// Mirrors videre's rowoff model: free scroll until the bottom, then re-follow.
     fn scroll_transcript(&mut self, delta: isize) {
-        let max_off = self
-            .last_body_wrapped
-            .saturating_sub(self.last_body_h.max(1));
+        let max_off = self.transcript_max_off();
         if max_off == 0 {
             self.transcript_rowoff = 0;
             self.transcript_follow = true;
@@ -765,6 +769,27 @@ impl Tui {
         };
         self.transcript_rowoff = next;
         self.transcript_follow = next >= max_off;
+    }
+
+    /// Previous entry in the local prompt history (shell-style).
+    fn history_prev(&mut self) {
+        if self.hist_idx > 0 {
+            self.hist_idx -= 1;
+            self.input_buf = self.history[self.hist_idx].clone();
+            self.cursor = self.input_buf.len();
+        }
+    }
+
+    /// Next entry in the local prompt history (shell-style).
+    fn history_next(&mut self) {
+        if self.hist_idx < self.history.len().saturating_sub(1) {
+            self.hist_idx += 1;
+            self.input_buf = self.history[self.hist_idx].clone();
+        } else {
+            self.hist_idx = self.history.len();
+            self.input_buf.clear();
+        }
+        self.cursor = self.input_buf.len();
     }
 
     fn scroll_page(&mut self, down: bool) {
@@ -802,12 +827,13 @@ impl Tui {
         }
 
         // Transcript scroll (videre-style Page / Ctrl-U/D + arrows with Ctrl).
-        // Skip when a picker owns navigation keys.
+        // Skip when a list picker owns navigation keys. Slash ghost completion is
+        // inline (not a multi-line list), so page/wheel scroll still works while
+        // typing `/…`. Bare Up/Down still cycle slash candidates first.
         let picker_nav = self.show_model_picker
             || self.show_provider_picker
             || self.show_theme_picker
             || self.show_session_picker
-            || self.show_command_picker
             || self.show_permission_prompt
             || self.confirm_remove_provider.is_some()
             || self.confirm_history_provider.is_some();
@@ -831,6 +857,19 @@ impl Tui {
                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     self.scroll_half_page(true);
+                    return true;
+                }
+                // Readline-style history that works even when Up/Down scroll the chat.
+                KeyCode::Char('p') | KeyCode::Char('P')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.history_prev();
+                    return true;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.history_next();
                     return true;
                 }
                 KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1045,11 +1084,14 @@ impl Tui {
                     }
                     return true;
                 }
-                if self.hist_idx > 0 {
-                    self.hist_idx -= 1;
-                    self.input_buf = self.history[self.hist_idx].clone();
-                    self.cursor = self.input_buf.len();
+                // Windows Terminal (and others) on the alt screen often send the
+                // mouse wheel as bare Up/Down. Prefer transcript scroll whenever
+                // the chat overflows so wheel does not walk prompt history.
+                if self.transcript_max_off() > 0 {
+                    self.scroll_transcript(-3);
+                    return true;
                 }
+                self.history_prev();
                 true
             }
             KeyCode::Down => {
@@ -1088,14 +1130,11 @@ impl Tui {
                     }
                     return true;
                 }
-                if self.hist_idx < self.history.len().saturating_sub(1) {
-                    self.hist_idx += 1;
-                    self.input_buf = self.history[self.hist_idx].clone();
-                } else {
-                    self.hist_idx = self.history.len();
-                    self.input_buf.clear();
+                if self.transcript_max_off() > 0 {
+                    self.scroll_transcript(3);
+                    return true;
                 }
-                self.cursor = self.input_buf.len();
+                self.history_next();
                 true
             }
             KeyCode::Left => {
@@ -1637,7 +1676,7 @@ impl Tui {
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /auth /clear /compact /copy /cost /delete /exit /help /mcp /model /mouse /provider /resume /save /select /sessions /skills /suggestions /theme /thinking\nExtensibility: skills (SKILL.md) + MCP stdio (config mcp.servers or mcpServers)\n/skills · /mcp — list skills and MCP servers\nMouse: wheel scrolls · Shift+drag selects (terminal-native) · /mouse off disables capture\n/select [last|all] or Ctrl+O — plain-text view if you need a full select dump\n/copy or Ctrl+Y — copy last assistant message to clipboard\n/thinking [on|off] · /suggestions [on|off]\nTab completes slash commands · Scroll: PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End\nSounds: CAIRN_SOUND=0 to mute · /provider xai — OAuth; /auth login xai".into(),
+                    content: "Commands: /auth /clear /compact /copy /cost /delete /exit /help /mcp /model /mouse /provider /resume /save /select /sessions /skills /suggestions /theme /thinking\nExtensibility: skills (SKILL.md) + MCP stdio (config mcp.servers or mcpServers)\n/skills · /mcp — list skills and MCP servers\nMouse: wheel scrolls · Shift+drag selects (terminal-native) · /mouse off disables capture\n/select [last|all] or Ctrl+O — plain-text view if you need a full select dump\n/copy or Ctrl+Y — copy last assistant message to clipboard\n/thinking [on|off] · /suggestions [on|off]\nTab completes slash commands · Scroll: wheel · PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End (Up/Down scroll when chat overflows; Ctrl+P/N for prompt history)\nSounds: CAIRN_SOUND=0 to mute · /provider xai — OAuth; /auth login xai".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
             }
@@ -3253,23 +3292,32 @@ impl Tui {
         );
 
         // Scroll position hint when not pinned to bottom (videre shows %).
+        // Must fully reset cell style (incl. BOLD from the welcome box border):
+        // ratatui patches styles, so a dim-only overlay over accent BOLD keeps
+        // bold and looks heavier / glitched where the % chip touches the frame.
         if !self.transcript_follow && max_off > 0 {
             let pct = (body_scroll * 100) / max_off;
             let hint = format!(" ↑ {pct}% · PgUp/PgDn · wheel · Ctrl+U/D ");
+            let hint_w = display_width(&hint) as u16;
             let hx = body_area
                 .x
-                .saturating_add(body_area.width.saturating_sub(hint.len() as u16 + 1));
+                .saturating_add(body_area.width.saturating_sub(hint_w.saturating_add(1)));
             let hy = body_area.y;
-            if body_area.width > 8 {
+            if body_area.width > 8 && hint_w > 0 {
+                // Style::reset clears bold/colors from underlying cells; patch
+                // muted fg so the chip matches the footer without inheriting
+                // the orange box border weight.
+                let hint_style = Style::reset().patch(dim);
                 f.render_widget(
-                    Paragraph::new(Span::styled(hint, dim)),
+                    Paragraph::new(Span::styled(hint, hint_style)),
                     ratatui::layout::Rect {
                         x: hx,
                         y: hy,
-                        width: body_area
-                            .width
-                            .saturating_sub(hx.saturating_sub(body_area.x))
-                            .min(40),
+                        width: hint_w.min(
+                            body_area
+                                .width
+                                .saturating_sub(hx.saturating_sub(body_area.x)),
+                        ),
                         height: 1,
                     },
                 );
@@ -4104,6 +4152,69 @@ mod exit_tests {
                 "{command} should request normal event-loop termination"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod scroll_history_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn bare_up_scrolls_when_transcript_overflows_instead_of_history() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.history = vec!["first".into(), "second".into()];
+        tui.hist_idx = tui.history.len();
+        // Simulate a painted frame where the body is taller than the viewport.
+        tui.last_body_wrapped = 100;
+        tui.last_body_h = 20;
+        tui.transcript_follow = true;
+        tui.transcript_rowoff = 80;
+
+        tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        assert!(
+            !tui.transcript_follow,
+            "Up should leave follow mode when content overflows"
+        );
+        assert!(
+            tui.transcript_rowoff < 80,
+            "Up should move rowoff toward older content"
+        );
+        assert!(
+            tui.input_buf.is_empty(),
+            "Up must not load prompt history while chat can scroll"
+        );
+    }
+
+    #[test]
+    fn bare_up_uses_history_when_transcript_fits() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.history = vec!["prior prompt".into()];
+        tui.hist_idx = tui.history.len();
+        tui.last_body_wrapped = 10;
+        tui.last_body_h = 40;
+        tui.transcript_follow = true;
+
+        tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        assert_eq!(tui.input_buf, "prior prompt");
+        assert_eq!(tui.hist_idx, 0);
+    }
+
+    #[test]
+    fn ctrl_p_always_walks_prompt_history() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.history = vec!["a".into(), "b".into()];
+        tui.hist_idx = tui.history.len();
+        tui.last_body_wrapped = 100;
+        tui.last_body_h = 20;
+        tui.transcript_follow = true;
+
+        tui.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+        assert_eq!(tui.input_buf, "b");
+        assert_eq!(tui.hist_idx, 1);
     }
 }
 
