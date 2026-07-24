@@ -23,6 +23,7 @@ pub fn new_live_mirror() -> LiveMirror {
     Arc::new(Mutex::new(LiveSnapshot::default()))
 }
 
+#[derive(Clone)]
 pub struct Session {
     pub id: String,
     pub model: String,
@@ -185,6 +186,101 @@ pub fn resolve_id(sessions_dir: &str, query: &str) -> Result<String, String> {
             ))
         }
     }
+}
+
+/// Error context accompanying a crash log.
+pub struct CrashInfo {
+    pub error: String,
+    /// Present only when `RUST_BACKTRACE` asked for one.
+    pub backtrace: Option<String>,
+}
+
+/// Prefix distinguishing a crash transcript from an ordinary session.
+const CRASH_ID_PREFIX: &str = "crash-";
+/// Extension of the sidecar holding the error context.
+///
+/// `.` is not a legal character in a session id, so `list` skips these while
+/// still returning the transcripts beside them.
+const CRASH_INFO_EXT: &str = ".info";
+
+/// Writes a crash log: the transcript, plus a sidecar recording what ended the
+/// run.
+///
+/// The transcript is an ordinary session file, so `/resume` can restore it with
+/// no additional code — the point of a crash log is to not lose the
+/// conversation. Error context goes in a sidecar rather than the session JSON
+/// so the transcript stays loadable by the existing reader.
+///
+/// Returns the transcript path so the caller can tell the user where it went.
+pub fn write_crash_log(
+    crash_dir: &str,
+    session: &Session,
+    crash: &CrashInfo,
+) -> Result<String, String> {
+    let id = format!("{CRASH_ID_PREFIX}{}", session.id);
+    validate_id(&id)?;
+    let crashed = Session {
+        id: id.clone(),
+        ..(*session).clone()
+    };
+    // Reuse `save` for the directory mode, atomic rename, and 0600 file mode:
+    // a transcript contains whatever the user typed and whatever tools read.
+    save(crash_dir, &crashed)?;
+
+    let mut info = format!(
+        "{{\"session_id\":\"{}\",\"error\":\"{}\",\"timestamp\":{}",
+        json_escape(&id),
+        json_escape(&crash.error),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    );
+    if let Some(backtrace) = &crash.backtrace {
+        info.push_str(&format!(",\"backtrace\":\"{}\"", json_escape(backtrace)));
+    }
+    info.push('}');
+
+    let dir = PathBuf::from(crash_dir);
+    let info_path = dir.join(format!("{id}{CRASH_INFO_EXT}"));
+    let temp_path = dir.join(format!(".{id}.{}.info.tmp", new_id()));
+    let write_result = (|| -> Result<(), String> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|e| format!("create temporary crash info: {e}"))?;
+        file.write_all(info.as_bytes())
+            .map_err(|e| format!("write crash info: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("sync crash info: {e}"))?;
+        drop(file);
+        fs::rename(&temp_path, &info_path).map_err(|e| format!("replace crash info: {e}"))
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result?;
+
+    Ok(dir.join(&id).to_string_lossy().into_owned())
+}
+
+/// Reads the error recorded alongside a crash transcript, if the sidecar is
+/// present and readable. A missing sidecar is not an error: the transcript is
+/// the part worth keeping.
+pub fn read_crash_error(crash_dir: &str, id: &str) -> Option<String> {
+    let path = PathBuf::from(crash_dir).join(format!("{id}{CRASH_INFO_EXT}"));
+    let raw = fs::read_to_string(path).ok()?;
+    crate::json::parse(&raw)
+        .ok()?
+        .get("error")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
 }
 
 pub fn list(sessions_dir: &str) -> Result<Vec<SessionSummary>, String> {
@@ -521,6 +617,105 @@ mod tests {
         let a = new_id();
         let b = new_id();
         assert_ne!(a, b);
+    }
+
+    fn sample_session(id: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            model: "claude-sonnet-5".into(),
+            provider: "anthropic".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: crate::llm::Content::Text("what broke".into()),
+            }],
+            tokens_in: 12,
+            tokens_out: 34,
+            created_at: 1,
+            updated_at: 2,
+        }
+    }
+
+    #[test]
+    fn crash_log_transcript_is_a_resumable_session() {
+        // The point of writing a transcript rather than only an error report:
+        // /resume must restore the conversation with no extra machinery.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_string_lossy().to_string();
+        let session = sample_session(&format!("test-{}", new_id()));
+        let crash = CrashInfo {
+            error: "provider returned HTTP 500".into(),
+            backtrace: None,
+        };
+
+        let path = write_crash_log(&dir, &session, &crash).unwrap();
+        assert!(std::path::Path::new(&path).exists(), "{path}");
+
+        let id = format!("crash-{}", session.id);
+        let restored = load(&dir, &id).expect("crash transcript must load");
+        assert_eq!(restored.messages.len(), 1);
+        assert_eq!(restored.model, session.model);
+        assert_eq!(restored.tokens_in, 12);
+        assert_eq!(read_crash_error(&dir, &id).as_deref(), Some(&*crash.error));
+    }
+
+    #[test]
+    fn crash_log_sidecar_is_not_listed_as_a_session() {
+        // `.` is illegal in a session id, so the sidecar must be skipped while
+        // the transcript beside it still appears.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_string_lossy().to_string();
+        let session = sample_session(&format!("test-{}", new_id()));
+        write_crash_log(
+            &dir,
+            &session,
+            &CrashInfo {
+                error: "boom".into(),
+                backtrace: None,
+            },
+        )
+        .unwrap();
+
+        let ids: Vec<String> = list(&dir).unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(ids.len(), 1, "sidecar must not be listed: {ids:?}");
+        assert!(ids[0].starts_with(CRASH_ID_PREFIX), "{ids:?}");
+    }
+
+    #[test]
+    fn crash_log_escapes_error_text_and_keeps_backtrace_optional() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_string_lossy().to_string();
+        let session = sample_session(&format!("test-{}", new_id()));
+        // Quotes, newlines and a control character: an unescaped sidecar would
+        // be unparseable, losing the error the log exists to record.
+        let error = "bad \"quoted\" thing\nline two\u{1b}[0m";
+        let path = write_crash_log(
+            &dir,
+            &session,
+            &CrashInfo {
+                error: error.into(),
+                backtrace: Some("frame one\nframe two".into()),
+            },
+        )
+        .unwrap();
+        assert!(!path.is_empty());
+
+        let id = format!("crash-{}", session.id);
+        let raw =
+            fs::read_to_string(std::path::PathBuf::from(&dir).join(format!("{id}.info"))).unwrap();
+        let parsed = crate::json::parse(&raw).expect("sidecar must be valid JSON");
+        assert_eq!(parsed.get("error").and_then(|v| v.as_str()), Some(error));
+        assert_eq!(
+            parsed.get("backtrace").and_then(|v| v.as_str()),
+            Some("frame one\nframe two")
+        );
+        assert!(parsed.get("timestamp").and_then(|v| v.as_u64()).is_some());
+    }
+
+    #[test]
+    fn crash_error_is_none_when_the_sidecar_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_string_lossy().to_string();
+        assert_eq!(read_crash_error(&dir, "crash-does-not-exist"), None);
     }
 
     #[test]

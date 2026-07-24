@@ -373,6 +373,22 @@ fn migrate_plaintext_keys_in_file(path: &std::path::Path) -> Result<(), String> 
     Ok(())
 }
 
+/// Directory for crash logs: a transcript plus the error that ended the run.
+///
+/// Kept beside `sessions/` rather than inside it so a crash does not appear in
+/// `/sessions`, and resolved the same way — `HOME`, then `USERPROFILE`, so
+/// Windows does not fall through to a relative path and drop transcripts into
+/// whatever directory the agent happened to be launched from.
+pub fn crash_logs_dir() -> String {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join(".config/cairn-code/crash-logs")
+        .to_string_lossy()
+        .to_string()
+}
+
 pub fn sessions_dir() -> String {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
