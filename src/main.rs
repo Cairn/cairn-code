@@ -14,29 +14,74 @@ fn main() -> ExitCode {
     let mut is_print_mode = false;
     let mut initial_prompt: Option<String> = None;
 
-    for arg in std::env::args().skip(1) {
-        match arg.as_str() {
-            "-p" | "--print" => is_print_mode = true,
-            "-h" | "--help" => {
-                print_help(version);
-                return ExitCode::SUCCESS;
+    let raw_args: Vec<String> = std::env::args().collect();
+    let is_exec_mode = raw_args.len() > 1 && raw_args[1] == "exec";
+    let mut exec_cwd: Option<String> = None;
+    let mut exec_resume: Option<String> = None;
+    let mut exec_init_session_id: Option<String> = None;
+
+    if is_exec_mode {
+        let mut i = 2;
+        while i < raw_args.len() {
+            match raw_args[i].as_str() {
+                "-C" | "--cwd" => {
+                    if i + 1 < raw_args.len() {
+                        exec_cwd = Some(raw_args[i + 1].clone());
+                        i += 1;
+                    }
+                }
+                "--resume" => {
+                    if i + 1 < raw_args.len() {
+                        exec_resume = Some(raw_args[i + 1].clone());
+                        i += 1;
+                    }
+                }
+                "--init-session-id" => {
+                    if i + 1 < raw_args.len() {
+                        exec_init_session_id = Some(raw_args[i + 1].clone());
+                        i += 1;
+                    }
+                }
+                "--input-format" | "--output-format" | "--auto" => {
+                    if i + 1 < raw_args.len() {
+                        i += 1;
+                    }
+                }
+                "--no-completion-gate" => {}
+                _ => {}
             }
-            "-v" | "--version" => {
-                println!("cairn-code {version}");
-                return ExitCode::SUCCESS;
-            }
-            arg if !arg.starts_with('-') => {
-                if initial_prompt.is_some() {
-                    eprintln!("Error: unexpected positional argument '{arg}'");
-                    eprintln!("Pass the prompt as one quoted argument. See '--help' for usage.");
+            i += 1;
+        }
+        if let Some(ref dir) = exec_cwd {
+            let _ = std::env::set_current_dir(dir);
+        }
+    } else {
+        for arg in std::env::args().skip(1) {
+            match arg.as_str() {
+                "-p" | "--print" => is_print_mode = true,
+                "-h" | "--help" => {
+                    print_help(version);
+                    return ExitCode::SUCCESS;
+                }
+                "-v" | "--version" => {
+                    println!("cairn-code {version}");
+                    return ExitCode::SUCCESS;
+                }
+                arg if !arg.starts_with('-') => {
+                    if initial_prompt.is_some() {
+                        eprintln!("Error: unexpected positional argument '{arg}'");
+                        eprintln!(
+                            "Pass the prompt as one quoted argument. See '--help' for usage."
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    initial_prompt = Some(arg.to_string());
+                }
+                _ => {
+                    eprintln!("Error: unknown option '{arg}'");
+                    eprintln!("See '--help' for usage.");
                     return ExitCode::FAILURE;
                 }
-                initial_prompt = Some(arg.to_string());
-            }
-            _ => {
-                eprintln!("Error: unknown option '{arg}'");
-                eprintln!("See '--help' for usage.");
-                return ExitCode::FAILURE;
             }
         }
     }
@@ -92,6 +137,152 @@ fn main() -> ExitCode {
     let work_dir = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| ".".to_string());
+
+    if is_exec_mode {
+        let mut input_line = String::new();
+        if let Err(error) = std::io::stdin().read_line(&mut input_line) {
+            eprintln!("Error: failed to read input event from stdin: {error}");
+            return ExitCode::FAILURE;
+        }
+        let prompt = match serde_json::from_str::<serde_json::Value>(&input_line) {
+            Ok(v) => v
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or(&input_line)
+                .to_string(),
+            Err(_) => input_line.trim().to_string(),
+        };
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let session_id = exec_resume
+            .or(exec_init_session_id)
+            .unwrap_or_else(|| format!("cairn-session-{now_ms}"));
+        let run_id = format!("run-{now_ms}");
+
+        println!(
+            "{}",
+            serde_json::json!({
+                "schemaVersion": 2,
+                "type": "run_start",
+                "runId": run_id,
+                "sessionId": session_id,
+            })
+        );
+
+        let (event_tx, event_rx) = mpsc::channel::<AgentEvent>();
+        let (perm_tx, perm_rx) = mpsc::channel::<String>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel2 = cancel.clone();
+        let perm_cancel = cancel.clone();
+
+        thread::spawn(move || {
+            while !perm_cancel.load(Ordering::Relaxed) {
+                let _ = perm_tx.send("allow".to_string());
+                thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+
+        let mut agent = Agent::new_with_skills(
+            chosen_provider,
+            p_model,
+            tool_registry,
+            cfg,
+            skills_for_agent,
+        );
+
+        thread::spawn(move || {
+            let _ = agent.run(&prompt, event_tx, &cancel2, &perm_rx);
+        });
+
+        let mut final_text = String::new();
+        while let Ok(event) = event_rx.recv() {
+            match event {
+                AgentEvent::Text(t) | AgentEvent::Thinking(t) => {
+                    final_text.push_str(&t);
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schemaVersion": 2,
+                            "type": "text",
+                            "runId": run_id,
+                            "sessionId": session_id,
+                            "text": t,
+                        })
+                    );
+                }
+                AgentEvent::ToolUse(name, input) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schemaVersion": 2,
+                            "type": "tool_use",
+                            "runId": run_id,
+                            "sessionId": session_id,
+                            "name": name,
+                            "text": input,
+                        })
+                    );
+                }
+                AgentEvent::ToolResult(_id, name, res) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schemaVersion": 2,
+                            "type": "tool_result",
+                            "runId": run_id,
+                            "sessionId": session_id,
+                            "name": name,
+                            "text": res,
+                        })
+                    );
+                }
+                AgentEvent::Error(err) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schemaVersion": 2,
+                            "type": "error",
+                            "runId": run_id,
+                            "sessionId": session_id,
+                            "message": err,
+                        })
+                    );
+                }
+                AgentEvent::Done => break,
+                _ => {}
+            }
+        }
+
+        cancel.store(true, Ordering::Relaxed);
+
+        println!(
+            "{}",
+            serde_json::json!({
+                "schemaVersion": 2,
+                "type": "final",
+                "runId": run_id,
+                "sessionId": session_id,
+                "text": final_text,
+            })
+        );
+
+        println!(
+            "{}",
+            serde_json::json!({
+                "schemaVersion": 2,
+                "type": "run_end",
+                "runId": run_id,
+                "sessionId": session_id,
+                "status": "completed",
+                "exitCode": 0,
+            })
+        );
+
+        return ExitCode::SUCCESS;
+    }
 
     if is_print_mode {
         let prompt = match initial_prompt {
