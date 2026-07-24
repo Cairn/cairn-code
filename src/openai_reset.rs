@@ -111,10 +111,7 @@ fn auth_from_cairn_oauth() -> Option<ChatGptAuth> {
 }
 
 fn oauth_account_id_from_keyring(provider: &str) -> Option<String> {
-    let raw = keyring::Entry::new("cairn-code", &format!("oauth:{provider}"))
-        .ok()?
-        .get_password()
-        .ok()?;
+    let raw = oauth::oauth_entry(provider).ok()?.get_password().ok()?;
     let val = json::parse(&raw).ok()?;
     let id = val
         .as_object()?
