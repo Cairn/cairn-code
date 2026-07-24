@@ -9,6 +9,13 @@ use std::time::Duration;
 const MAX_OUTPUT_CHARS: usize = 12_000;
 const HEAD_CHARS: usize = 6_000;
 const TAIL_CHARS: usize = 4_000;
+/// Wall-clock cap applied when the model does not ask for one, matching the
+/// reasoning behind `git_tool::GIT_TIMEOUT`: a command that never returns —
+/// a stuck network call, a server left in the foreground, a prompt waiting on
+/// input that can no longer arrive — must not hold the agent forever. Long
+/// builds and test suites finish well inside this, and a command that needs
+/// more can still ask by passing `timeout`.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub struct ShellTool;
 
@@ -58,11 +65,7 @@ impl Tool for ShellTool {
         let mut command = Command::new(shell);
         command.arg(flag).arg(&cmd);
 
-        let options = RunOptions {
-            timeout: timeout_ms.map(Duration::from_millis),
-            head_chars: HEAD_CHARS,
-            tail_chars: TAIL_CHARS,
-        };
+        let options = run_options_for(timeout_ms);
         let result = match process_runner::run(command, &options, Some(cancel)) {
             Ok(result) => result,
             Err(error) => return Err(format_run_error(error, timeout_ms)),
@@ -106,6 +109,19 @@ impl Tool for ShellTool {
             // Prefix so the TUI marks it red; keep full body so the model can recover.
             Err(format!("exit code {code}\n{result}"))
         }
+    }
+}
+
+/// Run options for a shell invocation.
+///
+/// Separated from `execute_with_cancel` so the timeout policy can be asserted
+/// without spawning a process: an omitted `timeout` must still carry a
+/// deadline, and an explicit one must win even when it exceeds the default.
+fn run_options_for(timeout_ms: Option<u64>) -> RunOptions {
+    RunOptions {
+        timeout: Some(timeout_ms.map_or(DEFAULT_TIMEOUT, Duration::from_millis)),
+        head_chars: HEAD_CHARS,
+        tail_chars: TAIL_CHARS,
     }
 }
 
@@ -202,6 +218,25 @@ mod tests {
         let out = tool.execute(&input).unwrap();
         assert!(out.contains("hi"), "unexpected output: {out}");
         assert!(out.contains("(exit code 0)"), "missing exit footer: {out}");
+    }
+
+    #[test]
+    fn omitting_timeout_applies_the_default_rather_than_running_unbounded() {
+        // The model usually omits `timeout`. Previously that meant no deadline
+        // at all, so a command that never returns held the agent until the
+        // user noticed. Assert the option carries a deadline either way.
+        let with_default = run_options_for(None);
+        assert_eq!(with_default.timeout, Some(DEFAULT_TIMEOUT));
+
+        // An explicit value still wins, including one longer than the default.
+        assert_eq!(
+            run_options_for(Some(1_500)).timeout,
+            Some(Duration::from_millis(1_500))
+        );
+        assert_eq!(
+            run_options_for(Some(3_600_000)).timeout,
+            Some(Duration::from_millis(3_600_000))
+        );
     }
 
     #[test]
