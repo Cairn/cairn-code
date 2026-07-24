@@ -3812,7 +3812,8 @@ impl Tui {
 
         let width = area.width as usize;
         let body_wrapped = total_wrapped(&lines, width);
-        // Normal composer uses a separate 3-row Block + status line in chrome.
+        // Normal composer uses a separate Block + status line in chrome.
+        // Height grows with soft-wrapped input (like Claude Code / Grok Build).
         let use_block_composer = cursor_pos == Some((u16::MAX, usize::MAX));
         let status_h = if use_block_composer {
             total_wrapped(&chrome, width).max(1) as u16
@@ -3825,10 +3826,50 @@ impl Tui {
         } else {
             total_wrapped(&chrome, width).max(1)
         };
+        // Inner text width: full terminal width minus rounded box borders.
+        let composer_inner_w = width.saturating_sub(2).max(1);
+        let composer_h: u16 = if use_block_composer {
+            // Preview mark + buffer (+ idle hint or slash ghost) for height.
+            let mark = "> ";
+            let show_idle_hint = self.input_buf.is_empty()
+                && matches!(self.state, State::Idle)
+                && self.idle_suggestion.is_some()
+                && !self.show_permission_prompt
+                && !self.show_recovery_prompt
+                && !self.awaiting_api_key;
+            let mut measure = String::from(mark);
+            let mut caret_prefix = String::from(mark);
+            if show_idle_hint {
+                measure.push_str(self.idle_suggestion.as_deref().unwrap_or(""));
+            } else {
+                measure.push_str(&self.input_buf);
+                let cur = self.cursor.min(self.input_buf.len());
+                caret_prefix.push_str(&self.input_buf[..cur]);
+                if self.cursor >= self.input_buf.len() {
+                    if let Some(cmd) = self.selected_slash_completion() {
+                        if let Some(suffix) = slash_ghost_suffix(&self.input_buf, cmd) {
+                            measure.push_str(&suffix);
+                        }
+                    }
+                }
+            }
+            // Grow for wrapped text and for the caret row (full-width lines park
+            // the caret on the next row).
+            let content_rows = wrap_row_count(&measure, composer_inner_w)
+                .max(cursor_xy_in_wrap(&caret_prefix, composer_inner_w).1 as usize + 1);
+            // +2 for top/bottom borders. Keep at least one transcript row + status.
+            let max_composer = (area.height as usize)
+                .saturating_sub(1)
+                .saturating_sub(status_h as usize)
+                .max(3);
+            ((content_rows + 2).clamp(3, max_composer)) as u16
+        } else {
+            0
+        };
         // Keep room for transcript; cap chrome so pickers cannot hide all output.
-        let composer_h: u16 = if use_block_composer { 3 } else { 0 };
         let max_chrome = (area.height as usize)
-            .saturating_sub(3)
+            .saturating_sub(composer_h as usize)
+            .saturating_sub(1)
             .min((area.height as usize).saturating_mul(2) / 3)
             .max(1);
         let chrome_h = if use_block_composer {
@@ -3921,8 +3962,22 @@ impl Tui {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(orange_fg);
+            let inner_w = composer_area.width.saturating_sub(2).max(1) as usize;
+            let inner_h = composer_area.height.saturating_sub(2).max(1) as usize;
+            // Caret is after mark + text before the cursor (idle hint has no caret edit).
+            let caret_prefix = if show_idle_hint {
+                mark.to_string()
+            } else {
+                format!("{mark}{before}")
+            };
+            let (cx, cy) = cursor_xy_in_wrap(&caret_prefix, inner_w);
+            // Keep the caret row visible when content is taller than the box cap.
+            let scroll_y = (cy as usize).saturating_sub(inner_h.saturating_sub(1));
             f.render_widget(
-                Paragraph::new(Line::from(spans)).block(block),
+                Paragraph::new(Line::from(spans))
+                    .block(block)
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll_y as u16, 0)),
                 composer_area,
             );
             f.render_widget(
@@ -3931,11 +3986,16 @@ impl Tui {
             );
 
             // Caret inside the block content area (one cell in from borders).
-            let x = composer_area.x.saturating_add(1).saturating_add(
-                (display_width(mark) + display_width(before))
-                    .min(composer_area.width.saturating_sub(3) as usize) as u16,
+            let x = composer_area.x.saturating_add(1).saturating_add(cx);
+            let y = composer_area
+                .y
+                .saturating_add(1)
+                .saturating_add(cy.saturating_sub(scroll_y as u16));
+            let y = y.min(
+                composer_area
+                    .y
+                    .saturating_add(composer_area.height.saturating_sub(2).max(1)),
             );
-            let y = composer_area.y.saturating_add(1);
             f.set_cursor_position(Position { x, y });
         } else {
             f.render_widget(
@@ -5871,6 +5931,54 @@ fn display_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 
+/// Rows needed to show `s` soft-wrapped to `width` columns (`\n` forces a break).
+fn wrap_row_count(s: &str, width: usize) -> usize {
+    let w = width.max(1);
+    // `split('\n')` yields at least one segment (including empty string).
+    s.split('\n')
+        .map(|line| {
+            let dw = display_width(line);
+            if dw == 0 {
+                1
+            } else {
+                (dw + w - 1) / w
+            }
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
+/// Caret column/row inside soft-wrapped text of `width` columns, when the caret
+/// sits at the end of `prefix` (text before the caret, including any prompt mark).
+fn cursor_xy_in_wrap(prefix: &str, width: usize) -> (u16, u16) {
+    let w = width.max(1);
+    let mut row = 0usize;
+    let mut col = 0usize;
+    for c in prefix.chars() {
+        if c == '\n' {
+            row += 1;
+            col = 0;
+            continue;
+        }
+        let cw = char_width(c);
+        if cw == 0 {
+            continue;
+        }
+        if col + cw > w {
+            row += 1;
+            col = 0;
+        }
+        col += cw;
+        // Filled the line: next character starts on the following row; park the
+        // caret there so it stays visible after a full-width line.
+        if col >= w {
+            row += 1;
+            col = 0;
+        }
+    }
+    (col as u16, row as u16)
+}
+
 /// Pad or truncate `s` to exactly `width` terminal columns (display width).
 fn pad_to_display_width(s: &str, width: usize) -> String {
     let dw = display_width(s);
@@ -5983,6 +6091,42 @@ fn total_wrapped(lines: &[Line], width: usize) -> usize {
             }
         })
         .sum()
+}
+
+#[cfg(test)]
+mod composer_wrap_tests {
+    use super::*;
+
+    #[test]
+    fn wrap_row_count_grows_with_width() {
+        assert_eq!(wrap_row_count("", 10), 1);
+        assert_eq!(wrap_row_count("hello", 10), 1);
+        assert_eq!(wrap_row_count("0123456789", 10), 1);
+        assert_eq!(wrap_row_count("0123456789A", 10), 2);
+        assert_eq!(wrap_row_count("line1\nline2", 40), 2);
+        assert_eq!(wrap_row_count("abcdefghijabcdefghij", 10), 2);
+    }
+
+    #[test]
+    fn cursor_xy_tracks_soft_wrap() {
+        assert_eq!(cursor_xy_in_wrap("", 10), (0, 0));
+        assert_eq!(cursor_xy_in_wrap("hi", 10), (2, 0));
+        // Full line parks caret on the next row.
+        assert_eq!(cursor_xy_in_wrap("0123456789", 10), (0, 1));
+        assert_eq!(cursor_xy_in_wrap("0123456789A", 10), (1, 1));
+        assert_eq!(cursor_xy_in_wrap("ab\ncd", 10), (2, 1));
+    }
+
+    #[test]
+    fn mark_plus_prompt_matches_composer_layout() {
+        let mark = "> ";
+        let text = "x".repeat(20);
+        let full = format!("{mark}{text}");
+        // mark is 2 cols; 22 total at width 10 → 3 rows
+        assert_eq!(wrap_row_count(&full, 10), 3);
+        let (cx, cy) = cursor_xy_in_wrap(&full, 10);
+        assert_eq!((cx, cy), (2, 2));
+    }
 }
 
 /// Limit on-screen tool output by line count (head + tail) so long shell
