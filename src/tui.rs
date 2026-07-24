@@ -3299,11 +3299,8 @@ impl Tui {
                     orange_fg,
                 )]));
             }
-            if !self.perm_tool_input.is_empty() {
-                chrome.push(Line::from(vec![Span::styled(
-                    format!("  {}", self.perm_tool_input),
-                    dim,
-                )]));
+            for preview in format_permission_tool_input(&self.perm_tool_input) {
+                chrome.push(Line::from(vec![Span::styled(format!("  {preview}"), dim)]));
             }
             chrome.push(Line::from(""));
             let options = ["Allow", "Always Allow", "Deny"];
@@ -5505,6 +5502,124 @@ fn permission_risk_warning(tool_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Max display columns for a single permission-preview field value.
+const PERM_VALUE_MAX_COLS: usize = 96;
+/// Hard cap on preview rows so a multi-KB `file_edit` cannot fill the chrome.
+const PERM_PREVIEW_MAX_LINES: usize = 8;
+
+/// Collapse newlines and truncate so permission chrome stays readable.
+fn truncate_perm_value(s: &str, max_cols: usize) -> String {
+    let one_line = s
+        .replace("\r\n", "\n")
+        .replace('\n', "↵")
+        .replace('\r', "↵");
+    let dw = display_width(&one_line);
+    if dw <= max_cols {
+        return one_line;
+    }
+    // Leave room for the ellipsis glyph.
+    let budget = max_cols.saturating_sub(1).max(1);
+    let mut out = String::new();
+    let mut used = 0;
+    for c in one_line.chars() {
+        let cw = char_width(c);
+        if used + cw > budget {
+            break;
+        }
+        out.push(c);
+        used += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// Structured, truncated multi-line preview for the permission prompt.
+/// Never dumps raw multi-KB JSON: that previously wrapped across the full
+/// chrome and made the TUI look corrupted on large `file_edit` payloads.
+fn format_permission_tool_input(input: &str) -> Vec<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    if let Ok(val) = crate::json::parse(trimmed) {
+        if let Some(obj) = val.as_object() {
+            let mut lines = Vec::new();
+            // Prefer a stable field order for common tools.
+            for key in [
+                "file_path",
+                "path",
+                "command",
+                "query",
+                "url",
+                "pattern",
+                "old_string",
+                "new_string",
+                "content",
+                "replace_all",
+                "args",
+            ] {
+                if lines.len() >= PERM_PREVIEW_MAX_LINES {
+                    break;
+                }
+                let Some(v) = obj.get(key) else {
+                    continue;
+                };
+                let shown = if let Some(s) = v.as_str() {
+                    truncate_perm_value(s, PERM_VALUE_MAX_COLS)
+                } else if let Some(b) = v.as_bool() {
+                    b.to_string()
+                } else if let Some(n) = v.as_u64() {
+                    n.to_string()
+                } else if let Some(arr) = v.as_array() {
+                    let joined = arr
+                        .iter()
+                        .filter_map(|x| x.as_str())
+                        .map(|x| format!("{x:?}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    truncate_perm_value(&joined, PERM_VALUE_MAX_COLS)
+                } else {
+                    continue;
+                };
+                lines.push(format!("{key}: {shown}"));
+            }
+            if !lines.is_empty() {
+                // Note remaining keys if we hit the line cap or skipped unknowns.
+                let shown_keys: usize = [
+                    "file_path",
+                    "path",
+                    "command",
+                    "query",
+                    "url",
+                    "pattern",
+                    "old_string",
+                    "new_string",
+                    "content",
+                    "replace_all",
+                    "args",
+                ]
+                .iter()
+                .filter(|k| obj.get(**k).is_some())
+                .count();
+                if shown_keys > lines.len() {
+                    let extra = shown_keys - lines.len();
+                    lines.push(format!("… (+{extra} more field(s))"));
+                }
+                return lines;
+            }
+        }
+    }
+
+    // Non-JSON or unrecognized shape: single compact line, never the full blob.
+    let hint = compact_tool_arg_hint(trimmed);
+    if hint.is_empty() {
+        Vec::new()
+    } else {
+        vec![hint]
+    }
+}
+
 /// One-line arg preview for tool_use rows (avoid dumping pretty JSON).
 fn compact_tool_arg_hint(input: &str) -> String {
     let trimmed = input.trim();
@@ -5713,5 +5828,65 @@ mod tool_display_tests {
         let warning = permission_risk_warning("git").unwrap();
         assert!(warning.contains("Shell-equivalent risk"));
         assert!(permission_risk_warning("go").is_none());
+    }
+
+    #[test]
+    fn permission_preview_shows_structured_fields() {
+        let input = r#"{"file_path":"src/tools/file_edit.rs","old_string":"a","new_string":"b","replace_all":true}"#;
+        let lines = format_permission_tool_input(input);
+        assert_eq!(
+            lines,
+            vec![
+                "file_path: src/tools/file_edit.rs".to_string(),
+                "old_string: a".to_string(),
+                "new_string: b".to_string(),
+                "replace_all: true".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn permission_preview_truncates_large_file_edit_payload() {
+        let big = "x".repeat(400);
+        let input = format!(
+            r#"{{"file_path":"src/tools/file_edit.rs","old_string":"keep","new_string":"{big}"}}"#
+        );
+        let lines = format_permission_tool_input(&input);
+        assert!(
+            lines.iter().any(|l| l.starts_with("file_path:")),
+            "{lines:?}"
+        );
+        let new_line = lines
+            .iter()
+            .find(|l| l.starts_with("new_string:"))
+            .expect("new_string row");
+        assert!(
+            new_line.ends_with('…'),
+            "expected truncated new_string, got {new_line}"
+        );
+        assert!(
+            display_width(new_line) <= "new_string: ".len() + PERM_VALUE_MAX_COLS + 2,
+            "preview line too wide: {} cols ({new_line})",
+            display_width(new_line)
+        );
+        // Full payload must never appear as a single raw JSON dump.
+        let joined = lines.join("\n");
+        assert!(
+            !joined.contains(&big),
+            "raw multi-KB value leaked into chrome"
+        );
+        assert!(lines.len() <= PERM_PREVIEW_MAX_LINES + 1);
+    }
+
+    #[test]
+    fn permission_preview_collapses_newlines_in_values() {
+        let input = r#"{"file_path":"a.rs","old_string":"line1\nline2","new_string":"x"}"#;
+        let lines = format_permission_tool_input(input);
+        let old = lines
+            .iter()
+            .find(|l| l.starts_with("old_string:"))
+            .expect("old_string");
+        assert!(old.contains('↵'), "{old}");
+        assert!(!old.contains('\n'), "{old}");
     }
 }
