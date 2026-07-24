@@ -19,7 +19,8 @@ impl Tool for ShellTool {
     fn description(&self) -> &str {
         "Execute a shell command. On Windows this uses PowerShell (-Command); \
          on Unix it uses bash (-c). For intentional PowerShell work on Windows, \
-         prefer the dedicated `powershell` tool. Always check the exit code footer."
+         prefer the dedicated `powershell` tool. Always check the exit code footer. \
+         Bare `git commit` invocations automatically get a Co-Authored-By: cairn-code trailer."
     }
     fn needs_permission(&self) -> bool {
         true
@@ -43,11 +44,19 @@ impl Tool for ShellTool {
             .ok_or("command required")?;
         let timeout_ms = obj.get("timeout").and_then(|v| v.as_u64());
 
+        // Commits via shell bypass the git tool's --trailer injection; rewrite
+        // bare `git commit` so GitHub still co-attributes cairn-code.
+        let cmd = if cfg!(windows) {
+            crate::tools::commit_attribution::ensure_powershell_command_co_author(cmd)
+        } else {
+            crate::tools::commit_attribution::ensure_shell_command_co_author(cmd)
+        };
+
         let shell = if cfg!(windows) { "powershell" } else { "bash" };
         let flag = if cfg!(windows) { "-Command" } else { "-c" };
 
         let mut command = Command::new(shell);
-        command.arg(flag).arg(cmd);
+        command.arg(flag).arg(&cmd);
 
         let options = RunOptions {
             timeout: timeout_ms.map(Duration::from_millis),
@@ -305,6 +314,58 @@ mod tests {
         assert!(out.ends_with(&"T".repeat(100)));
         assert!(out.contains("truncated"));
         assert!(!out.contains(&"M".repeat(50)));
+    }
+
+    #[test]
+    fn shell_git_commit_gets_co_author_trailer() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cairn-shell-coauthor-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_string_lossy().replace('\\', "/");
+
+        let setup = if cfg!(windows) {
+            format!(
+                "Set-Location -LiteralPath '{dir_str}'; git init -q; git config user.email t@e.com; git config user.name t; Set-Content -Path a.txt -Value a; git add a.txt; git commit -m 'shell-commit'"
+            )
+        } else {
+            format!(
+                "cd '{dir_str}' && git init -q && git config user.email t@e.com && git config user.name t && echo a > a.txt && git add a.txt && git commit -m 'shell-commit'"
+            )
+        };
+        let input = serde_json::json!({ "command": setup, "timeout": 60_000 }).to_string();
+        let out = ShellTool.execute(&input);
+        // Some environments may lack git; skip soft if so.
+        let body = match out {
+            Ok(s) => s,
+            Err(e) if e.contains("git") || e.to_ascii_lowercase().contains("not recognized") => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            Err(e) => panic!("setup/commit failed: {e}"),
+        };
+        assert!(
+            body.contains("(exit code 0)") || !body.contains("exit code"),
+            "{body}"
+        );
+
+        let log_cmd = if cfg!(windows) {
+            format!("Set-Location -LiteralPath '{dir_str}'; git log -1 --format=%B")
+        } else {
+            format!("cd '{dir_str}' && git log -1 --format=%B")
+        };
+        let log_input = serde_json::json!({ "command": log_cmd, "timeout": 30_000 }).to_string();
+        let log = ShellTool.execute(&log_input).unwrap_or_default();
+        assert!(
+            log.to_ascii_lowercase().contains("co-authored-by:") && log.contains("cairn-code"),
+            "expected cairn-code trailer in commit via shell, got: {log}"
+        );
+        assert!(log.contains("shell-commit"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
