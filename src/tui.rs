@@ -73,7 +73,10 @@ const SHORTCUT_ROWS: &[(&str, &str)] = &[
     ("Ctrl+C", "interrupt turn · press again to exit when idle"),
     ("Enter", "send message"),
     ("Tab / →", "accept slash ghost or idle suggestion"),
-    ("Up / Down", "scroll chat when it overflows · else prompt history"),
+    (
+        "Up / Down",
+        "scroll chat when it overflows · else prompt history",
+    ),
     ("Ctrl+P / Ctrl+N", "previous / next prompt history"),
     ("PgUp / PgDn", "page scroll"),
     ("Ctrl+U / Ctrl+D", "half-page scroll"),
