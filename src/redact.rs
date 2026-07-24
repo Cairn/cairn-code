@@ -23,6 +23,7 @@ pub fn redact_secrets(input: &str) -> String {
 }
 
 /// True when a header name is expected to carry credentials.
+#[allow(dead_code)]
 pub fn is_sensitive_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower == "authorization"
@@ -242,7 +243,8 @@ mod tests {
 
     #[test]
     fn redacts_github_and_slackish_tokens() {
-        let s = redact_secrets("token ghp_abcdefghijklmnopqrstuvwxyz012345 and xoxb-12345678-abcdefgh");
+        let s =
+            redact_secrets("token ghp_abcdefghijklmnopqrstuvwxyz012345 and xoxb-12345678-abcdefgh");
         assert!(!s.contains("ghp_abcdefghijklmnopqrstuvwxyz012345"));
         assert!(s.contains(REDACTED));
     }

@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use ratatui::style::{Style, Modifier, Color};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style as SynStyle, Theme as SyntectTheme, ThemeSet};
@@ -24,7 +24,14 @@ fn syntect_theme() -> &'static SyntectTheme {
             .get("base16-ocean.dark")
             .or_else(|| themes.themes.get("Solarized (dark)"))
             .cloned()
-            .unwrap_or_else(|| themes.themes.values().next().cloned().expect("syntect ships at least one theme"))
+            .unwrap_or_else(|| {
+                themes
+                    .themes
+                    .values()
+                    .next()
+                    .cloned()
+                    .expect("syntect ships at least one theme")
+            })
     })
 }
 
@@ -129,9 +136,13 @@ fn render_with(text: &str, styles: MdStyles) -> Vec<Line<'static>> {
 fn render_heading(line: &str, styles: MdStyles) -> Option<Line<'static>> {
     let trimmed = line.trim_start();
     let level = trimmed.chars().take_while(|c| *c == '#').count();
-    if level == 0 || level > 6 { return None; }
+    if level == 0 || level > 6 {
+        return None;
+    }
     let mut after = trimmed[level..].trim_start();
-    if after.starts_with(' ') { after = after.trim_start(); }
+    if after.starts_with(' ') {
+        after = after.trim_start();
+    }
     let style = match level {
         1 => styles.heading1,
         2 => styles.heading2,
@@ -146,8 +157,14 @@ fn render_heading(line: &str, styles: MdStyles) -> Option<Line<'static>> {
 }
 
 fn render_blockquote(line: &str, styles: MdStyles) -> Option<Line<'static>> {
-    if !line.trim_start().starts_with('>') { return None; }
-    let content = line.trim_start().trim_start_matches('>').trim_start().to_string();
+    if !line.trim_start().starts_with('>') {
+        return None;
+    }
+    let content = line
+        .trim_start()
+        .trim_start_matches('>')
+        .trim_start()
+        .to_string();
     Some(Line::from(vec![
         Span::styled("▎ ", styles.quote_bar),
         Span::styled(content, styles.quote_text),
@@ -214,7 +231,10 @@ fn render_code_block(lines: &[String], lang: &str, styles: MdStyles) -> Vec<Line
                     if text.is_empty() {
                         continue;
                     }
-                    spans.push(Span::styled(text.to_string(), syntect_style_to_ratatui(style)));
+                    spans.push(Span::styled(
+                        text.to_string(),
+                        syntect_style_to_ratatui(style),
+                    ));
                 }
                 if spans.is_empty() {
                     out.push(Line::from(""));
@@ -240,13 +260,22 @@ fn render_code_block(lines: &[String], lang: &str, styles: MdStyles) -> Vec<Line
 fn syntect_style_to_ratatui(style: SynStyle) -> Style {
     let fg = style.foreground;
     let mut s = Style::new().fg(Color::Rgb(fg.r, fg.g, fg.b));
-    if style.font_style.contains(syntect::highlighting::FontStyle::BOLD) {
+    if style
+        .font_style
+        .contains(syntect::highlighting::FontStyle::BOLD)
+    {
         s = s.add_modifier(Modifier::BOLD);
     }
-    if style.font_style.contains(syntect::highlighting::FontStyle::ITALIC) {
+    if style
+        .font_style
+        .contains(syntect::highlighting::FontStyle::ITALIC)
+    {
         s = s.add_modifier(Modifier::ITALIC);
     }
-    if style.font_style.contains(syntect::highlighting::FontStyle::UNDERLINE) {
+    if style
+        .font_style
+        .contains(syntect::highlighting::FontStyle::UNDERLINE)
+    {
         s = s.add_modifier(Modifier::UNDERLINED);
     }
     s
@@ -275,11 +304,14 @@ fn parse_inline_spans(text: &str, base: Style, styles: MdStyles) -> Vec<Span<'st
         if chars[i] == '[' {
             let text_start = i + 1;
             if let Some(close_bracket) = chars[text_start..].iter().position(|c| *c == ']') {
-                let link_text: String = chars[text_start..text_start + close_bracket].iter().collect();
+                let link_text: String = chars[text_start..text_start + close_bracket]
+                    .iter()
+                    .collect();
                 let after = text_start + close_bracket + 1;
                 if after < chars.len() && chars[after] == '(' {
                     if let Some(close_paren) = chars[after + 1..].iter().position(|c| *c == ')') {
-                        let _url: String = chars[after + 1..after + 1 + close_paren].iter().collect();
+                        let _url: String =
+                            chars[after + 1..after + 1 + close_paren].iter().collect();
                         spans.push(Span::styled(link_text, styles.link));
                         i = after + 1 + close_paren + 1;
                         continue;
@@ -292,7 +324,8 @@ fn parse_inline_spans(text: &str, base: Style, styles: MdStyles) -> Vec<Span<'st
             let start = i + 2;
             if let Some(end) = find_closing(&chars, start, "**") {
                 let inner: String = chars[start..end].iter().collect();
-                let inner_spans = parse_inline_spans_bold(&inner, base.add_modifier(Modifier::BOLD), styles);
+                let inner_spans =
+                    parse_inline_spans_bold(&inner, base.add_modifier(Modifier::BOLD), styles);
                 spans.extend(inner_spans);
                 i = end + 2;
                 continue;
@@ -303,10 +336,7 @@ fn parse_inline_spans(text: &str, base: Style, styles: MdStyles) -> Vec<Span<'st
             let start = i + 1;
             if let Some(end) = find_closing(&chars, start, "*") {
                 let inner: String = chars[start..end].iter().collect();
-                spans.push(Span::styled(
-                    inner,
-                    base.add_modifier(Modifier::ITALIC),
-                ));
+                spans.push(Span::styled(inner, base.add_modifier(Modifier::ITALIC)));
                 i = end + 1;
                 continue;
             }
@@ -459,13 +489,19 @@ mod tests {
     fn test_code_block_with_lang() {
         let lines = render_test("```rust\nfn main() {\n    let x = 1;\n}\n```");
         assert_eq!(lines.len(), 3, "one Line per source line, got {lines:?}");
-        let joined: String = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        let joined: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(joined.contains("fn main"), "got: {joined}");
         assert!(joined.contains("let x"), "got: {joined}");
         // At least one span should use a non-default RGB color from the theme
         // (syntect highlight for Rust keywords/identifiers).
         let has_rgb = lines.iter().any(|line| {
-            line.spans.iter().any(|sp| matches!(sp.style.fg, Some(Color::Rgb(_, _, _))))
+            line.spans
+                .iter()
+                .any(|sp| matches!(sp.style.fg, Some(Color::Rgb(_, _, _))))
         });
         assert!(has_rgb, "expected syntect RGB colors on rust fence");
     }

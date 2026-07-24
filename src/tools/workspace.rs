@@ -51,7 +51,6 @@ impl Workspace {
             match component {
                 Component::CurDir => {}
                 Component::Normal(part) => normalized.push(part),
-                Component::ParentDir if normalized.pop() => {}
                 Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                     return Err(self.outside(path));
                 }
@@ -62,6 +61,19 @@ impl Workspace {
 
     pub fn dir(&self) -> &Dir {
         &self.dir
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn create_parent_dirs(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            self.dir
+                .create_dir_all(parent)
+                .map_err(|_| self.outside(path))?;
+        }
+        Ok(())
     }
 
     pub fn access_error(&self, path: &Path, error: std::io::Error) -> String {
@@ -308,6 +320,16 @@ mod tests {
         let missing_error = workspace.relative_path(missing).unwrap_err();
         assert!(existing_error.contains("outside the workspace"));
         assert!(missing_error.contains("outside the workspace"));
+    }
+
+    #[test]
+    fn workspace_rejects_parent_components_that_end_inside() {
+        let workspace = Workspace::current().unwrap();
+        let error = workspace
+            .relative_path("missing/../Cargo.toml")
+            .unwrap_err();
+
+        assert!(error.contains("outside the workspace"));
     }
 
     #[cfg(windows)]

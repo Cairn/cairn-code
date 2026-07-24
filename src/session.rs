@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,28 +48,58 @@ pub fn new_id() -> String {
     format!("{:016x}{:04x}", nanos, seq & 0xffff)
 }
 
+fn validate_id(id: &str) -> Result<(), String> {
+    if id.len() < 8
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("invalid session id".into());
+    }
+    Ok(())
+}
+
 pub fn save(sessions_dir: &str, session: &Session) -> Result<(), String> {
+    validate_id(&session.id)?;
     let dir = PathBuf::from(sessions_dir);
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
 
     let path = dir.join(&session.id);
-    let json = session_to_json(session);
-    fs::write(&path, json).map_err(|e| format!("write: {e}"))?;
+    let temp_path = dir.join(format!(".{}.{}.tmp", session.id, new_id()));
+    let json = session_to_json(session)?;
+    let write_result = (|| -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|e| format!("create temporary session: {e}"))?;
+        file.write_all(json.as_bytes())
+            .map_err(|e| format!("write temporary session: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("sync temporary session: {e}"))?;
+        fs::rename(&temp_path, &path).map_err(|e| format!("replace session: {e}"))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result?;
     Ok(())
 }
 
 pub fn load(sessions_dir: &str, id: &str) -> Result<Session, String> {
+    validate_id(id)?;
     let path = PathBuf::from(sessions_dir).join(id);
     let content = fs::read_to_string(&path).map_err(|e| format!("read: {e}"))?;
-    session_from_json(&content)
+    let mut session = session_from_json(&content)?;
+    session.id = id.to_string();
+    Ok(session)
 }
 
 /// Deletes a saved session file. `id` must be an exact session id (no path
 /// separators). Use [`resolve_id`] first when the user only typed a prefix.
 pub fn delete(sessions_dir: &str, id: &str) -> Result<(), String> {
-    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
-        return Err("invalid session id".into());
-    }
+    validate_id(id)?;
     let path = PathBuf::from(sessions_dir).join(id);
     if !path.is_file() {
         return Err(format!("session not found: {id}"));
@@ -83,11 +114,15 @@ pub fn resolve_id(sessions_dir: &str, query: &str) -> Result<String, String> {
     if q.is_empty() {
         return Err("session id required".into());
     }
-    if q.contains('/') || q.contains('\\') || q.contains("..") {
+    if !q
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
         return Err("invalid session id".into());
     }
     let sessions = list(sessions_dir)?;
-    let matches: Vec<&SessionSummary> = sessions.iter()
+    let matches: Vec<&SessionSummary> = sessions
+        .iter()
         .filter(|s| s.id == q || s.id.starts_with(q))
         .collect();
     match matches.as_slice() {
@@ -113,20 +148,28 @@ pub fn list(sessions_dir: &str) -> Result<Vec<SessionSummary>, String> {
     for entry in fs::read_dir(&dir).map_err(|e| format!("readdir: {e}"))? {
         let entry = entry.map_err(|e| format!("entry: {e}"))?;
         let path = entry.path();
-        if path.is_file() {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(s) = session_from_json(&content) {
-                    sessions.push(SessionSummary {
-                        id: s.id,
-                        model: s.model,
-                        msg_count: s.messages.len(),
-                        updated_at: s.updated_at,
-                        summary: s.messages.first().and_then(|m| match &m.content {
+        let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !path.is_file() || validate_id(&id).is_err() {
+            continue;
+        }
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Ok(s) = session_from_json(&content) {
+                sessions.push(SessionSummary {
+                    id,
+                    model: s.model,
+                    msg_count: s.messages.len(),
+                    updated_at: s.updated_at,
+                    summary: s
+                        .messages
+                        .first()
+                        .and_then(|m| match &m.content {
                             crate::llm::Content::Text(t) => Some(t.clone()),
                             _ => None,
-                        }).unwrap_or_default(),
-                    });
-                }
+                        })
+                        .unwrap_or_default(),
+                });
             }
         }
     }
@@ -160,7 +203,7 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-fn session_to_json(s: &Session) -> String {
+fn session_to_json(s: &Session) -> Result<String, String> {
     let mut json = String::new();
     json.push_str(&format!(
         "{{\"id\":\"{}\",\"model\":\"{}\",\"provider\":\"{}\",",
@@ -168,33 +211,44 @@ fn session_to_json(s: &Session) -> String {
         json_escape(&s.model),
         json_escape(&s.provider)
     ));
-    json.push_str(&format!("\"tokens_in\":{},\"tokens_out\":{},", s.tokens_in, s.tokens_out));
-    json.push_str(&format!("\"created_at\":{},\"updated_at\":{},", s.created_at, s.updated_at));
+    json.push_str(&format!(
+        "\"tokens_in\":{},\"tokens_out\":{},",
+        s.tokens_in, s.tokens_out
+    ));
+    json.push_str(&format!(
+        "\"created_at\":{},\"updated_at\":{},",
+        s.created_at, s.updated_at
+    ));
     json.push_str("\"messages\":[");
     for (i, msg) in s.messages.iter().enumerate() {
         if i > 0 {
             json.push(',');
         }
-        json.push_str(&message_to_json(msg));
+        json.push_str(&message_to_json(msg)?);
     }
     json.push_str("]}");
-    json
+    Ok(json)
 }
 
-fn message_to_json(msg: &Message) -> String {
+fn json_value_to_json(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).expect("serializing a JSON value cannot fail")
+}
+
+fn message_to_json(msg: &Message) -> Result<String, String> {
     let content = match &msg.content {
         crate::llm::Content::Text(t) => format!("\"{}\"", json_escape(t)),
         crate::llm::Content::ToolUse(tu) => {
-            // tu.input is already JSON; keep as raw object. Name/id need escaping.
+            let input = if tu.input.trim().is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str(&tu.input)
+                    .map_err(|e| format!("invalid tool input for '{}': {e}", tu.name))?
+            };
             format!(
                 "{{\"type\":\"tool_use\",\"id\":\"{}\",\"name\":\"{}\",\"input\":{}}}",
                 json_escape(&tu.id),
                 json_escape(&tu.name),
-                if tu.input.trim().is_empty() {
-                    "{}"
-                } else {
-                    tu.input.as_str()
-                }
+                json_value_to_json(&input)
             )
         }
         crate::llm::Content::ToolResult(tr) => {
@@ -211,69 +265,126 @@ fn message_to_json(msg: &Message) -> String {
             )
         }
     };
-    format!(
+    Ok(format!(
         "{{\"role\":\"{}\",\"content\":{}}}",
         json_escape(&msg.role),
         content
-    )
+    ))
 }
 
 fn session_from_json(json_str: &str) -> Result<Session, String> {
-    let val = crate::json::parse(json_str).map_err(|e| e.to_string())?;
+    let val: serde_json::Value = serde_json::from_str(json_str).map_err(|e| e.to_string())?;
     let obj = val.as_object().ok_or("not an object")?;
 
-    let id = obj.get("id").and_then(|v| v.as_str()).ok_or("no id")?.to_string();
-    let model = obj.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let provider = obj.get("provider").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let id = obj
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("no id")?
+        .to_string();
+    validate_id(&id)?;
+    let model = obj
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let provider = obj
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let tokens_in = obj.get("tokens_in").and_then(|v| v.as_u64()).unwrap_or(0);
     let tokens_out = obj.get("tokens_out").and_then(|v| v.as_u64()).unwrap_or(0);
     let created_at = obj.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
     let updated_at = obj.get("updated_at").and_then(|v| v.as_u64()).unwrap_or(0);
 
-    let messages = if let Some(arr) = obj.get("messages").and_then(|v| v.as_array()) {
-        arr.iter().filter_map(|v| message_from_json(v)).collect()
-    } else {
-        Vec::new()
-    };
+    let messages = obj
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .ok_or("messages must be an array")?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            message_from_json(value).map_err(|e| format!("invalid message {index}: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(Session { id, model, provider, messages, tokens_in, tokens_out, created_at, updated_at })
+    Ok(Session {
+        id,
+        model,
+        provider,
+        messages,
+        tokens_in,
+        tokens_out,
+        created_at,
+        updated_at,
+    })
 }
 
-fn message_from_json(val: &crate::json::JsonValue) -> Option<Message> {
-    let obj = val.as_object()?;
-    let role = obj.get("role")?.as_str()?.to_string();
-    let content_val = obj.get("content")?;
+fn message_from_json(val: &serde_json::Value) -> Result<Message, String> {
+    let obj = val.as_object().ok_or("not an object")?;
+    let role = obj
+        .get("role")
+        .and_then(|v| v.as_str())
+        .ok_or("no role")?
+        .to_string();
+    let content_val = obj.get("content").ok_or("no content")?;
 
     let content = if let Some(s) = content_val.as_str() {
         crate::llm::Content::Text(s.to_string())
     } else if let Some(o) = content_val.as_object() {
-        let type_str = o.get("type")?.as_str()?;
+        let type_str = o
+            .get("type")
+            .and_then(|v| v.as_str())
+            .ok_or("no content type")?;
         match type_str {
             "tool_use" => {
-                let name = o.get("name")?.as_str()?.to_string();
-                let id = o.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let name = o
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or("no tool name")?
+                    .to_string();
+                let id = o
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("no tool id")?
+                    .to_string();
                 let input = o
                     .get("input")
-                    .map(|v| crate::json::serialize(v))
-                    .unwrap_or_else(|| "{}".into());
+                    .map(json_value_to_json)
+                    .ok_or("no tool input")?;
                 crate::llm::Content::ToolUse(crate::llm::ToolUse { name, input, id })
             }
             "tool_result" => {
-                let tool_use_id = o.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let content = o.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                crate::llm::Content::ToolResult(crate::llm::ToolResult { tool_use_id, content })
+                let tool_use_id = o
+                    .get("tool_use_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("no tool result id")?
+                    .to_string();
+                let content = o
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .ok_or("no tool result content")?
+                    .to_string();
+                crate::llm::Content::ToolResult(crate::llm::ToolResult {
+                    tool_use_id,
+                    content,
+                })
             }
             "thinking" => {
-                let thinking = o.get("thinking").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let thinking = o
+                    .get("thinking")
+                    .and_then(|v| v.as_str())
+                    .ok_or("no thinking content")?
+                    .to_string();
                 crate::llm::Content::Thinking(thinking)
             }
-            _ => crate::llm::Content::Text(crate::json::serialize(content_val)),
+            _ => return Err(format!("unknown content type: {type_str}")),
         }
     } else {
-        return None;
+        return Err("invalid content".into());
     };
 
-    Some(Message { role, content })
+    Ok(Message { role, content })
 }
 
 #[cfg(test)]
@@ -301,8 +412,14 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let msgs = vec![
-            Message { role: "user".into(), content: crate::llm::Content::Text("hello".into()) },
-            Message { role: "assistant".into(), content: crate::llm::Content::Text("hi".into()) },
+            Message {
+                role: "user".into(),
+                content: crate::llm::Content::Text("hello".into()),
+            },
+            Message {
+                role: "assistant".into(),
+                content: crate::llm::Content::Text("hi".into()),
+            },
         ];
 
         let session = Session {
@@ -354,9 +471,10 @@ mod tests {
 
         let session = Session {
             id: test_id.clone(),
-            messages: vec![
-                Message { role: "user".into(), content: crate::llm::Content::Text("hello".into()) },
-            ],
+            messages: vec![Message {
+                role: "user".into(),
+                content: crate::llm::Content::Text("hello".into()),
+            }],
             model: "mock".into(),
             provider: "mock".into(),
             tokens_in: 1,
@@ -385,6 +503,68 @@ mod tests {
         assert!(err.contains("invalid"), "got: {err}");
         let err = resolve_id(".", "..\\foo").unwrap_err();
         assert!(err.contains("invalid"), "got: {err}");
+
+        let session = Session {
+            id: "../escaped".into(),
+            messages: Vec::new(),
+            model: "mock".into(),
+            provider: "mock".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(save(".", &session).unwrap_err().contains("invalid"));
+        let error = match load(".", "../Cargo.toml") {
+            Ok(_) => panic!("path traversal should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("invalid"));
+    }
+
+    #[test]
+    fn test_list_and_load_derive_id_from_filename() {
+        let dir = std::env::temp_dir().join(format!("cairn-test-session-id-{}", new_id()));
+        let dir_str = dir.to_string_lossy().to_string();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("actual-id"),
+            r#"{"id":"other-id","model":"mock","provider":"mock","messages":[]}"#,
+        )
+        .unwrap();
+
+        let listed = list(&dir_str).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "actual-id");
+        assert_eq!(load(&dir_str, "actual-id").unwrap().id, "actual-id");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_surfaces_malformed_messages() {
+        let dir = std::env::temp_dir().join(format!("cairn-test-session-bad-{}", new_id()));
+        let dir_str = dir.to_string_lossy().to_string();
+        fs::create_dir_all(&dir).unwrap();
+        let malformed = [
+            r#"{"id":"bad-message","messages":{}}"#,
+            r#"{"id":"bad-message","messages":[{"role":"user"}]}"#,
+            r#"{"id":"bad-message","messages":[{"role":"assistant","content":{"type":"tool_use","name":"shell","input":{}}}]}"#,
+            r#"{"id":"bad-message","messages":[{"role":"assistant","content":{"type":"tool_use","id":"call-1","name":"shell"}}]}"#,
+            r#"{"id":"bad-message","messages":[{"role":"user","content":{"type":"tool_result","content":"ok"}}]}"#,
+            r#"{"id":"bad-message","messages":[{"role":"assistant","content":{"type":"thinking"}}]}"#,
+            r#"{"id":"bad-message","messages":[{"role":"assistant","content":{"type":"future"}}]}"#,
+        ];
+
+        for content in malformed {
+            fs::write(dir.join("bad-message"), content).unwrap();
+            assert!(
+                load(&dir_str, "bad-message").is_err(),
+                "accepted: {content}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -504,6 +684,113 @@ mod tests {
             }
             _ => panic!("expected tool_result"),
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tool_input_is_parsed_and_reserialized() {
+        let test_id = format!("test-{}", new_id());
+        let dir = std::env::temp_dir().join(format!("cairn-test-session-json-{}", new_id()));
+        let dir_str = dir.to_string_lossy().to_string();
+        let input = r#" { "text": "a\"b", "nested": [true, null], "big": 9007199254740993 } "#;
+        let session = Session {
+            id: test_id.clone(),
+            messages: vec![Message {
+                role: "assistant".into(),
+                content: crate::llm::Content::ToolUse(crate::llm::ToolUse {
+                    id: "call-1".into(),
+                    name: "example".into(),
+                    input: input.into(),
+                }),
+            }],
+            model: "mock".into(),
+            provider: "mock".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        save(&dir_str, &session).unwrap();
+        let loaded = load(&dir_str, &test_id).unwrap();
+        let crate::llm::Content::ToolUse(tool_use) = &loaded.messages[0].content else {
+            panic!("expected tool use");
+        };
+        assert!(tool_use.input.contains("9007199254740993"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tool_use.input).unwrap(),
+            serde_json::from_str::<serde_json::Value>(input).unwrap()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_invalid_tool_input_does_not_replace_saved_session() {
+        let test_id = format!("test-{}", new_id());
+        let dir = std::env::temp_dir().join(format!("cairn-test-session-atomic-{}", new_id()));
+        let dir_str = dir.to_string_lossy().to_string();
+        let mut session = Session {
+            id: test_id.clone(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: crate::llm::Content::Text("original".into()),
+            }],
+            model: "mock".into(),
+            provider: "mock".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+        save(&dir_str, &session).unwrap();
+
+        session.messages = vec![Message {
+            role: "user".into(),
+            content: crate::llm::Content::Text("replacement".into()),
+        }];
+        save(&dir_str, &session).unwrap();
+
+        session.messages = vec![Message {
+            role: "assistant".into(),
+            content: crate::llm::Content::ToolUse(crate::llm::ToolUse {
+                id: "call-1".into(),
+                name: "example".into(),
+                input: r#"{"valid":true} trailing"#.into(),
+            }),
+        }];
+        assert!(save(&dir_str, &session).is_err());
+
+        let loaded = load(&dir_str, &test_id).unwrap();
+        assert!(matches!(
+            &loaded.messages[0].content,
+            crate::llm::Content::Text(text) if text == "replacement"
+        ));
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_failed_atomic_replace_removes_temporary_file() {
+        let test_id = format!("test-{}", new_id());
+        let dir = std::env::temp_dir().join(format!("cairn-test-session-cleanup-{}", new_id()));
+        let dir_str = dir.to_string_lossy().to_string();
+        fs::create_dir_all(dir.join(&test_id)).unwrap();
+        let session = Session {
+            id: test_id,
+            messages: Vec::new(),
+            model: "mock".into(),
+            provider: "mock".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        assert!(save(&dir_str, &session).is_err());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

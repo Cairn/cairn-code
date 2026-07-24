@@ -183,7 +183,10 @@ impl BoundedCollector {
             format!("{}{}", self.head, tail_str)
         } else {
             let omitted = self.total_chars - self.head_len - tail_len;
-            format!("{}\n... [{omitted} chars truncated] ...\n{}", self.head, tail_str)
+            format!(
+                "{}\n... [{omitted} chars truncated] ...\n{}",
+                self.head, tail_str
+            )
         }
     }
 }
@@ -234,7 +237,11 @@ fn which_ok(bin: &str) -> bool {
     // --version works for both pwsh and Windows powershell 5.1
     let mut c = Command::new(bin);
     if bin == "powershell" {
-        c.args(["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"]);
+        c.args([
+            "-NoProfile",
+            "-Command",
+            "$PSVersionTable.PSVersion.ToString()",
+        ]);
     } else {
         c.arg("--version");
     }
