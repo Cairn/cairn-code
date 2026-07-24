@@ -1,7 +1,10 @@
 use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::fs;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+
+static CONFIG_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub struct Config {
     pub default_provider: String,
@@ -129,7 +132,7 @@ pub fn env_key_for(provider: &str) -> Option<String> {
 }
 
 fn load_for_workspace(user_path: &Path, workspace: &Path) -> Result<Config, String> {
-    migrate_plaintext_keys_in_file(user_path);
+    migrate_plaintext_keys_in_file(user_path)?;
 
     let user_content = read_optional_config(user_path)?;
     let mut cfg = match user_content.as_deref() {
@@ -314,25 +317,25 @@ fn keyring_delete(provider: &str) -> Result<bool, String> {
 /// One-time migration: API keys used to be stored as plaintext in the config
 /// file's `api_keys` map. Move any that are still there into the OS keyring
 /// and strip them from the file.
-fn migrate_plaintext_keys_in_file(path: &std::path::Path) {
+fn migrate_plaintext_keys_in_file(path: &std::path::Path) -> Result<(), String> {
     use crate::json::JsonValue;
     if !path.exists() {
-        return;
+        return Ok(());
     }
     let Ok(content) = fs::read_to_string(path) else {
-        return;
+        return Ok(());
     };
     let Ok(val) = crate::json::parse(&content) else {
-        return;
+        return Ok(());
     };
     let Some(mut obj) = val.as_object().cloned() else {
-        return;
+        return Ok(());
     };
     let Some(keys) = obj.get("api_keys").and_then(|v| v.as_object()).cloned() else {
-        return;
+        return Ok(());
     };
     if keys.is_empty() {
-        return;
+        return Ok(());
     }
 
     // Only drop keys that were actually written to the keyring; keep any
@@ -354,9 +357,9 @@ fn migrate_plaintext_keys_in_file(path: &std::path::Path) {
         } else {
             obj.insert("api_keys".into(), JsonValue::Object(remaining));
         }
-        let output = crate::json::serialize(&JsonValue::Object(obj));
-        let _ = fs::write(path, &output);
+        write_config_object(path, obj)?;
     }
+    Ok(())
 }
 
 pub fn sessions_dir() -> String {
@@ -489,17 +492,84 @@ fn write_config_object(
     path: &Path,
     obj: HashMap<String, crate::json::JsonValue>,
 ) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "failed to create config directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("invalid config path {}", path.display()))?;
+
+    #[cfg(unix)]
+    let parent_directory = fs::File::open(parent).map_err(|error| {
+        format!(
+            "failed to open config directory {}: {error}",
+            parent.display()
+        )
+    })?;
+
+    let output = crate::json::serialize(&crate::json::JsonValue::Object(obj));
+    let (temp_path, mut temp_file) = loop {
+        let sequence = CONFIG_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut temp_name = OsString::from(".");
+        temp_name.push(file_name);
+        temp_name.push(format!(".{}-{sequence}.tmp", std::process::id()));
+        let temp_path = parent.join(temp_name);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temp_path) {
+            Ok(file) => break (temp_path, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "failed to create temporary config file {}: {error}",
+                    temp_path.display()
+                ));
+            }
+        }
+    };
+
+    let result = (|| -> Result<(), String> {
+        temp_file.write_all(output.as_bytes()).map_err(|error| {
             format!(
-                "failed to create config directory {}: {error}",
+                "failed to write temporary config file {}: {error}",
+                temp_path.display()
+            )
+        })?;
+        temp_file.sync_all().map_err(|error| {
+            format!(
+                "failed to sync temporary config file {}: {error}",
+                temp_path.display()
+            )
+        })?;
+        drop(temp_file);
+        fs::rename(&temp_path, path)
+            .map_err(|error| format!("failed to replace config {}: {error}", path.display()))?;
+        #[cfg(unix)]
+        parent_directory.sync_all().map_err(|error| {
+            format!(
+                "failed to sync config directory {}: {error}",
                 parent.display()
             )
         })?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
     }
-    let output = crate::json::serialize(&crate::json::JsonValue::Object(obj));
-    fs::write(path, output)
-        .map_err(|error| format!("failed to write config {}: {error}", path.display()))
+    result
 }
 
 pub fn config_get_api_key(provider: &str) -> Option<String> {
@@ -1166,6 +1236,69 @@ mod tests {
     }
 
     #[test]
+    fn config_writes_replace_the_file_atomically_and_privately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        fs::write(&path, r#"{"generation":"original"}"#).unwrap();
+
+        #[cfg(unix)]
+        let original_inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&path).unwrap().ino()
+        };
+
+        write_config_object(
+            &path,
+            HashMap::from([(
+                "generation".into(),
+                crate::json::JsonValue::String("replacement".into()),
+            )]),
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let parsed = crate::json::parse(&content).unwrap();
+        assert_eq!(
+            parsed
+                .as_object()
+                .and_then(|obj| obj.get("generation"))
+                .and_then(|value| value.as_str()),
+            Some("replacement")
+        );
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let metadata = fs::metadata(&path).unwrap();
+            assert_ne!(
+                metadata.ino(),
+                original_inode,
+                "config update must publish a new file rather than truncate in place"
+            );
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn failed_config_replace_removes_the_temporary_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("sentinel"), "keep").unwrap();
+
+        let error = write_config_object(&path, HashMap::new()).unwrap_err();
+
+        assert!(error.contains("failed to replace config"), "{error}");
+        assert_eq!(fs::read_to_string(path.join("sentinel")).unwrap(), "keep");
+        assert_eq!(
+            fs::read_dir(tmp.path()).unwrap().count(),
+            1,
+            "failed replacement must not leave a temporary config file"
+        );
+    }
+
+    #[test]
     fn test_env_key_for_known_providers() {
         // env_key_for must return None when the env var is unset, for each known provider.
         // We can't easily unset env vars, so we just check the function returns a String
@@ -1236,7 +1369,7 @@ mod tests {
             r#"{{"default_provider":"openrouter","default_model":"m","api_keys":{{"{provider}":"sk-migrate-test"}}}}"#
         )).unwrap();
 
-        migrate_plaintext_keys_in_file(&cfg_path);
+        migrate_plaintext_keys_in_file(&cfg_path).unwrap();
 
         // The key moved into the keyring...
         assert_eq!(keyring_get(provider), Some("sk-migrate-test".to_string()));
@@ -1253,6 +1386,48 @@ mod tests {
             Some("openrouter")
         );
 
+        let _ = keyring_delete(provider);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plaintext_key_migration_propagates_config_write_failures() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let provider = "cairn-code-test-provider-migrate-write-fail";
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let cfg_path = tmp.path().join("config.json");
+        let original = format!(
+            r#"{{"default_provider":"openrouter","api_keys":{{"{provider}":"sk-write-fail"}}}}"#
+        );
+        fs::write(&cfg_path, &original).unwrap();
+
+        let original_permissions = fs::metadata(tmp.path()).unwrap().permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_mode(original_permissions.mode() & !0o222);
+        fs::set_permissions(tmp.path(), read_only_permissions).unwrap();
+
+        // Elevated test environments may bypass mode bits. Skip the failure
+        // assertion there rather than depending on a particular user id.
+        let probe = tmp.path().join("permission-probe");
+        if fs::write(&probe, "probe").is_ok() {
+            fs::remove_file(probe).unwrap();
+            fs::set_permissions(tmp.path(), original_permissions).unwrap();
+            return;
+        }
+
+        let result = load_for_workspace(&cfg_path, &workspace);
+        fs::set_permissions(tmp.path(), original_permissions).unwrap();
+
+        let error = result.err().expect("migration config write should fail");
+        assert!(
+            error.contains("failed to create temporary config file"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&cfg_path).unwrap(), original);
+        assert_eq!(keyring_get(provider), Some("sk-write-fail".to_string()));
         let _ = keyring_delete(provider);
     }
 
@@ -1278,7 +1453,7 @@ mod tests {
             std::io::Error::other("mock storage failure"),
         )));
 
-        migrate_plaintext_keys_in_file(&cfg_path);
+        migrate_plaintext_keys_in_file(&cfg_path).unwrap();
 
         // The good provider's key made it into the keyring...
         assert_eq!(keyring_get(good_provider), Some("sk-good".to_string()));
