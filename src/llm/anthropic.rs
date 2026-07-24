@@ -525,9 +525,12 @@ fn parse_anthropic_response_value(val: &json::JsonValue) -> Result<AnthropicResp
                 let name = block.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
                     "Invalid Anthropic response: tool_use block missing name".to_string()
                 })?;
-                let input = block.get("input").ok_or_else(|| {
-                    "Invalid Anthropic response: tool_use block missing input".to_string()
-                })?;
+                let input = block
+                    .get("input")
+                    .filter(|value| value.as_object().is_some())
+                    .ok_or_else(|| {
+                        "Invalid Anthropic response: tool_use input must be an object".to_string()
+                    })?;
                 content.push(AnthropicContentBlock::ToolUse {
                     id: id.to_string(),
                     name: name.to_string(),
@@ -547,27 +550,25 @@ fn parse_anthropic_response_value(val: &json::JsonValue) -> Result<AnthropicResp
         }
     }
 
-    let usage = obj
-        .get("usage")
-        .ok_or_else(|| "Invalid Anthropic response: missing usage".to_string())?;
+    let usage = obj.get("usage");
     Ok(AnthropicResponse {
         role,
         content,
         usage: AnthropicUsage {
             input_tokens: usage
-                .get("input_tokens")
+                .and_then(|value| value.get("input_tokens"))
                 .and_then(|v| v.as_u64())
-                .ok_or_else(|| "Invalid Anthropic response: missing input_tokens".to_string())?,
+                .unwrap_or(0),
             output_tokens: usage
-                .get("output_tokens")
+                .and_then(|value| value.get("output_tokens"))
                 .and_then(|v| v.as_u64())
-                .ok_or_else(|| "Invalid Anthropic response: missing output_tokens".to_string())?,
+                .unwrap_or(0),
             cache_read_input_tokens: usage
-                .get("cache_read_input_tokens")
+                .and_then(|value| value.get("cache_read_input_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             cache_creation_input_tokens: usage
-                .get("cache_creation_input_tokens")
+                .and_then(|value| value.get("cache_creation_input_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
         },
@@ -911,6 +912,36 @@ mod tests {
     }
 
     #[test]
+    fn test_complete_response_preserves_escaped_tool_input() {
+        let raw = r#"{
+            "type":"message","role":"assistant",
+            "content":[{"type":"tool_use","id":"toolu_1","name":"shell","input":{
+                "command":"printf \"hello\"\n","path":"C:\\tmp","control":"tab\tand\u0001"
+            }}]
+        }"#;
+        let (messages, _) = parse_anthropic_complete_response(raw).unwrap();
+        let Content::ToolUse(tool_use) = &messages[0].content else {
+            panic!("expected ToolUse content");
+        };
+
+        let input = json::parse(&tool_use.input).unwrap();
+        assert_eq!(input.get("command").and_then(|v| v.as_str()), Some("printf \"hello\"\n"));
+        assert_eq!(input.get("path").and_then(|v| v.as_str()), Some("C:\\tmp"));
+        assert_eq!(input.get("control").and_then(|v| v.as_str()), Some("tab\tand\u{0001}"));
+    }
+
+    #[test]
+    fn test_complete_response_rejects_non_object_tool_input() {
+        for input in ["null", "\"bad\"", "[]"] {
+            let raw = format!(
+                r#"{{"type":"message","role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"shell","input":{input}}}]}}"#
+            );
+            let error = parse_anthropic_complete_response(&raw).unwrap_err();
+            assert!(error.contains("input must be an object"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
     fn test_complete_response_parses_usage_including_cache_tokens() {
         let raw = r#"{
             "type":"message","role":"assistant","content":[],
@@ -925,6 +956,38 @@ mod tests {
         assert_eq!(usage.output_tokens, 25);
         assert_eq!(usage.cache_read, 80);
         assert_eq!(usage.cache_create, 10);
+    }
+
+    #[test]
+    fn test_complete_response_defaults_missing_usage() {
+        let raw = r#"{
+            "type":"message","role":"assistant",
+            "content":[{"type":"text","text":"usable"}]
+        }"#;
+        let (messages, usage) = parse_anthropic_complete_response(raw).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.cache_read, 0);
+        assert_eq!(usage.cache_create, 0);
+    }
+
+    #[test]
+    fn test_complete_response_defaults_invalid_usage_fields_independently() {
+        let raw = r#"{
+            "type":"message","role":"assistant","content":[],
+            "usage":{
+                "input_tokens":"unknown","output_tokens":7,
+                "cache_read_input_tokens":-1,"cache_creation_input_tokens":3
+            }
+        }"#;
+        let (_, usage) = parse_anthropic_complete_response(raw).unwrap();
+
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cache_read, 0);
+        assert_eq!(usage.cache_create, 3);
     }
 
     #[test]

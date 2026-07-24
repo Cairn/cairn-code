@@ -7,6 +7,7 @@ pub mod file_edit;
 pub mod file_undo;
 pub mod shell;
 pub mod powershell_tool;
+pub mod python_tool;
 pub mod go_tool;
 pub mod git_tool;
 pub mod glob_tool;

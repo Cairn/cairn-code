@@ -122,9 +122,32 @@ fn platform_beep_attention() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct SoundEnv(Option<std::ffi::OsString>);
+
+    impl SoundEnv {
+        fn capture() -> Self {
+            Self(std::env::var_os("CAIRN_SOUND"))
+        }
+    }
+
+    impl Drop for SoundEnv {
+        fn drop(&mut self) {
+            if let Some(value) = &self.0 {
+                std::env::set_var("CAIRN_SOUND", value);
+            } else {
+                std::env::remove_var("CAIRN_SOUND");
+            }
+        }
+    }
 
     #[test]
     fn enabled_defaults_true_without_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _sound_env = SoundEnv::capture();
         // Do not assert absolute truth under env pollution; just ensure the
         // parser treats explicit off values as disabled.
         std::env::set_var("CAIRN_SOUND", "0");
@@ -133,14 +156,14 @@ mod tests {
         assert!(!enabled());
         std::env::set_var("CAIRN_SOUND", "1");
         assert!(enabled());
-        std::env::remove_var("CAIRN_SOUND");
     }
 
     #[test]
     fn play_does_not_panic() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _sound_env = SoundEnv::capture();
         std::env::set_var("CAIRN_SOUND", "0");
         play(Kind::Done);
         play(Kind::Attention);
-        std::env::remove_var("CAIRN_SOUND");
     }
 }

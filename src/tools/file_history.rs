@@ -1,6 +1,7 @@
 use std::cell::RefCell;
-use std::fs;
 use std::path::PathBuf;
+
+use super::workspace::Workspace;
 
 /// In-process stack of file snapshots taken before mutating writes
 /// (`file_edit` / `file_write`). `file_undo` pops the most recent entry and
@@ -9,6 +10,7 @@ use std::path::PathBuf;
 /// Thread-local so the agent loop (single worker thread) sees a coherent
 /// stack, and so unit tests running in parallel do not clobber each other.
 struct Entry {
+    workspace: Workspace,
     path: PathBuf,
     label: String,
     /// `None` means the file did not exist before the write (undo = delete).
@@ -32,13 +34,23 @@ fn push(entry: Entry) {
 }
 
 /// Snapshot a path by reading it from disk (or recording that it is new).
-pub fn record_before_write(path: PathBuf, label: &str) -> Result<(), String> {
-    let previous = if path.exists() {
-        Some(fs::read_to_string(&path).map_err(|e| format!("read error before write: {e}"))?)
-    } else {
-        None
+pub fn record_before_write(
+    workspace: &Workspace,
+    path: PathBuf,
+    label: &str,
+) -> Result<(), String> {
+    let previous = match workspace.dir().read_to_string(&path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "read error before write: {}",
+                workspace.access_error(&path, error)
+            ))
+        }
     };
     push(Entry {
+        workspace: workspace.clone(),
         path,
         label: label.to_string(),
         previous,
@@ -48,8 +60,9 @@ pub fn record_before_write(path: PathBuf, label: &str) -> Result<(), String> {
 
 /// Snapshot known previous content (avoids a second disk read when the
 /// caller already loaded the file, e.g. `file_edit`).
-pub fn record_snapshot(path: PathBuf, label: &str, previous: String) {
+pub fn record_snapshot(workspace: &Workspace, path: PathBuf, label: &str, previous: String) {
     push(Entry {
+        workspace: workspace.clone(),
         path,
         label: label.to_string(),
         previous: Some(previous),
@@ -64,15 +77,29 @@ pub fn undo_last() -> Result<String, String> {
 
     match entry.previous {
         Some(content) => {
-            if let Some(parent) = entry.path.parent() {
-                fs::create_dir_all(parent).map_err(|e| format!("undo mkdir failed: {e}"))?;
-            }
-            fs::write(&entry.path, content).map_err(|e| format!("undo write failed: {e}"))?;
+            entry.workspace.create_parent_dirs(&entry.path)?;
+            entry
+                .workspace
+                .dir()
+                .write(&entry.path, content)
+                .map_err(|e| {
+                    format!(
+                        "undo write failed: {}",
+                        entry.workspace.access_error(&entry.path, e)
+                    )
+                })?;
             Ok(format!("Restored previous contents of {}", entry.label))
         }
         None => {
-            if entry.path.exists() {
-                fs::remove_file(&entry.path).map_err(|e| format!("undo remove failed: {e}"))?;
+            match entry.workspace.dir().remove_file(&entry.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "undo remove failed: {}",
+                        entry.workspace.access_error(&entry.path, error)
+                    ))
+                }
             }
             Ok(format!("Removed newly created file {}", entry.label))
         }

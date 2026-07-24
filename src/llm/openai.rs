@@ -55,6 +55,19 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn request_body_includes_max_completion_tokens() {
+        let body = openai_request_body(&[], &[], "sys", "gpt-4o", 12_345, false).unwrap();
+        let value = crate::json::parse(&body).unwrap();
+        let object = value.as_object().unwrap();
+
+        assert_eq!(
+            object.get("max_completion_tokens").and_then(|v| v.as_u64()),
+            Some(12_345)
+        );
+        assert!(object.get("max_tokens").is_none());
+    }
 }
 
 impl Provider for OpenAIProvider {
@@ -74,13 +87,13 @@ impl Provider for OpenAIProvider {
         tools: &[ToolDefinition],
         system: &str,
         model: &str,
-        _max_tokens: usize,
+        max_tokens: usize,
         mut on_chunk: StreamingCallback,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(Vec<Message>, Usage), String> {
         let key = self.get_key();
         if key.is_empty() { return Err(crate::llm::provider::missing_api_key("OPENAI_API_KEY")); }
-        let body = openai_request_body(messages, tools, system, model, true)?;
+        let body = openai_request_body(messages, tools, system, model, max_tokens, true)?;
         let req = http_client::HttpRequest {
             url: "https://api.openai.com/v1/chat/completions".into(),
             headers: vec![
@@ -120,11 +133,11 @@ impl Provider for OpenAIProvider {
         tools: &[ToolDefinition],
         system: &str,
         model: &str,
-        _max_tokens: usize,
+        max_tokens: usize,
     ) -> Result<(Vec<Message>, Usage), String> {
         let key = self.get_key();
         if key.is_empty() { return Err(crate::llm::provider::missing_api_key("OPENAI_API_KEY")); }
-        let body = openai_request_body(messages, tools, system, model, false)?;
+        let body = openai_request_body(messages, tools, system, model, max_tokens, false)?;
         let req = http_client::HttpRequest {
             url: "https://api.openai.com/v1/chat/completions".into(),
             headers: vec![
@@ -143,9 +156,11 @@ fn openai_request_body(
     tools: &[ToolDefinition],
     system: &str,
     model: &str,
+    max_tokens: usize,
     stream: bool,
 ) -> Result<String, String> {
     let mut body = format!("{{\"model\":\"{model}\",\"stream\":{stream}");
+    body.push_str(&format!(",\"max_completion_tokens\":{max_tokens}"));
     body.push_str(",\"messages\":");
     body.push_str(&crate::llm::openai_compat::build_messages_json(messages, system));
     body.push_str(&crate::llm::openai_compat::build_tools_json(tools));
