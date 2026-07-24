@@ -942,11 +942,7 @@ mod tests {
         let leftovers: Vec<_> = fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains(".tmp")
-            })
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "tmp files left: {leftovers:?}");
         let _ = fs::remove_dir_all(&dir);
