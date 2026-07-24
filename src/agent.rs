@@ -1,10 +1,10 @@
 use std::fs;
-use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 
 use crate::config::Config;
-use crate::llm::Usage;
 use crate::llm;
+use crate::llm::Usage;
 use crate::tools::registry::Registry;
 
 #[allow(dead_code)]
@@ -81,15 +81,23 @@ impl Agent {
     }
 
     #[allow(dead_code)]
-    pub fn model(&self) -> &str { &self.model }
+    pub fn model(&self) -> &str {
+        &self.model
+    }
     #[allow(dead_code)]
-    pub fn provider_name(&self) -> &str { self.provider.name() }
+    pub fn provider_name(&self) -> &str {
+        self.provider.name()
+    }
     #[allow(dead_code)]
-    pub fn available_models(&self) -> Vec<llm::ModelInfo> { self.provider.available_models() }
+    pub fn available_models(&self) -> Vec<llm::ModelInfo> {
+        self.provider.available_models()
+    }
 
     pub fn switch_provider(&mut self, provider_name: &str, model: &str) -> Result<(), String> {
         let mut providers = crate::llm::provider::default_providers();
-        let provider = providers.remove(provider_name).ok_or_else(|| format!("Unknown provider: {provider_name}"))?;
+        let provider = providers
+            .remove(provider_name)
+            .ok_or_else(|| format!("Unknown provider: {provider_name}"))?;
         self.provider = provider;
         self.model = model.to_string();
         self.last_input_tokens = 0;
@@ -125,7 +133,10 @@ impl Agent {
         if self.last_input_tokens == 0 || self.messages.len() < MIN_MESSAGES_TO_COMPACT {
             return false;
         }
-        let max_ctx = self.provider.available_models().iter()
+        let max_ctx = self
+            .provider
+            .available_models()
+            .iter()
             .find(|m| m.id == self.model)
             .map(|m| m.max_ctx);
         match max_ctx {
@@ -142,13 +153,22 @@ impl Agent {
     /// (no safe split point, too few messages, or the summarization call
     /// itself failed). When `tx` is `Some`, emits usage and Compacted events.
     fn compact_history(&mut self, tx: Option<&mpsc::Sender<AgentEvent>>) -> usize {
-        let Some(split) = find_safe_split_point(&self.messages) else { return 0; };
+        let Some(split) = find_safe_split_point(&self.messages) else {
+            return 0;
+        };
 
         let transcript = render_transcript(&self.messages[..split]);
-        let request = vec![llm::Message { role: "user".into(), content: llm::Content::Text(transcript) }];
+        let request = vec![llm::Message {
+            role: "user".into(),
+            content: llm::Content::Text(transcript),
+        }];
 
         let (summary_msgs, summary_usage) = match self.provider.complete(
-            &request, &[], SUMMARY_SYSTEM_PROMPT, &self.model, SUMMARY_MAX_TOKENS,
+            &request,
+            &[],
+            SUMMARY_SYSTEM_PROMPT,
+            &self.model,
+            SUMMARY_MAX_TOKENS,
         ) {
             Ok(r) => r,
             Err(_) => return 0,
@@ -158,7 +178,9 @@ impl Agent {
             llm::Content::Text(t) if !t.is_empty() => Some(t.clone()),
             _ => None,
         });
-        let Some(summary) = summary else { return 0; };
+        let Some(summary) = summary else {
+            return 0;
+        };
 
         let mut compacted = vec![llm::Message {
             role: "user".into(),
@@ -201,10 +223,20 @@ impl Agent {
 
     fn format_llm_err(e: String) -> String {
         let e = crate::redact::redact_secrets(&e);
-        if e.starts_with("LLM error:") { e } else { format!("LLM error: {e}") }
+        if e.starts_with("LLM error:") {
+            e
+        } else {
+            format!("LLM error: {e}")
+        }
     }
 
-    pub fn run(&mut self, input: &str, tx: mpsc::Sender<AgentEvent>, cancel: &AtomicBool, perm_rx: &mpsc::Receiver<String>) -> Result<(), String> {
+    pub fn run(
+        &mut self,
+        input: &str,
+        tx: mpsc::Sender<AgentEvent>,
+        cancel: &AtomicBool,
+        perm_rx: &mpsc::Receiver<String>,
+    ) -> Result<(), String> {
         self.messages.push(llm::Message {
             role: "user".into(),
             content: llm::Content::Text(input.to_string()),
@@ -276,7 +308,8 @@ impl Agent {
                     cache_create: usage.cache_create,
                 }));
 
-                let tool_uses: Vec<llm::ToolUse> = new_msgs.iter()
+                let tool_uses: Vec<llm::ToolUse> = new_msgs
+                    .iter()
                     .filter_map(|m| match &m.content {
                         llm::Content::ToolUse(tu) => Some(tu.clone()),
                         _ => None,
@@ -354,10 +387,16 @@ impl Agent {
     fn execute_tool_with_policy(
         &mut self,
         tu: &llm::ToolUse,
-        interactive: Option<(&mpsc::Sender<AgentEvent>, &AtomicBool, &mpsc::Receiver<String>)>,
+        interactive: Option<(
+            &mpsc::Sender<AgentEvent>,
+            &AtomicBool,
+            &mpsc::Receiver<String>,
+        )>,
     ) -> Result<String, String> {
         let tool = self.tools.get(&tu.name);
-        let wants_permission = tool.map(|t| t.needs_permission_for(&tu.input)).unwrap_or(false);
+        let wants_permission = tool
+            .map(|t| t.needs_permission_for(&tu.input))
+            .unwrap_or(false);
         let needs_ask = wants_permission || self.config.ask.iter().any(|t| t == &tu.name);
         let permission_key = tool
             .map(|t| t.permission_key(&tu.input))
@@ -381,7 +420,10 @@ impl Agent {
             ));
         };
 
-        let _ = tx.send(AgentEvent::PermissionRequest(tu.name.clone(), tu.input.clone()));
+        let _ = tx.send(AgentEvent::PermissionRequest(
+            tu.name.clone(),
+            tu.input.clone(),
+        ));
         let response = loop {
             match perm_rx.recv_timeout(std::time::Duration::from_millis(200)) {
                 Ok(resp) => break resp,
@@ -429,14 +471,18 @@ impl Agent {
             Ok(r) => r,
             Err(e) => {
                 let err = Self::format_llm_err(e);
-                if crate::http_client::is_context_limit_error(&err) && self.compact_history(None) > 0 {
-                    self.provider.complete(
-                        &self.messages,
-                        &tool_defs,
-                        &system,
-                        &self.model,
-                        self.config.max_tokens,
-                    ).map_err(Self::format_llm_err)?
+                if crate::http_client::is_context_limit_error(&err)
+                    && self.compact_history(None) > 0
+                {
+                    self.provider
+                        .complete(
+                            &self.messages,
+                            &tool_defs,
+                            &system,
+                            &self.model,
+                            self.config.max_tokens,
+                        )
+                        .map_err(Self::format_llm_err)?
                 } else {
                     return Err(err);
                 }
@@ -500,12 +546,18 @@ fn find_safe_split_point(messages: &[llm::Message]) -> Option<usize> {
 
 /// Flatten messages into plain text for the summarizer.
 fn render_transcript(messages: &[llm::Message]) -> String {
-    messages.iter().map(|m| match &m.content {
-        llm::Content::Text(t) => format!("{}: {t}", m.role),
-        llm::Content::Thinking(t) => format!("{} [thinking]: {t}", m.role),
-        llm::Content::ToolUse(tu) => format!("assistant [tool call]: {}({})", tu.name, tu.input),
-        llm::Content::ToolResult(tr) => format!("tool result: {}", tr.content),
-    }).collect::<Vec<_>>().join("\n\n")
+    messages
+        .iter()
+        .map(|m| match &m.content {
+            llm::Content::Text(t) => format!("{}: {t}", m.role),
+            llm::Content::Thinking(t) => format!("{} [thinking]: {t}", m.role),
+            llm::Content::ToolUse(tu) => {
+                format!("assistant [tool call]: {}({})", tu.name, tu.input)
+            }
+            llm::Content::ToolResult(tr) => format!("tool result: {}", tr.content),
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 #[cfg(test)]
@@ -514,7 +566,10 @@ mod tests {
     use crate::llm::{Content, Message, ToolResult, ToolUse};
 
     fn text(role: &str, body: &str) -> Message {
-        Message { role: role.into(), content: Content::Text(body.into()) }
+        Message {
+            role: role.into(),
+            content: Content::Text(body.into()),
+        }
     }
 
     fn tool_use(name: &str, input: &str) -> Message {
@@ -630,9 +685,13 @@ mod tests {
         assert_eq!(agent.provider_name(), "openai");
         assert_eq!(agent.model(), "gpt-5-mini");
         assert_eq!(agent.messages().len(), 4);
-        assert!(matches!(&agent.messages()[0].content, Content::Text(t) if t == "inspect src/main.rs"));
+        assert!(
+            matches!(&agent.messages()[0].content, Content::Text(t) if t == "inspect src/main.rs")
+        );
         assert!(matches!(&agent.messages()[1].content, Content::ToolUse(tu) if tu.name == "read"));
-        assert!(matches!(&agent.messages()[2].content, Content::ToolResult(tr) if tr.content == "fn main() {}"));
+        assert!(
+            matches!(&agent.messages()[2].content, Content::ToolResult(tr) if tr.content == "fn main() {}")
+        );
         assert!(matches!(&agent.messages()[3].content, Content::Text(t) if t == "done"));
         assert_eq!(agent.usage().input_tokens, 120);
         assert_eq!(agent.usage().output_tokens, 30);
@@ -663,10 +722,18 @@ mod tests {
     }
 
     impl llm::Provider for SharedMock {
-        fn name(&self) -> &str { "mock" }
-        fn default_model(&self) -> &str { "mock-model" }
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn default_model(&self) -> &str {
+            "mock-model"
+        }
         fn available_models(&self) -> Vec<llm::ModelInfo> {
-            vec![llm::ModelInfo { id: "mock-model".into(), name: "Mock".into(), max_ctx: 1000 }]
+            vec![llm::ModelInfo {
+                id: "mock-model".into(),
+                name: "Mock".into(),
+                max_ctx: 1000,
+            }]
         }
         fn stream_complete(
             &self,
@@ -712,7 +779,12 @@ mod tests {
                     role: "assistant".into(),
                     content: llm::Content::Text("Prior work on foo.rs and bar.rs.".into()),
                 }],
-                Usage { input_tokens: 40, output_tokens: 12, cache_read: 0, cache_create: 0 },
+                Usage {
+                    input_tokens: 40,
+                    output_tokens: 12,
+                    cache_read: 0,
+                    cache_create: 0,
+                },
             ))
         }
     }
@@ -786,17 +858,29 @@ mod tests {
 
         agent.run("first", tx.clone(), &cancel, &perm_rx).unwrap();
         assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(complete_calls.load(Ordering::SeqCst), 0, "no compact on first turn");
+        assert_eq!(
+            complete_calls.load(Ordering::SeqCst),
+            0,
+            "no compact on first turn"
+        );
 
         while rx.try_recv().is_ok() {}
 
         agent.run("second", tx, &cancel, &perm_rx).unwrap();
-        assert_eq!(complete_calls.load(Ordering::SeqCst), 1, "summarizer should run before second stream");
+        assert_eq!(
+            complete_calls.load(Ordering::SeqCst),
+            1,
+            "summarizer should run before second stream"
+        );
         assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
 
         let events: Vec<_> = rx.try_iter().collect();
         let compacted = events.iter().any(|e| matches!(e, AgentEvent::Compacted(_)));
-        assert!(compacted, "expected Compacted event among {} events", events.len());
+        assert!(
+            compacted,
+            "expected Compacted event among {} events",
+            events.len()
+        );
 
         let msgs = agent.messages();
         assert!(
@@ -805,7 +889,10 @@ mod tests {
         );
         // Pre-compact peak is seed(16)+user+asst+user ≈ 19; compacted should be smaller.
         let seen = *last_count.lock().unwrap();
-        assert!(seen < 20, "second stream should see a compacted history, got {seen} messages");
+        assert!(
+            seen < 20,
+            "second stream should see a compacted history, got {seen} messages"
+        );
     }
 
     /// First stream fails with a context-limit error; after compact, second stream succeeds.
@@ -815,10 +902,18 @@ mod tests {
     }
 
     impl llm::Provider for ReactiveMock {
-        fn name(&self) -> &str { "mock" }
-        fn default_model(&self) -> &str { "mock-model" }
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn default_model(&self) -> &str {
+            "mock-model"
+        }
         fn available_models(&self) -> Vec<llm::ModelInfo> {
-            vec![llm::ModelInfo { id: "mock-model".into(), name: "Mock".into(), max_ctx: 1000 }]
+            vec![llm::ModelInfo {
+                id: "mock-model".into(),
+                name: "Mock".into(),
+                max_ctx: 1000,
+            }]
         }
         fn stream_complete(
             &self,
@@ -840,7 +935,12 @@ mod tests {
                     role: "assistant".into(),
                     content: llm::Content::Text("recovered".into()),
                 }],
-                Usage { input_tokens: 50, output_tokens: 3, cache_read: 0, cache_create: 0 },
+                Usage {
+                    input_tokens: 50,
+                    output_tokens: 3,
+                    cache_read: 0,
+                    cache_create: 0,
+                },
             ))
         }
         fn complete(
@@ -857,7 +957,12 @@ mod tests {
                     role: "assistant".into(),
                     content: llm::Content::Text("summary".into()),
                 }],
-                Usage { input_tokens: 10, output_tokens: 5, cache_read: 0, cache_create: 0 },
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read: 0,
+                    cache_create: 0,
+                },
             ))
         }
     }
@@ -912,7 +1017,10 @@ mod tests {
         );
         let (tx, _rx) = mpsc::channel();
         let err = agent.compact_now(&tx).unwrap_err();
-        assert!(err.to_ascii_lowercase().contains("could not compact"), "{err}");
+        assert!(
+            err.to_ascii_lowercase().contains("could not compact"),
+            "{err}"
+        );
     }
 
     /// Always returns a single assistant `ToolUse` message for the configured
@@ -930,10 +1038,18 @@ mod tests {
     }
 
     impl crate::tools::registry::Tool for RecordingTool {
-        fn name(&self) -> &str { &self.name }
-        fn description(&self) -> &str { "Records executions for authorization tests" }
-        fn input_schema(&self) -> String { r#"{"type":"object"}"#.into() }
-        fn needs_permission(&self) -> bool { self.needs_permission }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "Records executions for authorization tests"
+        }
+        fn input_schema(&self) -> String {
+            r#"{"type":"object"}"#.into()
+        }
+        fn needs_permission(&self) -> bool {
+            self.needs_permission
+        }
         fn execute(&self, _input: &str) -> Result<String, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("recorded execution".into())
@@ -941,10 +1057,18 @@ mod tests {
     }
 
     impl llm::Provider for ToolCallMock {
-        fn name(&self) -> &str { "mock" }
-        fn default_model(&self) -> &str { "mock-model" }
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn default_model(&self) -> &str {
+            "mock-model"
+        }
         fn available_models(&self) -> Vec<llm::ModelInfo> {
-            vec![llm::ModelInfo { id: "mock-model".into(), name: "Mock".into(), max_ctx: 1000 }]
+            vec![llm::ModelInfo {
+                id: "mock-model".into(),
+                name: "Mock".into(),
+                max_ctx: 1000,
+            }]
         }
         fn stream_complete(
             &self,
@@ -994,7 +1118,10 @@ mod tests {
         }));
         (
             Agent::new(
-                Box::new(ToolCallMock { tool_name: tool_name.into(), tool_input: "{}".into() }),
+                Box::new(ToolCallMock {
+                    tool_name: tool_name.into(),
+                    tool_input: "{}".into(),
+                }),
                 "mock-model".into(),
                 registry,
                 config,
@@ -1004,7 +1131,11 @@ mod tests {
     }
 
     fn test_tool_use(name: &str) -> llm::ToolUse {
-        llm::ToolUse { id: "1".into(), name: name.into(), input: "{}".into() }
+        llm::ToolUse {
+            id: "1".into(),
+            name: name.into(),
+            input: "{}".into(),
+        }
     }
 
     /// C-01 regression: print mode (`run_simple`) must not execute a tool
@@ -1057,7 +1188,11 @@ mod tests {
         let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
         let output = agent.run_simple("do something").unwrap();
         assert!(output.contains("denied by config"), "{output}");
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "deny must override auto_allow");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "deny must override auto_allow"
+        );
     }
 
     /// Tools that don't need permission should keep working unattended.
@@ -1112,7 +1247,10 @@ mod tests {
 
         assert!(result.unwrap_err().contains("Permission denied"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert!(matches!(event_rx.recv().unwrap(), AgentEvent::PermissionRequest(_, _)));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AgentEvent::PermissionRequest(_, _)
+        ));
     }
 
     #[test]

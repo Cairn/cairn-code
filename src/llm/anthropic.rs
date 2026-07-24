@@ -108,7 +108,9 @@ impl Provider for AnthropicProvider {
                             match obj.get("type").and_then(|v| v.as_str()) {
                                 Some("content_block_delta") => {
                                     if let Some(delta) = obj.get("delta") {
-                                        if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
+                                        if let Some(text) =
+                                            delta.get("text").and_then(|v| v.as_str())
+                                        {
                                             on_chunk(text, "text");
                                         }
                                         if let Some(text) =
@@ -313,7 +315,10 @@ fn parse_models_page(body: &str) -> Result<ModelsPage, String> {
             max_ctx,
         });
     }
-    let has_more = val.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
+    let has_more = val
+        .get("has_more")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let last_id = val
         .get("last_id")
         .and_then(|v| v.as_str())
@@ -328,10 +333,7 @@ fn parse_models_page(body: &str) -> Result<ModelsPage, String> {
 
 fn display_name_fallback(id: &str) -> String {
     // claude-opus-4-8 → Claude Opus 4.8 (best-effort)
-    let rest = id
-        .strip_prefix("claude-")
-        .unwrap_or(id)
-        .replace('-', " ");
+    let rest = id.strip_prefix("claude-").unwrap_or(id).replace('-', " ");
     let mut out = String::from("Claude");
     for word in rest.split_whitespace() {
         out.push(' ');
@@ -408,10 +410,10 @@ fn build_request_body(
             tools
                 .iter()
                 .map(|tool| {
-                    let input_schema =
-                        serde_json::from_str::<serde_json::Value>(&tool.input_schema).map_err(
-                            |e| format!("Invalid input schema for tool '{}': {e}", tool.name),
-                        )?;
+                    let input_schema = serde_json::from_str::<serde_json::Value>(
+                        &tool.input_schema,
+                    )
+                    .map_err(|e| format!("Invalid input schema for tool '{}': {e}", tool.name))?;
                     Ok(serde_json::json!({
                         "name": tool.name,
                         "description": tool.description,
@@ -593,7 +595,8 @@ fn parse_anthropic_streaming_response(raw: &str) -> Result<(Vec<Message>, Usage)
                             if let Some(block) = obj.get("content_block") {
                                 match block.get("type").and_then(|v| v.as_str()) {
                                     Some("text") => {
-                                        if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                                        if let Some(t) = block.get("text").and_then(|v| v.as_str())
+                                        {
                                             text_accum = t.to_string();
                                         }
                                     }
@@ -925,9 +928,15 @@ mod tests {
         };
 
         let input = json::parse(&tool_use.input).unwrap();
-        assert_eq!(input.get("command").and_then(|v| v.as_str()), Some("printf \"hello\"\n"));
+        assert_eq!(
+            input.get("command").and_then(|v| v.as_str()),
+            Some("printf \"hello\"\n")
+        );
         assert_eq!(input.get("path").and_then(|v| v.as_str()), Some("C:\\tmp"));
-        assert_eq!(input.get("control").and_then(|v| v.as_str()), Some("tab\tand\u{0001}"));
+        assert_eq!(
+            input.get("control").and_then(|v| v.as_str()),
+            Some("tab\tand\u{0001}")
+        );
     }
 
     #[test]
@@ -937,7 +946,10 @@ mod tests {
                 r#"{{"type":"message","role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"shell","input":{input}}}]}}"#
             );
             let error = parse_anthropic_complete_response(&raw).unwrap_err();
-            assert!(error.contains("input must be an object"), "unexpected error: {error}");
+            assert!(
+                error.contains("input must be an object"),
+                "unexpected error: {error}"
+            );
         }
     }
 

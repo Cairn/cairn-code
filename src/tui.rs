@@ -1,11 +1,10 @@
 use std::io::{self, stdout, Write};
-use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui::{
-    DefaultTerminal, Frame,
     crossterm::{
         event::{
             DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -17,6 +16,7 @@ use ratatui::{
     style::Modifier,
     text::{Line, Span, Text},
     widgets::{Paragraph, Wrap},
+    DefaultTerminal, Frame,
 };
 
 /// What to dump in plain-text select mode (outside the alternate screen).
@@ -28,9 +28,9 @@ enum SelectDump {
     FullTranscript,
 }
 
+use crate::agent::AgentEvent;
 use crate::llm;
 use crate::session;
-use crate::agent::AgentEvent;
 use crate::theme::{self, Theme};
 
 pub struct OutputLine {
@@ -192,10 +192,25 @@ impl Tui {
             api_key_target: None,
             show_command_picker: false,
             cmd_picker_list: vec![
-                "/auth".into(), "/clear".into(), "/compact".into(), "/cost".into(), "/delete".into(),
-                "/exit".into(), "/help".into(), "/model".into(), "/provider".into(), "/quit".into(),
-                "/copy".into(), "/q".into(), "/resume".into(), "/save".into(), "/select".into(),
-                "/sessions".into(), "/suggestions".into(), "/theme".into(), "/thinking".into(),
+                "/auth".into(),
+                "/clear".into(),
+                "/compact".into(),
+                "/cost".into(),
+                "/delete".into(),
+                "/exit".into(),
+                "/help".into(),
+                "/model".into(),
+                "/provider".into(),
+                "/quit".into(),
+                "/copy".into(),
+                "/q".into(),
+                "/resume".into(),
+                "/save".into(),
+                "/select".into(),
+                "/sessions".into(),
+                "/suggestions".into(),
+                "/theme".into(),
+                "/thinking".into(),
                 "/mouse".into(),
             ],
             cmd_picker_filtered: Vec::new(),
@@ -245,7 +260,9 @@ impl Tui {
     pub fn set_theme_name(&mut self, name: &str) {
         self.theme = theme::lookup(name);
         self.theme_picker_list = theme::all_themes();
-        self.theme_picker_sel = self.theme_picker_list.iter()
+        self.theme_picker_sel = self
+            .theme_picker_list
+            .iter()
             .position(|t| t.name == self.theme.name)
             .unwrap_or(0);
     }
@@ -361,7 +378,10 @@ impl Tui {
                             out.push_str(&format!("● {} {}\n", line.tool_name, line.content));
                         }
                         "tool_result" => {
-                            out.push_str(&format!("● {} result:\n{}\n", line.tool_name, line.content));
+                            out.push_str(&format!(
+                                "● {} result:\n{}\n",
+                                line.tool_name, line.content
+                            ));
                         }
                         "error" => {
                             out.push_str("Error: ");
@@ -426,7 +446,9 @@ impl Tui {
                 while let Ok(event) = rx.try_recv() {
                     got_event = true;
                     match event {
-                        AgentEvent::Text(t) => { self.streaming_text.push_str(&t); }
+                        AgentEvent::Text(t) => {
+                            self.streaming_text.push_str(&t);
+                        }
                         AgentEvent::Thinking(t) => {
                             if self.thinking_started.is_none() {
                                 self.thinking_started = Some(Instant::now());
@@ -436,12 +458,18 @@ impl Tui {
                         AgentEvent::ToolUse(name, input) => {
                             self.flush_streaming();
                             self.output_lines.push(OutputLine {
-                                type_: "tool_use".into(), content: input, tool_name: name, duration: String::new(),
+                                type_: "tool_use".into(),
+                                content: input,
+                                tool_name: name,
+                                duration: String::new(),
                             });
                         }
                         AgentEvent::ToolResult(name, _inp, out) => {
                             self.output_lines.push(OutputLine {
-                                type_: "tool_result".into(), content: out, tool_name: name, duration: String::new(),
+                                type_: "tool_result".into(),
+                                content: out,
+                                tool_name: name,
+                                duration: String::new(),
                             });
                         }
                         AgentEvent::Error(e) => {
@@ -498,7 +526,9 @@ impl Tui {
                             }
                             self.refresh_idle_suggestion();
                             if self.pending_model_after_auth {
-                                let target = self.pending_provider_selection.clone()
+                                let target = self
+                                    .pending_provider_selection
+                                    .clone()
                                     .unwrap_or_else(|| self.provider.clone());
                                 if crate::config::has_usable_credential(&target) {
                                     // Signed in — now pick a model (live catalog available).
@@ -530,7 +560,9 @@ impl Tui {
                         }
                     }
                 }
-                if got_event { self.dirty = true; }
+                if got_event {
+                    self.dirty = true;
+                }
             }
 
             if matches!(self.state, State::Idle) {
@@ -578,8 +610,7 @@ impl Tui {
                 } else {
                     until_spinner.min(MIN_FRAME)
                 };
-                let event_avail =
-                    ratatui::crossterm::event::poll(poll_for).unwrap_or(false);
+                let event_avail = ratatui::crossterm::event::poll(poll_for).unwrap_or(false);
                 if event_avail {
                     match ratatui::crossterm::event::read() {
                         Ok(Event::Key(key)) => {
@@ -701,13 +732,21 @@ impl Tui {
 
     fn scroll_page(&mut self, down: bool) {
         let page = self.last_body_h.max(1).saturating_sub(1);
-        self.scroll_transcript(if down { page as isize } else { -(page as isize) });
+        self.scroll_transcript(if down {
+            page as isize
+        } else {
+            -(page as isize)
+        });
     }
 
     fn scroll_half_page(&mut self, down: bool) {
         // videre: half = screen_rows / 2
         let half = (self.last_body_h.max(1) / 2).max(1);
-        self.scroll_transcript(if down { half as isize } else { -(half as isize) });
+        self.scroll_transcript(if down {
+            half as isize
+        } else {
+            -(half as isize)
+        });
     }
 
     fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) -> bool {
@@ -798,7 +837,9 @@ impl Tui {
                     self.perm_selection = self.perm_selection.saturating_sub(1);
                 }
                 KeyCode::Right => {
-                    if self.perm_selection < 2 { self.perm_selection += 1; }
+                    if self.perm_selection < 2 {
+                        self.perm_selection += 1;
+                    }
                 }
                 KeyCode::Enter => {
                     let selected = match self.perm_selection {
@@ -862,9 +903,15 @@ impl Tui {
 
         if let Some(name) = self.confirm_remove_provider.clone() {
             match key.code {
-                KeyCode::Left => { self.confirm_remove_sel = 0; }
-                KeyCode::Right => { self.confirm_remove_sel = 1; }
-                KeyCode::Esc => { self.confirm_remove_provider = None; }
+                KeyCode::Left => {
+                    self.confirm_remove_sel = 0;
+                }
+                KeyCode::Right => {
+                    self.confirm_remove_sel = 1;
+                }
+                KeyCode::Esc => {
+                    self.confirm_remove_provider = None;
+                }
                 KeyCode::Enter => {
                     let remove = self.confirm_remove_sel == 1;
                     self.confirm_remove_provider = None;
@@ -876,17 +923,27 @@ impl Tui {
                                         crate::config::env_var_name(&name).unwrap_or("its environment variable")),
                                     None => String::new(),
                                 };
-                                ("system", format!("Removed saved API key for {name}.{env_note}"))
+                                (
+                                    "system",
+                                    format!("Removed saved API key for {name}.{env_note}"),
+                                )
                             }
                             Ok(false) => ("system", format!("No saved API key for {name}.")),
-                            Err(e) => ("error", format!("Failed to remove API key for {name}: {e}")),
+                            Err(e) => {
+                                ("error", format!("Failed to remove API key for {name}: {e}"))
+                            }
                         };
                         self.output_lines.push(OutputLine {
-                            type_: type_.into(), content,
-                            tool_name: String::new(), duration: String::new(),
+                            type_: type_.into(),
+                            content,
+                            tool_name: String::new(),
+                            duration: String::new(),
                         });
-                        self.provider_picker_keys = self.provider_picker_list.iter()
-                            .map(|n| crate::config::has_usable_credential(n)).collect();
+                        self.provider_picker_keys = self
+                            .provider_picker_list
+                            .iter()
+                            .map(|n| crate::config::has_usable_credential(n))
+                            .collect();
                     }
                 }
                 _ => {}
@@ -896,9 +953,15 @@ impl Tui {
 
         if let Some(name) = self.confirm_history_provider.clone() {
             match key.code {
-                KeyCode::Left => { self.confirm_history_sel = 0; }
-                KeyCode::Right => { self.confirm_history_sel = 1; }
-                KeyCode::Esc => { self.confirm_history_provider = None; }
+                KeyCode::Left => {
+                    self.confirm_history_sel = 0;
+                }
+                KeyCode::Right => {
+                    self.confirm_history_sel = 1;
+                }
+                KeyCode::Esc => {
+                    self.confirm_history_provider = None;
+                }
                 KeyCode::Enter => {
                     let proceed = self.confirm_history_sel == 1;
                     self.confirm_history_provider = None;
@@ -914,7 +977,9 @@ impl Tui {
         match key.code {
             KeyCode::Up => {
                 if self.show_session_picker {
-                    if self.picker_session_sel > 0 { self.picker_session_sel -= 1; }
+                    if self.picker_session_sel > 0 {
+                        self.picker_session_sel -= 1;
+                    }
                     return true;
                 }
                 if self.show_theme_picker {
@@ -932,11 +997,15 @@ impl Tui {
                     return true;
                 }
                 if self.show_provider_picker {
-                    if self.provider_picker_sel > 0 { self.provider_picker_sel -= 1; }
+                    if self.provider_picker_sel > 0 {
+                        self.provider_picker_sel -= 1;
+                    }
                     return true;
                 }
                 if self.show_model_picker {
-                    if self.picker_sel > 0 { self.picker_sel -= 1; }
+                    if self.picker_sel > 0 {
+                        self.picker_sel -= 1;
+                    }
                     return true;
                 }
                 if self.hist_idx > 0 {
@@ -948,7 +1017,9 @@ impl Tui {
             }
             KeyCode::Down => {
                 if self.show_session_picker {
-                    if self.picker_session_sel + 1 < self.picker_sessions.len() { self.picker_session_sel += 1; }
+                    if self.picker_session_sel + 1 < self.picker_sessions.len() {
+                        self.picker_session_sel += 1;
+                    }
                     return true;
                 }
                 if self.show_theme_picker {
@@ -965,14 +1036,18 @@ impl Tui {
                     return true;
                 }
                 if self.show_provider_picker {
-                    if self.provider_picker_sel + 1 < self.provider_picker_list.len() { self.provider_picker_sel += 1; }
+                    if self.provider_picker_sel + 1 < self.provider_picker_list.len() {
+                        self.provider_picker_sel += 1;
+                    }
                     return true;
                 }
                 if self.show_model_picker {
                     if self.picker_sel + 1 < self.picker_models.len() {
                         self.picker_sel += 1;
                         let vh = self.picker_visible_height();
-                        if self.picker_sel >= self.picker_scrl + vh { self.picker_scrl = self.picker_sel - vh + 1; }
+                        if self.picker_sel >= self.picker_scrl + vh {
+                            self.picker_scrl = self.picker_sel - vh + 1;
+                        }
                     }
                     return true;
                 }
@@ -987,7 +1062,9 @@ impl Tui {
                 true
             }
             KeyCode::Left => {
-                if self.cursor > 0 { self.cursor -= 1; }
+                if self.cursor > 0 {
+                    self.cursor -= 1;
+                }
                 true
             }
             KeyCode::Right => {
@@ -1056,31 +1133,30 @@ impl Tui {
                     self.show_command_picker = false;
                     self.cmd_picker_filtered.clear();
                     self.cmd_picker_sel = 0;
-                }
-                else if self.show_provider_picker { self.show_provider_picker = false; }
-                else if self.show_model_picker {
+                } else if self.show_provider_picker {
+                    self.show_provider_picker = false;
+                } else if self.show_model_picker {
                     self.show_model_picker = false;
                     self.cancel_pending_provider_selection();
-                }
-                else if self.show_session_picker {
+                } else if self.show_session_picker {
                     self.show_session_picker = false;
                     self.session_picker_delete = false;
-                }
-                else if self.show_theme_picker {
+                } else if self.show_theme_picker {
                     self.show_theme_picker = false;
                     if let Some(prev) = self.theme_before_picker.take() {
                         self.theme = theme::lookup(&prev);
                     }
-                }
-                else if matches!(self.state, State::Running) {
+                } else if matches!(self.state, State::Running) {
                     if let Some(flag) = &self.cancel_flag {
                         flag.store(true, Ordering::Relaxed);
                     }
                     self.cancel_pending_provider_selection();
                     self.flush_streaming();
                     self.output_lines.push(OutputLine {
-                        type_: "system".into(), content: "Cancelled.".into(),
-                        tool_name: String::new(), duration: String::new(),
+                        type_: "system".into(),
+                        content: "Cancelled.".into(),
+                        tool_name: String::new(),
+                        duration: String::new(),
                     });
                 }
                 true
@@ -1168,7 +1244,10 @@ impl Tui {
                         return true;
                     }
                     self.awaiting_api_key = false;
-                    let target = self.api_key_target.take().unwrap_or_else(|| self.provider.clone());
+                    let target = self
+                        .api_key_target
+                        .take()
+                        .unwrap_or_else(|| self.provider.clone());
                     if self.pending_model_after_auth {
                         // Provider switch path: save key, then open model list (live catalog).
                         match crate::config::save_api_key(&target, &key) {
@@ -1190,7 +1269,9 @@ impl Tui {
                                 self.cancel_pending_provider_selection();
                                 self.output_lines.push(OutputLine {
                                     type_: "error".into(),
-                                    content: format!("Failed to save API key for {target}: {error}"),
+                                    content: format!(
+                                        "Failed to save API key for {target}: {error}"
+                                    ),
                                     tool_name: String::new(),
                                     duration: String::new(),
                                 });
@@ -1210,7 +1291,10 @@ impl Tui {
                                     ),
                                 )
                             }
-                            Err(error) => ("error", format!("Failed to save API key for {target}: {error}")),
+                            Err(error) => (
+                                "error",
+                                format!("Failed to save API key for {target}: {error}"),
+                            ),
                         };
                         self.output_lines.push(OutputLine {
                             type_: type_.into(),
@@ -1222,11 +1306,16 @@ impl Tui {
                     return true;
                 }
 
-                if !matches!(self.state, State::Idle) { return true; }
+                if !matches!(self.state, State::Idle) {
+                    return true;
+                }
 
                 let input = self.input_buf.trim().to_string();
-                self.input_buf.clear(); self.cursor = 0;
-                if input.is_empty() { return true; }
+                self.input_buf.clear();
+                self.cursor = 0;
+                if input.is_empty() {
+                    return true;
+                }
 
                 if input.starts_with('/') {
                     return self.handle_command(&input);
@@ -1240,8 +1329,10 @@ impl Tui {
                 self.expect_turn_notify = true;
                 self.idle_suggestion = None;
                 self.output_lines.push(OutputLine {
-                    type_: "user".into(), content: input.clone(),
-                    tool_name: String::new(), duration: String::new(),
+                    type_: "user".into(),
+                    content: input.clone(),
+                    tool_name: String::new(),
+                    duration: String::new(),
                 });
                 self.state = State::Running;
                 if let Some(tx) = &self.agent_tx {
@@ -1271,7 +1362,8 @@ impl Tui {
                             self.output_lines.push(OutputLine {
                                 type_: "system".into(),
                                 content: format!("No saved API key for {name} in the config file."),
-                                tool_name: String::new(), duration: String::new(),
+                                tool_name: String::new(),
+                                duration: String::new(),
                             });
                         }
                     }
@@ -1315,7 +1407,8 @@ impl Tui {
                     self.output_lines.push(OutputLine {
                         type_: "system".into(),
                         content: "Wait for the current turn to finish before clearing.".into(),
-                        tool_name: String::new(), duration: String::new(),
+                        tool_name: String::new(),
+                        duration: String::new(),
                     });
                     return true;
                 }
@@ -1340,7 +1433,8 @@ impl Tui {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
                     content: "Cleared conversation and session state.".into(),
-                    tool_name: String::new(), duration: String::new(),
+                    tool_name: String::new(),
+                    duration: String::new(),
                 });
             }
             "/thinking" => {
@@ -1474,11 +1568,16 @@ impl Tui {
                 let cost_str = crate::cost::format_cost(est);
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: format!("Tokens: {} in, {} out  •  {}\nModel: {}\nEstimated cost: {}",
-                        self.total_usage.input_tokens, self.total_usage.output_tokens,
+                    content: format!(
+                        "Tokens: {} in, {} out  •  {}\nModel: {}\nEstimated cost: {}",
+                        self.total_usage.input_tokens,
+                        self.total_usage.output_tokens,
                         self.total_usage.cache_read + self.total_usage.cache_create,
-                        self.model, cost_str),
-                    tool_name: String::new(), duration: String::new(),
+                        self.model,
+                        cost_str
+                    ),
+                    tool_name: String::new(),
+                    duration: String::new(),
                 });
             }
             "/provider" => {
@@ -1495,7 +1594,9 @@ impl Tui {
                     } else {
                         self.output_lines.push(OutputLine {
                             type_: "system".into(),
-                            content: format!("Unknown provider '{name}'. Use /provider to pick from the list."),
+                            content: format!(
+                                "Unknown provider '{name}'. Use /provider to pick from the list."
+                            ),
                             tool_name: String::new(),
                             duration: String::new(),
                         });
@@ -1526,8 +1627,11 @@ impl Tui {
                         } else {
                             self.output_lines.push(OutputLine {
                                 type_: "system".into(),
-                                content: format!("Provider '{provider}' does not use a cloud API key."),
-                                tool_name: String::new(), duration: String::new(),
+                                content: format!(
+                                    "Provider '{provider}' does not use a cloud API key."
+                                ),
+                                tool_name: String::new(),
+                                duration: String::new(),
                             });
                         }
                     }
@@ -1577,7 +1681,8 @@ impl Tui {
                     self.output_lines.push(OutputLine {
                         type_: "system".into(),
                         content: "Wait for the current turn to finish before compacting.".into(),
-                        tool_name: String::new(), duration: String::new(),
+                        tool_name: String::new(),
+                        duration: String::new(),
                     });
                 } else if let Some(tx) = &self.agent_tx {
                     self.state = State::Running;
@@ -1599,7 +1704,8 @@ impl Tui {
                             self.output_lines.push(OutputLine {
                                 type_: "error".into(),
                                 content: e,
-                                tool_name: String::new(), duration: String::new(),
+                                tool_name: String::new(),
+                                duration: String::new(),
                             });
                         }
                     }
@@ -1609,7 +1715,8 @@ impl Tui {
                         self.output_lines.push(OutputLine {
                             type_: "system".into(),
                             content: "No saved sessions to delete.".into(),
-                            tool_name: String::new(), duration: String::new(),
+                            tool_name: String::new(),
+                            duration: String::new(),
                         });
                     } else {
                         self.show_session_picker = true;
@@ -1625,8 +1732,11 @@ impl Tui {
                 if sessions.is_empty() {
                     self.output_lines.push(OutputLine {
                         type_: "system".into(),
-                        content: "No saved sessions. Use /save to save the current conversation first.".into(),
-                        tool_name: String::new(), duration: String::new(),
+                        content:
+                            "No saved sessions. Use /save to save the current conversation first."
+                                .into(),
+                        tool_name: String::new(),
+                        duration: String::new(),
                     });
                 } else {
                     self.show_session_picker = true;
@@ -1643,7 +1753,8 @@ impl Tui {
                 self.output_lines.push(OutputLine {
                     type_: "error".into(),
                     content: format!("Unknown command: {} (type /help)", parts[0]),
-                    tool_name: String::new(), duration: String::new(),
+                    tool_name: String::new(),
+                    duration: String::new(),
                 });
             }
         }
@@ -1656,7 +1767,9 @@ impl Tui {
 
     fn open_model_picker(&mut self) {
         let providers = crate::llm::default_providers();
-        let provider_name = self.pending_provider_selection.as_deref()
+        let provider_name = self
+            .pending_provider_selection
+            .as_deref()
             .unwrap_or(&self.provider);
         if let Some(p) = providers.get(provider_name) {
             self.picker_models = p.available_models();
@@ -1669,7 +1782,9 @@ impl Tui {
             } else {
                 &self.model
             };
-            self.picker_sel = self.picker_models.iter()
+            self.picker_sel = self
+                .picker_models
+                .iter()
                 .position(|m| m.id == selected_model)
                 .unwrap_or(0);
         }
@@ -1685,8 +1800,10 @@ impl Tui {
         // Current provider first, matching render order so the
         // selection index always points at the displayed row.
         names.sort_by_key(|n| usize::from(*n != self.provider));
-        self.provider_picker_keys = names.iter()
-            .map(|n| crate::config::has_usable_credential(n)).collect();
+        self.provider_picker_keys = names
+            .iter()
+            .map(|n| crate::config::has_usable_credential(n))
+            .collect();
         self.provider_picker_list = names;
         self.provider_picker_sel = 0;
         self.show_provider_picker = true;
@@ -1704,7 +1821,10 @@ impl Tui {
             }
         }
         self.output_lines.iter().any(|line| {
-            matches!(line.type_.as_str(), "user" | "text" | "tool_use" | "tool_result")
+            matches!(
+                line.type_.as_str(),
+                "user" | "text" | "tool_use" | "tool_result"
+            )
         })
     }
 
@@ -1851,7 +1971,9 @@ impl Tui {
     fn open_theme_picker(&mut self) {
         self.theme_before_picker = Some(self.theme.name.to_string());
         self.theme_picker_list = theme::all_themes();
-        self.theme_picker_sel = self.theme_picker_list.iter()
+        self.theme_picker_sel = self
+            .theme_picker_list
+            .iter()
             .position(|t| t.name == self.theme.name)
             .unwrap_or(0);
         // Live-preview current selection immediately
@@ -1934,7 +2056,10 @@ impl Tui {
         Self::persist_provider_model(&self.provider, &self.model);
         self.output_lines.push(OutputLine {
             type_: "system".into(),
-            content: format!("Provider set to: {}\nModel set to: {}", self.provider, self.model),
+            content: format!(
+                "Provider set to: {}\nModel set to: {}",
+                self.provider, self.model
+            ),
             tool_name: String::new(),
             duration: String::new(),
         });
@@ -2082,7 +2207,8 @@ impl Tui {
             self.output_lines.push(OutputLine {
                 type_: "system".into(),
                 content: "No saved sessions.".into(),
-                tool_name: String::new(), duration: String::new(),
+                tool_name: String::new(),
+                duration: String::new(),
             });
             return;
         }
@@ -2094,7 +2220,13 @@ impl Tui {
             } else {
                 s.summary.clone()
             };
-            msg.push_str(&format!("  {}  {}  {} msgs  {}\n", &s.id[..8], s.model, s.msg_count, time_str));
+            msg.push_str(&format!(
+                "  {}  {}  {} msgs  {}\n",
+                &s.id[..8],
+                s.model,
+                s.msg_count,
+                time_str
+            ));
             if !summary.is_empty() {
                 msg.push_str(&format!("    {summary}\n"));
             }
@@ -2102,7 +2234,8 @@ impl Tui {
         self.output_lines.push(OutputLine {
             type_: "system".into(),
             content: msg.trim_end().to_string(),
-            tool_name: String::new(), duration: String::new(),
+            tool_name: String::new(),
+            duration: String::new(),
         });
     }
 
@@ -2113,14 +2246,16 @@ impl Tui {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
                     content: format!("Deleted session {short}."),
-                    tool_name: String::new(), duration: String::new(),
+                    tool_name: String::new(),
+                    duration: String::new(),
                 });
             }
             Err(e) => {
                 self.output_lines.push(OutputLine {
                     type_: "error".into(),
                     content: format!("Failed to delete session: {e}"),
-                    tool_name: String::new(), duration: String::new(),
+                    tool_name: String::new(),
+                    duration: String::new(),
                 });
             }
         }
@@ -2238,7 +2373,8 @@ impl Tui {
                 self.output_lines.push(OutputLine {
                     type_: "error".into(),
                     content: format!("Failed to load session: {e}"),
-                    tool_name: String::new(), duration: String::new(),
+                    tool_name: String::new(),
+                    duration: String::new(),
                 });
             }
         }
@@ -2270,17 +2406,24 @@ impl Tui {
                 let mut w_used = 0;
                 for c in s.chars() {
                     let cw = char_width(c);
-                    if w_used + cw > pw { break; }
+                    if w_used + cw > pw {
+                        break;
+                    }
                     out.push(c);
                     w_used += cw;
                 }
-                if w_used < pw { out.push_str(&" ".repeat(pw - w_used)); }
+                if w_used < pw {
+                    out.push_str(&" ".repeat(pw - w_used));
+                }
                 out
             }
         };
         let sp = " ".repeat((area.width as usize).saturating_sub(pw + 4));
 
-        lines.push(Line::from(Span::styled(format!("╭{}╮", "─".repeat(pw)), dim)));
+        lines.push(Line::from(Span::styled(
+            format!("╭{}╮", "─".repeat(pw)),
+            dim,
+        )));
         lines.push(Line::from(vec![
             Span::styled("│", dim),
             Span::styled(pad(&format!("  ⚡ Cairn Code v{}", self.version)), bright),
@@ -2291,10 +2434,16 @@ impl Tui {
             Span::styled(pad("  open terminal coding agent"), dim),
             Span::styled(format!("│{sp}"), dim),
         ]));
-        lines.push(Line::from(Span::styled(format!("├{}┤", "─".repeat(pw)), dim)));
+        lines.push(Line::from(Span::styled(
+            format!("├{}┤", "─".repeat(pw)),
+            dim,
+        )));
         lines.push(Line::from(vec![
             Span::styled("│", dim),
-            Span::styled(pad(&format!("  Model   {} / {}", self.provider, self.model)), dim),
+            Span::styled(
+                pad(&format!("  Model   {} / {}", self.provider, self.model)),
+                dim,
+            ),
             Span::styled(format!("│{sp}"), dim),
         ]));
         lines.push(Line::from(vec![
@@ -2302,7 +2451,10 @@ impl Tui {
             Span::styled(pad(&format!("  Path    {}", self.work_dir)), dim),
             Span::styled(format!("│{sp}"), dim),
         ]));
-        lines.push(Line::from(Span::styled(format!("╰{}╯", "─".repeat(pw)), dim)));
+        lines.push(Line::from(Span::styled(
+            format!("╰{}╯", "─".repeat(pw)),
+            dim,
+        )));
 
         // Output
         for line in &self.output_lines {
@@ -2365,9 +2517,7 @@ impl Tui {
                             if part.is_empty() {
                                 continue;
                             }
-                            lines.push(Line::from(vec![
-                                Span::styled(format!("  {part}"), dim),
-                            ]));
+                            lines.push(Line::from(vec![Span::styled(format!("  {part}"), dim)]));
                         }
                     }
                 }
@@ -2434,9 +2584,13 @@ impl Tui {
 
         // Usage
         if self.total_usage.input_tokens > 0 {
-            lines.push(Line::from(vec![
-                Span::styled(format!("\nTokens: {} in, {} out  •  {}", self.total_usage.input_tokens, self.total_usage.output_tokens, self.model), dim),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                format!(
+                    "\nTokens: {} in, {} out  •  {}",
+                    self.total_usage.input_tokens, self.total_usage.output_tokens, self.model
+                ),
+                dim,
+            )]));
         }
 
         // Composer / pickers live in a fixed bottom chrome region so typing never
@@ -2447,33 +2601,43 @@ impl Tui {
         let mut cursor_pos: Option<(u16, usize)> = None;
 
         if let Some(name) = &self.confirm_remove_provider {
-            chrome.push(Line::from(vec![
-                Span::styled(format!("Remove saved API key for '{name}'?"), white),
-            ]));
-            chrome.push(Line::from(vec![
-                Span::styled("This only deletes the key from the config file.", dim),
-            ]));
+            chrome.push(Line::from(vec![Span::styled(
+                format!("Remove saved API key for '{name}'?"),
+                white,
+            )]));
+            chrome.push(Line::from(vec![Span::styled(
+                "This only deletes the key from the config file.",
+                dim,
+            )]));
             chrome.push(Line::from(""));
             let options = ["Cancel", "Remove"];
             let mut option_spans = Vec::new();
             for (i, opt) in options.iter().enumerate() {
-                if i > 0 { option_spans.push(Span::raw("  ")); }
+                if i > 0 {
+                    option_spans.push(Span::raw("  "));
+                }
                 let is_sel = i == self.confirm_remove_sel;
                 let open = if is_sel { "[" } else { " " };
                 let close = if is_sel { "]" } else { " " };
                 option_spans.push(Span::styled(
                     format!("{open}{opt}{close}"),
-                    if is_sel { orange_fg.add_modifier(Modifier::BOLD) } else { dim },
+                    if is_sel {
+                        orange_fg.add_modifier(Modifier::BOLD)
+                    } else {
+                        dim
+                    },
                 ));
             }
             chrome.push(Line::from(option_spans));
-            chrome.push(Line::from(vec![
-                Span::styled("(← → navigate  Enter confirm  Esc cancel)", dim),
-            ]));
+            chrome.push(Line::from(vec![Span::styled(
+                "(← → navigate  Enter confirm  Esc cancel)",
+                dim,
+            )]));
         } else if let Some(name) = &self.confirm_history_provider {
-            chrome.push(Line::from(vec![
-                Span::styled(format!("Send existing conversation to '{name}'?"), white),
-            ]));
+            chrome.push(Line::from(vec![Span::styled(
+                format!("Send existing conversation to '{name}'?"),
+                white,
+            )]));
             chrome.push(Line::from(vec![
                 Span::styled(
                     "Existing prompts, source excerpts, and tool results will be sent to this provider.",
@@ -2484,23 +2648,33 @@ impl Tui {
             let options = ["Cancel", "Continue"];
             let mut option_spans = Vec::new();
             for (i, opt) in options.iter().enumerate() {
-                if i > 0 { option_spans.push(Span::raw("  ")); }
+                if i > 0 {
+                    option_spans.push(Span::raw("  "));
+                }
                 let is_sel = i == self.confirm_history_sel;
                 let open = if is_sel { "[" } else { " " };
                 let close = if is_sel { "]" } else { " " };
                 option_spans.push(Span::styled(
                     format!("{open}{opt}{close}"),
-                    if is_sel { orange_fg.add_modifier(Modifier::BOLD) } else { dim },
+                    if is_sel {
+                        orange_fg.add_modifier(Modifier::BOLD)
+                    } else {
+                        dim
+                    },
                 ));
             }
             chrome.push(Line::from(option_spans));
-            chrome.push(Line::from(vec![
-                Span::styled("(← → navigate  Enter confirm  Esc cancel)", dim),
-            ]));
+            chrome.push(Line::from(vec![Span::styled(
+                "(← → navigate  Enter confirm  Esc cancel)",
+                dim,
+            )]));
         } else if self.show_provider_picker {
             chrome.push(Line::from(vec![
                 Span::styled("── Provider ", orange),
-                Span::styled("(↑↓ navigate  Enter select  Del remove key  Esc cancel) ──", bold_dim),
+                Span::styled(
+                    "(↑↓ navigate  Enter select  Del remove key  Esc cancel) ──",
+                    bold_dim,
+                ),
             ]));
             for (i, name) in self.provider_picker_list.iter().enumerate() {
                 let is_sel = i == self.provider_picker_sel;
@@ -2514,9 +2688,10 @@ impl Tui {
                     ""
                 };
                 let prefix = if is_sel { "▸ " } else { "  " };
-                chrome.push(Line::from(vec![
-                    Span::styled(format!("{prefix}{name}{key_mark}{cur_mark}"), if is_sel { selected } else { dim }),
-                ]));
+                chrome.push(Line::from(vec![Span::styled(
+                    format!("{prefix}{name}{key_mark}{cur_mark}"),
+                    if is_sel { selected } else { dim },
+                )]));
             }
         } else if self.show_model_picker {
             let visible = self.picker_visible_height();
@@ -2528,18 +2703,26 @@ impl Tui {
                 Span::styled("(↑↓ navigate  Enter select  Esc cancel) ──", bold_dim),
             ]));
             if num > visible {
-                chrome.push(Line::from(vec![Span::styled(format!("  … {}/{}  ↑↓ scroll", self.picker_sel + 1, num), dim)]));
+                chrome.push(Line::from(vec![Span::styled(
+                    format!("  … {}/{}  ↑↓ scroll", self.picker_sel + 1, num),
+                    dim,
+                )]));
             }
             for i in self.picker_scrl..end {
                 let m = &self.picker_models[i];
                 let is_sel = i == self.picker_sel;
                 let is_cur = m.id == self.model;
-                let ctx = if m.max_ctx > 0 { format!(" ({}K context)", m.max_ctx / 1000) } else { String::new() };
+                let ctx = if m.max_ctx > 0 {
+                    format!(" ({}K context)", m.max_ctx / 1000)
+                } else {
+                    String::new()
+                };
                 let check = if is_cur { "  ✓" } else { "" };
                 let prefix = if is_sel { "▸ " } else { "  " };
-                chrome.push(Line::from(vec![
-                    Span::styled(format!("{prefix}{}  {}{ctx}{check}", m.name, m.id), if is_sel { selected } else { dim }),
-                ]));
+                chrome.push(Line::from(vec![Span::styled(
+                    format!("{prefix}{}  {}{ctx}{check}", m.name, m.id),
+                    if is_sel { selected } else { dim },
+                )]));
             }
         } else if self.show_theme_picker {
             chrome.push(Line::from(vec![
@@ -2551,9 +2734,10 @@ impl Tui {
                 let is_cur = t.name == self.theme.name;
                 let cur_mark = if is_cur { "  ✓" } else { "" };
                 let prefix = if is_sel { "▸ " } else { "  " };
-                chrome.push(Line::from(vec![
-                    Span::styled(format!("{prefix}{} ({}){cur_mark}", t.label, t.name), if is_sel { selected } else { dim }),
-                ]));
+                chrome.push(Line::from(vec![Span::styled(
+                    format!("{prefix}{} ({}){cur_mark}", t.label, t.name),
+                    if is_sel { selected } else { dim },
+                )]));
             }
         } else if self.show_session_picker {
             let visible = 10usize;
@@ -2575,7 +2759,10 @@ impl Tui {
                 Span::styled(hint, bold_dim),
             ]));
             if num > visible {
-                chrome.push(Line::from(vec![Span::styled(format!("  … {}/{}  ↑↓ scroll", self.picker_session_sel + 1, num), dim)]));
+                chrome.push(Line::from(vec![Span::styled(
+                    format!("  … {}/{}  ↑↓ scroll", self.picker_session_sel + 1, num),
+                    dim,
+                )]));
             }
             for i in self.picker_session_scrl..end {
                 let s = &self.picker_sessions[i];
@@ -2587,13 +2774,20 @@ impl Tui {
                     s.summary.clone()
                 };
                 let time_str = format_timestamp(s.updated_at);
-                chrome.push(Line::from(vec![
-                    Span::styled(format!("{prefix}{}  {}  {} msgs  {time_str}", &s.id[..8], s.model, s.msg_count), if is_sel { selected } else { dim }),
-                ]));
+                chrome.push(Line::from(vec![Span::styled(
+                    format!(
+                        "{prefix}{}  {}  {} msgs  {time_str}",
+                        &s.id[..8],
+                        s.model,
+                        s.msg_count
+                    ),
+                    if is_sel { selected } else { dim },
+                )]));
                 if !summary.is_empty() && is_sel {
-                    chrome.push(Line::from(vec![
-                        Span::styled(format!("   {summary}"), if is_sel { selected } else { dim }),
-                    ]));
+                    chrome.push(Line::from(vec![Span::styled(
+                        format!("   {summary}"),
+                        if is_sel { selected } else { dim },
+                    )]));
                 }
             }
         } else if self.show_permission_prompt {
@@ -2607,56 +2801,76 @@ impl Tui {
                 Span::raw(after),
             ]));
             chrome.push(Line::from(""));
-            chrome.push(Line::from(vec![
-                Span::styled(format!("Tool '{}' wants to run:", self.perm_tool_name), white),
-            ]));
+            chrome.push(Line::from(vec![Span::styled(
+                format!("Tool '{}' wants to run:", self.perm_tool_name),
+                white,
+            )]));
             if !self.perm_tool_input.is_empty() {
-                chrome.push(Line::from(vec![
-                    Span::styled(format!("  {}", self.perm_tool_input), dim),
-                ]));
+                chrome.push(Line::from(vec![Span::styled(
+                    format!("  {}", self.perm_tool_input),
+                    dim,
+                )]));
             }
             chrome.push(Line::from(""));
             let options = ["Allow", "Always Allow", "Deny"];
             let mut option_spans = Vec::new();
             for (i, opt) in options.iter().enumerate() {
-                if i > 0 { option_spans.push(Span::raw("  ")); }
+                if i > 0 {
+                    option_spans.push(Span::raw("  "));
+                }
                 let is_sel = i == self.perm_selection;
                 let open = if is_sel { "[" } else { " " };
                 let close = if is_sel { "]" } else { " " };
                 option_spans.push(Span::styled(
                     format!("{open}{opt}{close}"),
-                    if is_sel { orange_fg.add_modifier(Modifier::BOLD) } else { dim },
+                    if is_sel {
+                        orange_fg.add_modifier(Modifier::BOLD)
+                    } else {
+                        dim
+                    },
                 ));
             }
             chrome.push(Line::from(option_spans));
-            chrome.push(Line::from(vec![
-                Span::styled("(← → navigate  Enter confirm  Esc deny)", dim),
-            ]));
-            cursor_pos = Some((display_width("❯ ") as u16 + display_width(before) as u16, prompt_line_idx));
+            chrome.push(Line::from(vec![Span::styled(
+                "(← → navigate  Enter confirm  Esc deny)",
+                dim,
+            )]));
+            cursor_pos = Some((
+                display_width("❯ ") as u16 + display_width(before) as u16,
+                prompt_line_idx,
+            ));
         } else if self.show_recovery_prompt {
-            chrome.push(Line::from(vec![
-                Span::styled(
-                    format!("LLM failed ({}/{}). Switch and retry your request:", self.provider, self.model),
-                    white,
+            chrome.push(Line::from(vec![Span::styled(
+                format!(
+                    "LLM failed ({}/{}). Switch and retry your request:",
+                    self.provider, self.model
                 ),
-            ]));
+                white,
+            )]));
             chrome.push(Line::from(""));
             let options = ["Switch model (m)", "Switch provider (p)", "Dismiss (d)"];
             let mut option_spans = Vec::new();
             for (i, opt) in options.iter().enumerate() {
-                if i > 0 { option_spans.push(Span::raw("  ")); }
+                if i > 0 {
+                    option_spans.push(Span::raw("  "));
+                }
                 let is_sel = i == self.recovery_selection;
                 let open = if is_sel { "[" } else { " " };
                 let close = if is_sel { "]" } else { " " };
                 option_spans.push(Span::styled(
                     format!("{open}{opt}{close}"),
-                    if is_sel { orange_fg.add_modifier(Modifier::BOLD) } else { dim },
+                    if is_sel {
+                        orange_fg.add_modifier(Modifier::BOLD)
+                    } else {
+                        dim
+                    },
                 ));
             }
             chrome.push(Line::from(option_spans));
-            chrome.push(Line::from(vec![
-                Span::styled("(← → navigate  Enter confirm  Esc dismiss)", dim),
-            ]));
+            chrome.push(Line::from(vec![Span::styled(
+                "(← → navigate  Enter confirm  Esc dismiss)",
+                dim,
+            )]));
             let cursor = self.cursor.min(self.input_buf.len());
             let (before, after) = self.input_buf.split_at(cursor);
             let prompt_line_idx = chrome.len();
@@ -2666,7 +2880,10 @@ impl Tui {
                 Span::styled("▋", orange_fg),
                 Span::raw(after),
             ]));
-            cursor_pos = Some((display_width("❯ ") as u16 + display_width(before) as u16, prompt_line_idx));
+            cursor_pos = Some((
+                display_width("❯ ") as u16 + display_width(before) as u16,
+                prompt_line_idx,
+            ));
         } else if self.awaiting_api_key {
             let target = self.api_key_target.as_deref().unwrap_or(&self.provider);
             let env_hint = crate::config::env_var_name(target).unwrap_or("API_KEY");
@@ -2683,12 +2900,10 @@ impl Tui {
                 Span::styled("▋", orange_fg),
                 Span::styled(after, orange_fg),
             ]));
-            chrome.push(Line::from(vec![
-                Span::styled(
-                    "Hidden as you type (last 4 characters shown). Enter to save  ·  Esc to cancel",
-                    dim,
-                ),
-            ]));
+            chrome.push(Line::from(vec![Span::styled(
+                "Hidden as you type (last 4 characters shown). Enter to save  ·  Esc to cancel",
+                dim,
+            )]));
             cursor_pos = Some((
                 display_width(&label) as u16 + display_width(&before) as u16,
                 0,
@@ -2732,10 +2947,7 @@ impl Tui {
                     }
                 }
                 chrome.push(Line::from(spans));
-                cursor_pos = Some((
-                    display_width("❯ ") as u16 + display_width(before) as u16,
-                    0,
-                ));
+                cursor_pos = Some((display_width("❯ ") as u16 + display_width(before) as u16, 0));
             }
         }
 
@@ -2769,10 +2981,7 @@ impl Tui {
         } else {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(1),
-                    Constraint::Length(chrome_h),
-                ])
+                .constraints([Constraint::Min(1), Constraint::Length(chrome_h)])
                 .split(area);
             (chunks[0], chunks[1])
         };
@@ -2837,8 +3046,14 @@ impl Tui {
             let line_idx = line_idx.min(chrome.len().saturating_sub(1));
             let wrapped_before = total_wrapped(&chrome[..line_idx], width);
             let y = (chrome_area.y as usize + wrapped_before).saturating_sub(chrome_scroll) as u16;
-            let y = y.min(chrome_area.y.saturating_add(chrome_area.height.saturating_sub(1)));
-            let x = chrome_area.x.saturating_add(x_off.min(chrome_area.width.saturating_sub(1)));
+            let y = y.min(
+                chrome_area
+                    .y
+                    .saturating_add(chrome_area.height.saturating_sub(1)),
+            );
+            let x = chrome_area
+                .x
+                .saturating_add(x_off.min(chrome_area.width.saturating_sub(1)));
             f.set_cursor_position(Position { x, y });
         }
     }
@@ -2882,7 +3097,11 @@ impl Tui {
 
     fn picker_visible_height(&self) -> usize {
         let h = terminal_height().unwrap_or(24).saturating_sub(10);
-        if h < 3 { 3 } else { h.min(self.picker_models.len()) }
+        if h < 3 {
+            3
+        } else {
+            h.min(self.picker_models.len())
+        }
     }
 
     pub fn set_picker_models(&mut self, models: Vec<llm::ModelInfo>) {
@@ -2909,7 +3128,10 @@ impl Tui {
         };
         let mut provider_names: Vec<String> = crate::llm::default_providers().into_keys().collect();
         provider_names.sort();
-        let themes: Vec<String> = theme::theme_names().iter().map(|s| (*s).to_string()).collect();
+        let themes: Vec<String> = theme::theme_names()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         let sessions: Vec<String> = session::list(&self.sessions_dir())
             .unwrap_or_default()
             .into_iter()
@@ -2939,7 +3161,9 @@ impl Tui {
 
     /// Selected slash completion string, if any.
     fn selected_slash_completion(&self) -> Option<&str> {
-        self.cmd_picker_filtered.get(self.cmd_picker_sel).map(|s| s.as_str())
+        self.cmd_picker_filtered
+            .get(self.cmd_picker_sel)
+            .map(|s| s.as_str())
     }
 
     /// Refresh the grayed ready-to-send prompt in the empty composer.
@@ -3043,7 +3267,9 @@ pub(crate) fn compute_idle_suggestion(lines: &[OutputLine]) -> String {
             return "Summarize the command output and what we should do next".into();
         }
         if tool == "file_read" || tool == "grep" || tool == "glob" {
-            return format!("Based on the {tool} results, explain what you found and recommend next steps");
+            return format!(
+                "Based on the {tool} results, explain what you found and recommend next steps"
+            );
         }
         return format!("Summarize the {tool} results and continue with the next step");
     }
@@ -3053,7 +3279,8 @@ pub(crate) fn compute_idle_suggestion(lines: &[OutputLine]) -> String {
             return "Run the tests, fix any failures, and report the final result".into();
         }
         if lower.contains("commit") || lower.contains("push") {
-            return "Review the git status and diff, then commit and push if the changes look good".into();
+            return "Review the git status and diff, then commit and push if the changes look good"
+                .into();
         }
         if lower.contains("fix") || lower.contains("bug") {
             return "Verify the fix works end-to-end and check for related regressions".into();
@@ -3105,10 +3332,7 @@ fn enter_plain_select_mode(terminal: &mut DefaultTerminal, text: &str) -> Result
          ==================================\n"
     );
     let _ = writeln!(out, "{text}");
-    let _ = writeln!(
-        out,
-        "\n======== end — press Enter to return ========\n"
-    );
+    let _ = writeln!(out, "\n======== end — press Enter to return ========\n");
     let _ = out.flush();
 
     // stdin is cooked again after disable_raw_mode; block until Enter.
@@ -3136,10 +3360,7 @@ fn copy_text_to_clipboard(text: &str) -> Result<&'static str, String> {
 fn copy_text_windows_clipboard(text: &str) -> Result<(), String> {
     use std::process::{Command, Stdio};
     // Temp UTF-8 file avoids command-line length limits and quoting issues.
-    let path = std::env::temp_dir().join(format!(
-        "cairn-clip-{}.txt",
-        std::process::id()
-    ));
+    let path = std::env::temp_dir().join(format!("cairn-clip-{}.txt", std::process::id()));
     std::fs::write(&path, text).map_err(|e| format!("write temp clip file: {e}"))?;
     let path_str = path.to_string_lossy().replace('\'', "''");
     let status = Command::new("powershell.exe")
@@ -3147,9 +3368,7 @@ fn copy_text_windows_clipboard(text: &str) -> Result<(), String> {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            &format!(
-                "Get-Content -LiteralPath '{path_str}' -Raw -Encoding utf8 | Set-Clipboard"
-            ),
+            &format!("Get-Content -LiteralPath '{path_str}' -Raw -Encoding utf8 | Set-Clipboard"),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -3351,10 +3570,7 @@ pub(crate) fn slash_completions(
         }
         "/resume" | "/delete" => {
             if parts.len() == 1 && ends_with_space {
-                return session_ids
-                    .iter()
-                    .map(|id| format!("{cmd} {id}"))
-                    .collect();
+                return session_ids.iter().map(|id| format!("{cmd} {id}")).collect();
             }
             if parts.len() == 2 && !ends_with_space {
                 return prefix_match(session_ids, parts[1], &|id| format!("{cmd} {id}"));
@@ -3401,7 +3617,10 @@ mod suggestion_tests {
         let s = compute_idle_suggestion(&[]);
         assert_eq!(s, default_empty_suggestion());
         assert!(
-            s.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false),
+            s.chars()
+                .next()
+                .map(|c| c.is_ascii_uppercase())
+                .unwrap_or(false),
             "ready prompts should read as imperative agent requests"
         );
     }
@@ -3442,10 +3661,16 @@ mod provider_privacy_tests {
 
         assert_eq!(tui.provider, "anthropic");
         assert_eq!(tui.confirm_history_provider.as_deref(), Some("ollama"));
-        assert_eq!(tui.confirm_history_sel, 0, "confirmation must default to cancel");
+        assert_eq!(
+            tui.confirm_history_sel, 0,
+            "confirmation must default to cancel"
+        );
 
         tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(tui.provider, "anthropic", "default confirmation action must cancel");
+        assert_eq!(
+            tui.provider, "anthropic",
+            "default confirmation action must cancel"
+        );
     }
 
     #[test]
@@ -3469,7 +3694,10 @@ mod provider_privacy_tests {
         tui.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert_eq!(tui.provider, "anthropic", "provider stays committed until model selection");
+        assert_eq!(
+            tui.provider, "anthropic",
+            "provider stays committed until model selection"
+        );
         assert_eq!(tui.pending_provider_selection.as_deref(), Some("ollama"));
         assert!(tui.show_model_picker);
 
@@ -3544,7 +3772,10 @@ mod provider_privacy_tests {
 
         assert!(cancelled.load(Ordering::Relaxed));
         assert!(matches!(tui.state, State::Running));
-        assert!(rx.try_recv().is_err(), "cancellation must not leave a stale command queued");
+        assert!(
+            rx.try_recv().is_err(),
+            "cancellation must not leave a stale command queued"
+        );
     }
 }
 
@@ -3603,7 +3834,10 @@ mod completion_tests {
     fn completes_mouse_toggle() {
         let c = slash_completions("/mo", &base(), &[], &[], &[], &[]);
         // /model and /mouse both match /mo
-        assert!(c.iter().any(|x| x == "/mouse") || c.iter().any(|x| x == "/model"), "{c:?}");
+        assert!(
+            c.iter().any(|x| x == "/mouse") || c.iter().any(|x| x == "/model"),
+            "{c:?}"
+        );
         let c = slash_completions("/mouse ", &base(), &[], &[], &[], &[]);
         assert!(c.iter().any(|x| x == "/mouse on"));
         assert!(c.iter().any(|x| x == "/mouse off"));
@@ -3647,7 +3881,10 @@ mod completion_tests {
     #[test]
     fn ghost_suffix_for_partial_command() {
         assert_eq!(slash_ghost_suffix("/e", "/exit").as_deref(), Some("xit"));
-        assert_eq!(slash_ghost_suffix("/auth lo", "/auth login").as_deref(), Some("gin"));
+        assert_eq!(
+            slash_ghost_suffix("/auth lo", "/auth login").as_deref(),
+            Some("gin")
+        );
         assert_eq!(slash_ghost_suffix("/exit", "/exit"), None);
         assert_eq!(slash_ghost_suffix("/z", "/exit"), None);
     }
@@ -3658,7 +3895,10 @@ mod completion_tests {
         assert!(c.iter().any(|x| x == "/auth login"));
         assert!(c.iter().any(|x| x == "/auth status"));
         let c = slash_completions("/auth lo", &base(), &[], &[], &[], &[]);
-        assert_eq!(c, vec!["/auth login".to_string(), "/auth logout".to_string()]);
+        assert_eq!(
+            c,
+            vec!["/auth login".to_string(), "/auth logout".to_string()]
+        );
     }
 
     #[test]
@@ -3704,33 +3944,61 @@ mod completion_tests {
 
 fn char_width(c: char) -> usize {
     let cp = c as u32;
-    if cp < 0x1100 { 1 }
-    else if cp <= 0x115F { 2 }
-    else if cp >= 0x2329 && cp <= 0x232A { 2 }
-    else if cp >= 0x2E80 && cp <= 0x303E { 2 }
-    else if cp >= 0x3040 && cp <= 0x3096 { 2 }
-    else if cp >= 0x3099 && cp <= 0x30FF { 2 }
-    else if cp >= 0x3105 && cp <= 0x312F { 2 }
-    else if cp >= 0x3131 && cp <= 0x318E { 2 }
-    else if cp >= 0x3190 && cp <= 0x31E3 { 2 }
-    else if cp >= 0x31F0 && cp <= 0x321E { 2 }
-    else if cp >= 0x3220 && cp <= 0x3247 { 2 }
-    else if cp >= 0x3250 && cp <= 0x4DBF { 2 }
-    else if cp >= 0x4E00 && cp <= 0xA4CF { 2 }
-    else if cp >= 0xA960 && cp <= 0xA97C { 2 }
-    else if cp >= 0xAC00 && cp <= 0xD7A3 { 2 }
-    else if cp >= 0xF900 && cp <= 0xFAFF { 2 }
-    else if cp >= 0xFE10 && cp <= 0xFE19 { 2 }
-    else if cp >= 0xFE30 && cp <= 0xFE6F { 2 }
-    else if cp >= 0xFF01 && cp <= 0xFF60 { 2 }
-    else if cp >= 0xFFE0 && cp <= 0xFFE6 { 2 }
-    else if cp >= 0x1B000 && cp <= 0x1B0FF { 2 }
-    else if cp >= 0x1B100 && cp <= 0x1B12F { 2 }
-    else if cp >= 0x1F200 && cp <= 0x1F2FF { 2 }
-    else if cp >= 0x20000 && cp <= 0x2FFFD { 2 }
-    else if cp >= 0x30000 && cp <= 0x3FFFD { 2 }
-    else if cp >= 0x2600 && cp <= 0x26FF { 2 }
-    else { 1 }
+    if cp < 0x1100 {
+        1
+    } else if cp <= 0x115F {
+        2
+    } else if cp >= 0x2329 && cp <= 0x232A {
+        2
+    } else if cp >= 0x2E80 && cp <= 0x303E {
+        2
+    } else if cp >= 0x3040 && cp <= 0x3096 {
+        2
+    } else if cp >= 0x3099 && cp <= 0x30FF {
+        2
+    } else if cp >= 0x3105 && cp <= 0x312F {
+        2
+    } else if cp >= 0x3131 && cp <= 0x318E {
+        2
+    } else if cp >= 0x3190 && cp <= 0x31E3 {
+        2
+    } else if cp >= 0x31F0 && cp <= 0x321E {
+        2
+    } else if cp >= 0x3220 && cp <= 0x3247 {
+        2
+    } else if cp >= 0x3250 && cp <= 0x4DBF {
+        2
+    } else if cp >= 0x4E00 && cp <= 0xA4CF {
+        2
+    } else if cp >= 0xA960 && cp <= 0xA97C {
+        2
+    } else if cp >= 0xAC00 && cp <= 0xD7A3 {
+        2
+    } else if cp >= 0xF900 && cp <= 0xFAFF {
+        2
+    } else if cp >= 0xFE10 && cp <= 0xFE19 {
+        2
+    } else if cp >= 0xFE30 && cp <= 0xFE6F {
+        2
+    } else if cp >= 0xFF01 && cp <= 0xFF60 {
+        2
+    } else if cp >= 0xFFE0 && cp <= 0xFFE6 {
+        2
+    } else if cp >= 0x1B000 && cp <= 0x1B0FF {
+        2
+    } else if cp >= 0x1B100 && cp <= 0x1B12F {
+        2
+    } else if cp >= 0x1F200 && cp <= 0x1F2FF {
+        2
+    } else if cp >= 0x20000 && cp <= 0x2FFFD {
+        2
+    } else if cp >= 0x30000 && cp <= 0x3FFFD {
+        2
+    } else if cp >= 0x2600 && cp <= 0x26FF {
+        2
+    } else {
+        1
+    }
 }
 
 fn display_width(s: &str) -> usize {
@@ -3738,7 +4006,10 @@ fn display_width(s: &str) -> usize {
 }
 
 fn terminal_height() -> Option<usize> {
-    std::env::var("LINES").ok().and_then(|v| v.parse().ok()).or(Some(24))
+    std::env::var("LINES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or(Some(24))
 }
 
 fn format_timestamp(ts: u64) -> String {
@@ -3764,10 +4035,17 @@ fn format_timestamp(ts: u64) -> String {
 
 fn total_wrapped(lines: &[Line], width: usize) -> usize {
     let w = width.max(1);
-    lines.iter().map(|l| {
-        let line_w: usize = l.spans.iter().map(|s| display_width(&s.content)).sum();
-        if line_w == 0 { 1 } else { (line_w + w - 1) / w }
-    }).sum()
+    lines
+        .iter()
+        .map(|l| {
+            let line_w: usize = l.spans.iter().map(|s| display_width(&s.content)).sum();
+            if line_w == 0 {
+                1
+            } else {
+                (line_w + w - 1) / w
+            }
+        })
+        .sum()
 }
 
 /// Limit on-screen tool output by line count (head + tail) so long shell
@@ -3846,12 +4124,21 @@ fn infer_tool_display_kind<'a>(tool_name: &'a str, content: &str) -> &'a str {
     if content.contains("(exit code") {
         return "shell";
     }
-    if content.lines().take(5).any(|l| l.contains(':') && !l.starts_with('{'))
+    if content
+        .lines()
+        .take(5)
+        .any(|l| l.contains(':') && !l.starts_with('{'))
         && content.lines().count() > 3
         && !content.contains("(showing lines")
     {
         // Heuristic: path:line:text style matches.
-        if content.lines().take(8).filter(|l| l.matches(':').count() >= 2).count() >= 2 {
+        if content
+            .lines()
+            .take(8)
+            .filter(|l| l.matches(':').count() >= 2)
+            .count()
+            >= 2
+        {
             return "grep";
         }
     }
@@ -3866,11 +4153,7 @@ fn compact_tool_result_display(kind: &str, content: &str) -> String {
     }
     match kind {
         "file_read" => {
-            if let Some(summary) = content
-                .lines()
-                .rev()
-                .find(|l| l.contains("(showing lines"))
-            {
+            if let Some(summary) = content.lines().rev().find(|l| l.contains("(showing lines")) {
                 return summary.to_string();
             }
             let n = content.lines().filter(|l| !l.trim().is_empty()).count();

@@ -75,7 +75,9 @@ impl Tool for PythonTool {
             cmd.arg("-c").arg(src);
         } else if let Some(path) = file {
             let ws = workspace::Workspace::current().map_err(|e| format!("workspace: {e}"))?;
-            let _ = ws.relative_path(path).map_err(|e| format!("file path: {e}"))?;
+            let _ = ws
+                .relative_path(path)
+                .map_err(|e| format!("file path: {e}"))?;
             let abs = std::path::Path::new(path);
             if !abs.is_file() {
                 return Err(format!("file not found: {}", abs.display()));

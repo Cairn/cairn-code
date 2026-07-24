@@ -25,7 +25,9 @@ pub struct XaiProvider {
 
 impl XaiProvider {
     pub fn new() -> Self {
-        XaiProvider { api_key: String::new() }
+        XaiProvider {
+            api_key: String::new(),
+        }
     }
 
     pub fn with_api_key(mut self, key: &str) -> Self {
@@ -120,7 +122,9 @@ impl Provider for XaiProvider {
                         if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
                             if let Some(choice) = choices.first() {
                                 if let Some(delta) = choice.get("delta") {
-                                    if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+                                    if let Some(text) =
+                                        delta.get("content").and_then(|v| v.as_str())
+                                    {
                                         on_chunk(text, "text");
                                     }
                                     // Optional reasoning summary stream (when present)
@@ -389,9 +393,7 @@ fn expand_reasoning_rows(base: Vec<ModelInfo>) -> Vec<ModelInfo> {
         rank_model(&base_a)
             .cmp(&rank_model(&base_b))
             .then_with(|| base_a.cmp(&base_b))
-            .then_with(|| {
-                effort_rank(effort_a.as_deref()).cmp(&effort_rank(effort_b.as_deref()))
-            })
+            .then_with(|| effort_rank(effort_a.as_deref()).cmp(&effort_rank(effort_b.as_deref())))
     });
     out
 }
@@ -515,10 +517,7 @@ mod tests {
             ("grok-4.20-multi-agent-0309".into(), Some("xhigh".into()))
         );
         // Colon that is not an effort token stays intact
-        assert_eq!(
-            parse_model_spec("foo:bar"),
-            ("foo:bar".into(), None)
-        );
+        assert_eq!(parse_model_spec("foo:bar"), ("foo:bar".into(), None));
     }
 
     #[test]
@@ -589,7 +588,10 @@ mod tests {
             .filter(|m| m.id.starts_with("grok-4.5:"))
             .map(|m| m.id.as_str())
             .collect();
-        assert_eq!(g45, vec!["grok-4.5:high", "grok-4.5:medium", "grok-4.5:low"]);
+        assert_eq!(
+            g45,
+            vec!["grok-4.5:high", "grok-4.5:medium", "grok-4.5:low"]
+        );
 
         let ma: Vec<_> = rows
             .iter()
