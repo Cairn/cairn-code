@@ -77,6 +77,7 @@ pub fn default_registry() -> Registry {
     r.register(Box::new(crate::tools::file_undo::FileUndoTool));
     r.register(Box::new(crate::tools::shell::ShellTool));
     r.register(Box::new(crate::tools::powershell_tool::PowerShellTool));
+    r.register(Box::new(crate::tools::python_tool::PythonTool));
     r.register(Box::new(crate::tools::go_tool::GoTool));
     r.register(Box::new(crate::tools::git_tool::GitTool));
     r.register(Box::new(crate::tools::glob_tool::GlobTool::new(
@@ -97,7 +98,7 @@ mod tests {
     #[test]
     fn default_registry_has_expected_tools() {
         let r = default_registry();
-        assert_eq!(r.len(), 14);
+        assert_eq!(r.len(), 15);
         for name in [
             "file_read",
             "file_write",
@@ -105,6 +106,7 @@ mod tests {
             "file_undo",
             "shell",
             "powershell",
+            "python",
             "go",
             "git",
             "glob",
@@ -138,6 +140,7 @@ mod tests {
         assert!(!r.get("grep").unwrap().needs_permission());
         assert!(r.get("shell").unwrap().needs_permission());
         assert!(r.get("powershell").unwrap().needs_permission());
+        assert!(r.get("python").unwrap().needs_permission());
         assert!(r.get("file_write").unwrap().needs_permission());
         assert!(r.get("git").unwrap().needs_permission());
         assert!(r.get("web_fetch").unwrap().needs_permission());
