@@ -5,7 +5,7 @@
 //! falling back to a curated list. Models that support reasoning effort are
 //! listed as `id:effort` (e.g. `grok-4.5:high`) so effort is pickable and saved.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::provider::*;
@@ -108,45 +108,13 @@ impl Provider for XaiProvider {
             ],
             body: Some(body),
         };
-        let response_data: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-        let response_data2 = response_data.clone();
+        let mut response = openai_compat::StreamingResponse::default();
         http_client::request_streaming_with_cancel(
             &req,
-            move |line| {
-                let mut data = response_data2.lock().unwrap();
-                data.push_str(line);
-                data.push('\n');
-                if let Some(json_str) = line.strip_prefix("data: ") {
-                    if json_str == "[DONE]" {
-                        return;
-                    }
-                    if let Ok(val) = crate::json::parse(json_str) {
-                        if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
-                            if let Some(choice) = choices.first() {
-                                if let Some(delta) = choice.get("delta") {
-                                    if let Some(text) =
-                                        delta.get("content").and_then(|v| v.as_str())
-                                    {
-                                        on_chunk(text, "text");
-                                    }
-                                    // Optional reasoning summary stream (when present)
-                                    if let Some(text) =
-                                        delta.get("reasoning_content").and_then(|v| v.as_str())
-                                    {
-                                        if !text.is_empty() {
-                                            on_chunk(text, "thinking");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
+            |line| response.push_line(line, &mut on_chunk, true),
             Some(cancel),
         )?;
-        let raw = response_data.lock().unwrap().clone();
-        openai_compat::parse_streaming_response(&raw)
+        response.finish()
     }
 
     fn complete(

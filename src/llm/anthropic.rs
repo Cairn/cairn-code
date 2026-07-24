@@ -3,7 +3,7 @@
 //! Model picker prefers a live `GET /v1/models` catalog when an API key is
 //! available (5-minute cache), falling back to a curated list.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::provider::*;
@@ -91,59 +91,13 @@ impl Provider for AnthropicProvider {
             ],
             body: Some(body),
         };
-        let response_data: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-        let response_data2 = response_data.clone();
+        let mut response = AnthropicStreamingResponse::default();
         http_client::request_streaming_with_cancel(
             &req,
-            move |line| {
-                let mut data = response_data2.lock().unwrap();
-                data.push_str(line);
-                data.push('\n');
-                if let Some(json_str) = line.strip_prefix("data: ") {
-                    if json_str == "[DONE]" {
-                        return;
-                    }
-                    if let Ok(val) = json::parse(json_str) {
-                        if let Some(obj) = val.as_object() {
-                            match obj.get("type").and_then(|v| v.as_str()) {
-                                Some("content_block_delta") => {
-                                    if let Some(delta) = obj.get("delta") {
-                                        if let Some(text) =
-                                            delta.get("text").and_then(|v| v.as_str())
-                                        {
-                                            on_chunk(text, "text");
-                                        }
-                                        if let Some(text) =
-                                            delta.get("thinking").and_then(|v| v.as_str())
-                                        {
-                                            on_chunk(text, "thinking");
-                                        }
-                                    }
-                                }
-                                Some("content_block_start") => {
-                                    if let Some(block) = obj.get("content_block") {
-                                        if let Some(text) =
-                                            block.get("text").and_then(|v| v.as_str())
-                                        {
-                                            on_chunk(text, "text");
-                                        }
-                                        if let Some(text) =
-                                            block.get("thinking").and_then(|v| v.as_str())
-                                        {
-                                            on_chunk(text, "thinking");
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            },
+            |line| response.push_line(line, &mut on_chunk),
             Some(cancel),
         )?;
-        let raw = response_data.lock().unwrap().clone();
-        parse_anthropic_streaming_response(&raw)
+        response.finish()
     }
 
     fn complete(
@@ -585,191 +539,242 @@ fn parse_anthropic_response_value(val: &json::JsonValue) -> Result<AnthropicResp
     })
 }
 
-fn parse_anthropic_streaming_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
-    let mut messages: Vec<Message> = Vec::new();
-    let mut usage = Usage::default();
-    let mut current_tool_use: Option<(u64, ToolUse)> = None;
-    let mut tool_input_accum = String::new();
-    let mut text_accum = String::new();
-    let mut saw_message_stop = false;
-    for (line_index, line) in raw.lines().enumerate() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            if data == "[DONE]" {
-                continue;
+/// Incremental Anthropic SSE reducer. Only final message state is retained;
+/// processed event JSON is released after each line.
+#[derive(Default)]
+struct AnthropicStreamingResponse {
+    messages: Vec<Message>,
+    usage: Usage,
+    current_tool_use: Option<(u64, ToolUse)>,
+    tool_input_accum: String,
+    text_accum: String,
+    saw_message_stop: bool,
+    lines_seen: usize,
+    error: Option<String>,
+}
+
+impl AnthropicStreamingResponse {
+    fn push_line<F>(&mut self, line: &str, on_chunk: &mut F)
+    where
+        F: FnMut(&str, &str),
+    {
+        self.lines_seen = self.lines_seen.saturating_add(1);
+        if self.error.is_some() || self.saw_message_stop {
+            return;
+        }
+        if let Err(error) = self.process_line(line, on_chunk) {
+            self.error = Some(error);
+        }
+    }
+
+    fn process_line<F>(&mut self, line: &str, on_chunk: &mut F) -> Result<(), String>
+    where
+        F: FnMut(&str, &str),
+    {
+        let Some(data) = line.strip_prefix("data: ") else {
+            return Ok(());
+        };
+        if data == "[DONE]" {
+            return Ok(());
+        }
+
+        let val = json::parse(data).map_err(|error| {
+            format!(
+                "Malformed Anthropic stream event on line {}: {error}",
+                self.lines_seen
+            )
+        })?;
+        let obj = val.as_object().ok_or_else(|| {
+            format!(
+                "Malformed Anthropic stream event on line {}: expected a JSON object",
+                self.lines_seen
+            )
+        })?;
+        match obj.get("type").and_then(|v| v.as_str()) {
+            Some("content_block_start") => {
+                if self.current_tool_use.is_some() {
+                    return Err(
+                        "Invalid Anthropic stream: new content block started before the tool call completed"
+                            .into(),
+                    );
+                }
+                if let Some(block) = obj.get("content_block") {
+                    match block.get("type").and_then(|v| v.as_str()) {
+                        Some("text") => {
+                            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                self.text_accum = text.to_string();
+                                on_chunk(text, "text");
+                            }
+                        }
+                        Some("tool_use") => {
+                            let index =
+                                obj.get("index").and_then(|v| v.as_u64()).ok_or_else(|| {
+                                    "Invalid Anthropic stream: tool call start missing block index"
+                                        .to_string()
+                                })?;
+                            if !self.text_accum.is_empty() {
+                                self.messages.push(Message {
+                                    role: "assistant".into(),
+                                    content: Content::Text(self.text_accum.clone()),
+                                });
+                                self.text_accum.clear();
+                            }
+                            self.tool_input_accum.clear();
+                            self.current_tool_use = Some((
+                                index,
+                                ToolUse {
+                                    name: block
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    id: block
+                                        .get("id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    // In real streaming responses content_block_start's `input` is
+                                    // always `{}` — the actual arguments arrive as input_json_delta
+                                    // fragments below and get assembled at content_block_stop.
+                                    input: block
+                                        .get("input")
+                                        .map(json::serialize)
+                                        .unwrap_or_default(),
+                                },
+                            ));
+                        }
+                        _ => {}
+                    }
+                    if let Some(thinking) = block.get("thinking").and_then(|v| v.as_str()) {
+                        on_chunk(thinking, "thinking");
+                    }
+                }
             }
-            let val = json::parse(data).map_err(|e| {
-                format!(
-                    "Malformed Anthropic stream event on line {}: {e}",
-                    line_index + 1
-                )
-            })?;
-            let obj = val.as_object().ok_or_else(|| {
-                format!(
-                    "Malformed Anthropic stream event on line {}: expected a JSON object",
-                    line_index + 1
-                )
-            })?;
-            match obj.get("type").and_then(|v| v.as_str()) {
-                Some("content_block_start") => {
-                    if current_tool_use.is_some() {
+            Some("content_block_delta") => {
+                if let Some(delta) = obj.get("delta") {
+                    if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
+                        self.text_accum.push_str(text);
+                        on_chunk(text, "text");
+                    }
+                    if let Some(thinking) = delta.get("thinking").and_then(|v| v.as_str()) {
+                        on_chunk(thinking, "thinking");
+                    }
+                    if delta.get("type").and_then(|v| v.as_str()) == Some("input_json_delta") {
+                        let index = obj.get("index").and_then(|v| v.as_u64()).ok_or_else(|| {
+                            "Invalid Anthropic stream: tool call delta missing block index"
+                                .to_string()
+                        })?;
+                        match self.current_tool_use.as_ref() {
+                            Some((tool_index, _)) if *tool_index == index => {}
+                            Some(_) => {
+                                return Err(
+                                    "Invalid Anthropic stream: tool call delta block index does not match the open tool call"
+                                        .into(),
+                                );
+                            }
+                            None => {
+                                return Err(
+                                    "Invalid Anthropic stream: tool call delta has no open tool call"
+                                        .into(),
+                                );
+                            }
+                        }
+                        let partial = delta
+                            .get("partial_json")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| {
+                                "Invalid Anthropic stream: tool call delta missing partial_json"
+                                    .to_string()
+                            })?;
+                        self.tool_input_accum.push_str(partial);
+                    }
+                }
+            }
+            Some("content_block_stop") => {
+                if let Some((tool_index, _)) = self.current_tool_use.as_ref() {
+                    let index = obj.get("index").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        "Invalid Anthropic stream: tool call stop missing block index".to_string()
+                    })?;
+                    if *tool_index != index {
                         return Err(
-                            "Invalid Anthropic stream: new content block started before the tool call completed"
+                            "Invalid Anthropic stream: tool call stop block index does not match the open tool call"
                                 .into(),
                         );
                     }
-                    if let Some(block) = obj.get("content_block") {
-                        match block.get("type").and_then(|v| v.as_str()) {
-                            Some("text") => {
-                                if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                                    text_accum = t.to_string();
-                                }
-                            }
-                            Some("tool_use") => {
-                                let index = obj
-                                    .get("index")
-                                    .and_then(|v| v.as_u64())
-                                    .ok_or_else(|| {
-                                        "Invalid Anthropic stream: tool call start missing block index"
-                                            .to_string()
-                                    })?;
-                                if !text_accum.is_empty() {
-                                    messages.push(Message {
-                                        role: "assistant".into(),
-                                        content: Content::Text(text_accum.clone()),
-                                    });
-                                    text_accum.clear();
-                                }
-                                tool_input_accum.clear();
-                                current_tool_use = Some((
-                                    index,
-                                    ToolUse {
-                                        name: block
-                                            .get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string(),
-                                        id: block
-                                            .get("id")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string(),
-                                        // In real streaming responses content_block_start's `input` is
-                                        // always `{}` — the actual arguments arrive as input_json_delta
-                                        // fragments below and get assembled at content_block_stop.
-                                        input: block
-                                            .get("input")
-                                            .map(|v| json::serialize(v))
-                                            .unwrap_or_default(),
-                                    },
-                                ));
-                            }
-                            _ => {}
-                        }
+                    let (_, mut tool_use) = self.current_tool_use.take().unwrap();
+                    if !self.tool_input_accum.is_empty() {
+                        tool_use.input = self.tool_input_accum.clone();
                     }
+                    self.tool_input_accum.clear();
+                    tool_use
+                        .validate()
+                        .map_err(|error| format!("Invalid Anthropic stream: {error}"))?;
+                    self.messages.push(Message {
+                        role: "assistant".into(),
+                        content: Content::ToolUse(tool_use),
+                    });
                 }
-                Some("content_block_delta") => {
-                    if let Some(delta) = obj.get("delta") {
-                        if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
-                            text_accum.push_str(t);
-                        }
-                        if delta.get("type").and_then(|v| v.as_str()) == Some("input_json_delta") {
-                            let index =
-                                obj.get("index").and_then(|v| v.as_u64()).ok_or_else(|| {
-                                    "Invalid Anthropic stream: tool call delta missing block index"
-                                        .to_string()
-                                })?;
-                            match current_tool_use.as_ref() {
-                                Some((tool_index, _)) if *tool_index == index => {}
-                                Some(_) => {
-                                    return Err(
-                                        "Invalid Anthropic stream: tool call delta block index does not match the open tool call"
-                                            .into(),
-                                    );
-                                }
-                                None => {
-                                    return Err(
-                                        "Invalid Anthropic stream: tool call delta has no open tool call"
-                                            .into(),
-                                    );
-                                }
-                            }
-                            let partial = delta
-                                .get("partial_json")
-                                .and_then(|v| v.as_str())
-                                .ok_or_else(|| {
-                                    "Invalid Anthropic stream: tool call delta missing partial_json"
-                                        .to_string()
-                                })?;
-                            tool_input_accum.push_str(partial);
-                        }
-                    }
-                }
-                Some("content_block_stop") => {
-                    if let Some((tool_index, _)) = current_tool_use.as_ref() {
-                        let index = obj.get("index").and_then(|v| v.as_u64()).ok_or_else(|| {
-                            "Invalid Anthropic stream: tool call stop missing block index"
-                                .to_string()
-                        })?;
-                        if *tool_index != index {
-                            return Err(
-                                "Invalid Anthropic stream: tool call stop block index does not match the open tool call"
-                                    .into(),
-                            );
-                        }
-                        let (_, mut tu) = current_tool_use.take().unwrap();
-                        if !tool_input_accum.is_empty() {
-                            tu.input = tool_input_accum.clone();
-                        }
-                        tool_input_accum.clear();
-                        tu.validate()
-                            .map_err(|e| format!("Invalid Anthropic stream: {e}"))?;
-                        messages.push(Message {
-                            role: "assistant".into(),
-                            content: Content::ToolUse(tu),
-                        });
-                    }
-                }
-                Some("message_start") | Some("message_delta") => {
-                    if let Some(u) = obj.get("usage") {
-                        usage.input_tokens +=
-                            u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        usage.output_tokens +=
-                            u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    }
-                }
-                Some("message_stop") => {
-                    saw_message_stop = true;
-                    break;
-                }
-                Some("error") => {
-                    let error = obj.get("error");
-                    let kind = error
-                        .and_then(|e| e.get("type"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("api_error");
-                    let message = error
-                        .and_then(|e| e.get("message"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Anthropic returned an error event");
-                    return Err(format!("Anthropic API stream error ({kind}): {message}"));
-                }
-                _ => {}
             }
+            Some("message_start") | Some("message_delta") => {
+                if let Some(usage) = obj.get("usage") {
+                    self.usage.input_tokens += usage
+                        .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    self.usage.output_tokens += usage
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                }
+            }
+            Some("message_stop") => self.saw_message_stop = true,
+            Some("error") => {
+                let error = obj.get("error");
+                let kind = error
+                    .and_then(|e| e.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("api_error");
+                let message = error
+                    .and_then(|e| e.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Anthropic returned an error event");
+                return Err(format!("Anthropic API stream error ({kind}): {message}"));
+            }
+            _ => {}
         }
+        Ok(())
     }
-    if !saw_message_stop {
-        return Err("Incomplete Anthropic stream: missing message_stop completion marker".into());
+
+    fn finish(mut self) -> Result<(Vec<Message>, Usage), String> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        if !self.saw_message_stop {
+            return Err(
+                "Incomplete Anthropic stream: missing message_stop completion marker".into(),
+            );
+        }
+        if self.current_tool_use.is_some() {
+            return Err("Invalid Anthropic stream: tool call did not complete".into());
+        }
+        if !self.text_accum.is_empty() {
+            self.messages.push(Message {
+                role: "assistant".into(),
+                content: Content::Text(self.text_accum),
+            });
+        }
+        Ok((self.messages, self.usage))
     }
-    if current_tool_use.is_some() {
-        return Err("Invalid Anthropic stream: tool call did not complete".into());
+}
+
+#[cfg(test)]
+fn parse_anthropic_streaming_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
+    let mut response = AnthropicStreamingResponse::default();
+    let mut ignore_chunk = |_: &str, _: &str| {};
+    for line in raw.lines() {
+        response.push_line(line, &mut ignore_chunk);
     }
-    if !text_accum.is_empty() {
-        messages.push(Message {
-            role: "assistant".into(),
-            content: Content::Text(text_accum),
-        });
-    }
-    Ok((messages, usage))
+    response.finish()
 }
 
 #[cfg(test)]

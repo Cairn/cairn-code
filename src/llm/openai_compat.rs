@@ -119,108 +119,170 @@ pub fn validate_json_body(body: String) -> Result<String, String> {
     Ok(body)
 }
 
-pub fn parse_streaming_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
-    let mut messages = Vec::new();
-    let mut usage = Usage::default();
-    let mut collected = String::new();
-    let mut tool_calls: HashMap<u64, (String, String, String)> = HashMap::new();
-    let mut saw_done = false;
-    for (line_index, line) in raw.lines().enumerate() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            if data == "[DONE]" {
-                saw_done = true;
-                break;
-            }
-            let val = json::parse(data).map_err(|e| {
-                format!(
-                    "Malformed OpenAI-compatible stream event on line {}: {e}",
-                    line_index + 1
-                )
-            })?;
-            if val.as_object().is_none() {
-                return Err(format!(
-                    "Malformed OpenAI-compatible stream event on line {}: expected a JSON object",
-                    line_index + 1
-                ));
-            }
-            if let Some(error) = val.get("error") {
-                let message = error
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("provider returned an error event");
-                return Err(format!("OpenAI-compatible API stream error: {message}"));
-            }
-            if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
-                if let Some(choice) = choices.first() {
-                    if let Some(delta) = choice.get("delta") {
-                        if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-                            collected.push_str(text);
+/// Incremental reducer for OpenAI-compatible SSE data lines. It retains only
+/// state that becomes part of the returned messages/usage, rather than a
+/// second copy of the complete wire transcript.
+#[derive(Default)]
+pub struct StreamingResponse {
+    usage: Usage,
+    collected: String,
+    tool_calls: HashMap<u64, (String, String, String)>,
+    saw_done: bool,
+    lines_seen: usize,
+    error: Option<String>,
+}
+
+impl StreamingResponse {
+    pub fn push_line<F>(&mut self, line: &str, on_chunk: &mut F, emit_reasoning: bool)
+    where
+        F: FnMut(&str, &str),
+    {
+        self.lines_seen = self.lines_seen.saturating_add(1);
+        if self.error.is_some() || self.saw_done {
+            return;
+        }
+        if let Err(error) = self.process_line(line, on_chunk, emit_reasoning) {
+            self.error = Some(error);
+        }
+    }
+
+    fn process_line<F>(
+        &mut self,
+        line: &str,
+        on_chunk: &mut F,
+        emit_reasoning: bool,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&str, &str),
+    {
+        let Some(data) = line.strip_prefix("data: ") else {
+            return Ok(());
+        };
+        if data == "[DONE]" {
+            self.saw_done = true;
+            return Ok(());
+        }
+
+        let val = json::parse(data).map_err(|error| {
+            format!(
+                "Malformed OpenAI-compatible stream event on line {}: {error}",
+                self.lines_seen
+            )
+        })?;
+        if val.as_object().is_none() {
+            return Err(format!(
+                "Malformed OpenAI-compatible stream event on line {}: expected a JSON object",
+                self.lines_seen
+            ));
+        }
+        if let Some(error) = val.get("error") {
+            let message = error
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("provider returned an error event");
+            return Err(format!("OpenAI-compatible API stream error: {message}"));
+        }
+        if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
+            if let Some(choice) = choices.first() {
+                if let Some(delta) = choice.get("delta") {
+                    if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+                        self.collected.push_str(text);
+                        on_chunk(text, "text");
+                    }
+                    if emit_reasoning {
+                        if let Some(text) = delta.get("reasoning_content").and_then(|v| v.as_str())
+                        {
+                            if !text.is_empty() {
+                                on_chunk(text, "thinking");
+                            }
                         }
-                        if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                            for tc in tc_arr {
-                                let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let entry = tool_calls.entry(idx).or_insert_with(|| {
-                                    (String::new(), String::new(), String::new())
-                                });
-                                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                                    if !id.is_empty() {
-                                        entry.0 = id.to_string();
+                    }
+                    if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                        for tc in tc_arr {
+                            let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let entry = self
+                                .tool_calls
+                                .entry(idx)
+                                .or_insert_with(|| (String::new(), String::new(), String::new()));
+                            if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                if !id.is_empty() {
+                                    entry.0 = id.to_string();
+                                }
+                            }
+                            if let Some(func) = tc.get("function") {
+                                if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                    if !name.is_empty() {
+                                        entry.1 = name.to_string();
                                     }
                                 }
-                                if let Some(func) = tc.get("function") {
-                                    if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                                        if !name.is_empty() {
-                                            entry.1 = name.to_string();
-                                        }
-                                    }
-                                    if let Some(args) =
-                                        func.get("arguments").and_then(|v| v.as_str())
-                                    {
-                                        entry.2.push_str(args);
-                                    }
+                                if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                    entry.2.push_str(args);
                                 }
                             }
                         }
                     }
                 }
             }
-            if let Some(u) = val.get("usage") {
-                usage.input_tokens = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                usage.output_tokens = u
-                    .get("completion_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-            }
         }
+        if let Some(usage) = val.get("usage") {
+            self.usage.input_tokens = usage
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            self.usage.output_tokens = usage
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+        }
+        Ok(())
     }
-    if !saw_done {
-        return Err("Incomplete OpenAI-compatible stream: missing [DONE] completion marker".into());
-    }
-    if !collected.is_empty() {
-        messages.push(Message {
-            role: "assistant".into(),
-            content: Content::Text(collected),
-        });
-    }
-    if !tool_calls.is_empty() {
-        let mut calls: Vec<_> = tool_calls.into_iter().collect();
-        calls.sort_by_key(|(idx, _)| *idx);
-        for (_, (id, name, args)) in calls {
-            let tool_use = ToolUse {
-                id,
-                name,
-                input: args,
-            };
-            tool_use
-                .validate()
-                .map_err(|e| format!("Invalid OpenAI-compatible stream: {e}"))?;
+
+    pub fn finish(self) -> Result<(Vec<Message>, Usage), String> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        if !self.saw_done {
+            return Err(
+                "Incomplete OpenAI-compatible stream: missing [DONE] completion marker".into(),
+            );
+        }
+
+        let mut messages = Vec::new();
+        if !self.collected.is_empty() {
             messages.push(Message {
                 role: "assistant".into(),
-                content: Content::ToolUse(tool_use),
+                content: Content::Text(self.collected),
             });
         }
+        if !self.tool_calls.is_empty() {
+            let mut calls: Vec<_> = self.tool_calls.into_iter().collect();
+            calls.sort_by_key(|(idx, _)| *idx);
+            for (_, (id, name, args)) in calls {
+                let tool_use = ToolUse {
+                    id,
+                    name,
+                    input: args,
+                };
+                tool_use
+                    .validate()
+                    .map_err(|error| format!("Invalid OpenAI-compatible stream: {error}"))?;
+                messages.push(Message {
+                    role: "assistant".into(),
+                    content: Content::ToolUse(tool_use),
+                });
+            }
+        }
+        Ok((messages, self.usage))
     }
-    Ok((messages, usage))
+}
+
+pub fn parse_streaming_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
+    let mut response = StreamingResponse::default();
+    let mut ignore_chunk = |_: &str, _: &str| {};
+    for line in raw.lines() {
+        response.push_line(line, &mut ignore_chunk, false);
+    }
+    response.finish()
 }
 
 pub fn parse_complete_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
