@@ -53,7 +53,7 @@ Co-Authored-By: cairn-code <282421612+cairn-code@users.noreply.github.com>
 ```
 
 - Prefer the **git** tool for commits: it adds this via `git commit --trailer` automatically (works with `-m`, `-F`, `-C`, etc.).
-- If you must commit via **shell**, pass the same trailer with `--trailer` or end the message with a blank line and that line. Do not duplicate it if it is already present.
+- **shell** and **powershell** also inject the same trailer when they detect a bare `git commit` (including `git.exe` / path forms and chains like `&&` / `;`). Do not duplicate it if it is already present.
 - Do not invent a different name or email for this trailer.
 
 ## Response Style
