@@ -15,6 +15,12 @@ use crate::json::{self, JsonValue};
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const INIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Upper bound on a single inbound frame (an NDJSON line or a Content-Length
+/// body) so a peer cannot force an unbounded allocation.
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+/// Grace period Drop waits for a server to exit after stdin EOF before it
+/// force-kills and reaps the child.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct RemoteTool {
@@ -35,6 +41,8 @@ pub struct McpClient {
     server_name: String,
     /// Reader thread join handle.
     _reader: Option<thread::JoinHandle<()>>,
+    /// Stderr-draining thread join handle.
+    _stderr: Option<thread::JoinHandle<()>>,
 }
 
 impl McpClient {
@@ -73,13 +81,17 @@ impl McpClient {
         let pending_r = pending.clone();
         let server_label = server_name.to_string();
 
+        // Drain stderr on its own thread so a chatty server that fills its
+        // stderr pipe cannot block before it answers on stdout.
+        let stderr_drainer = stderr.map(|mut err| {
+            thread::spawn(move || {
+                let mut sink = Vec::new();
+                let _ = err.read_to_end(&mut sink);
+            })
+        });
+
         let reader = thread::spawn(move || {
             read_loop(stdout, pending_r, &server_label);
-            // Drain stderr into nowhere (or log later); keep process from blocking.
-            if let Some(mut err) = stderr {
-                let mut buf = Vec::new();
-                let _ = err.read_to_end(&mut buf);
-            }
         });
 
         let mut client = McpClient {
@@ -89,6 +101,7 @@ impl McpClient {
             next_id: AtomicU64::new(1),
             server_name: server_name.to_string(),
             _reader: Some(reader),
+            _stderr: stderr_drainer,
         };
 
         client.handshake()?;
@@ -213,8 +226,23 @@ impl McpClient {
             ("method".into(), JsonValue::String(method.into())),
             ("params".into(), params),
         ]));
-        self.write_message(&msg)?;
-        wait_response(&rx, timeout, &self.server_name, method)
+        // On any failure path, drop the pending entry so a timed-out or
+        // never-sent request cannot leak in the map forever.
+        if let Err(e) = self.write_message(&msg) {
+            self.forget_pending(id);
+            return Err(e);
+        }
+        let result = wait_response(&rx, timeout, &self.server_name, method);
+        if result.is_err() {
+            self.forget_pending(id);
+        }
+        result
+    }
+
+    fn forget_pending(&self, id: u64) {
+        if let Ok(mut map) = self.pending.lock() {
+            map.remove(&id);
+        }
     }
 
     fn notify(&mut self, method: &str, params: JsonValue) -> Result<(), String> {
@@ -246,8 +274,21 @@ impl Drop for McpClient {
     fn drop(&mut self) {
         // Close stdin so the server sees EOF and can exit cleanly.
         self.stdin.take();
-        let _ = self.child.wait();
+        // Bounded graceful shutdown: poll for a clean exit for a short grace
+        // period, then force-kill so a non-cooperative server cannot hang us.
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                _ => break,
+            }
+        }
         let _ = self.child.kill();
+        // Reap the child so we never leave a zombie behind.
+        let _ = self.child.wait();
     }
 }
 
@@ -276,12 +317,14 @@ fn wait_response(
 
 fn read_loop<R: Read>(stdout: R, pending: Arc<Mutex<HashMap<u64, Pending>>>, server: &str) {
     let mut reader = BufReader::new(stdout);
-    let mut buf = String::new();
     loop {
-        buf.clear();
-        // Prefer NDJSON lines; also accept Content-Length framing.
+        // Prefer NDJSON lines; also accept Content-Length framing. Cap every
+        // read so a peer cannot force an unbounded line allocation.
         let mut header = String::new();
-        match reader.read_line(&mut header) {
+        match (&mut reader)
+            .take(MAX_FRAME_BYTES as u64)
+            .read_line(&mut header)
+        {
             Ok(0) => break,
             Ok(_) => {}
             Err(_) => break,
@@ -295,10 +338,19 @@ fn read_loop<R: Read>(stdout: R, pending: Arc<Mutex<HashMap<u64, Pending>>>, ser
             .strip_prefix("content-length:")
         {
             let len: usize = rest.trim().parse().unwrap_or(0);
+            // Refuse a peer-selected allocation larger than our frame cap.
+            if len > MAX_FRAME_BYTES {
+                break;
+            }
             // consume remaining headers until blank line
             loop {
                 let mut h = String::new();
-                if reader.read_line(&mut h).unwrap_or(0) == 0 {
+                if (&mut reader)
+                    .take(MAX_FRAME_BYTES as u64)
+                    .read_line(&mut h)
+                    .unwrap_or(0)
+                    == 0
+                {
                     break;
                 }
                 if h.trim().is_empty() {
@@ -412,6 +464,19 @@ mod tests {
         read_loop(Cursor::new(payload), pending, "test");
         let res = rx.recv().unwrap();
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn read_loop_rejects_oversized_content_length() {
+        // A peer-selected Content-Length above the cap must not be allocated;
+        // the loop breaks and any pending request is failed.
+        let payload = format!("Content-Length: {}\r\n\r\n", MAX_FRAME_BYTES + 1);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel();
+        pending.lock().unwrap().insert(9, Pending { tx });
+        read_loop(Cursor::new(payload), pending, "test");
+        let res = rx.recv().unwrap();
+        assert!(res.is_err());
     }
 
     #[test]
