@@ -144,6 +144,11 @@ fn serve_once(listener: TcpListener, response: &[u8], capture: &PathBuf) {
             };
             request.extend_from_slice(&buffer[..read]);
         }
+        // Read timeout can stop body collection early; never slice past what
+        // actually arrived or the server thread panics and join().unwrap fails.
+        if request.len() < body_end.saturating_add(content_length) {
+            continue;
+        }
         if first {
             let _ = fs::write(capture, &request[body_end..body_end + content_length]);
             first = false;
