@@ -244,6 +244,10 @@ impl Agent {
         }
     }
 
+    fn max_turns_error(max_turns: usize) -> String {
+        format!("Agent reached the maximum of {max_turns} turns before completing")
+    }
+
     pub fn run(
         &mut self,
         input: &str,
@@ -335,7 +339,7 @@ impl Agent {
                 }
 
                 if tool_uses.is_empty() {
-                    break;
+                    return Ok(());
                 }
 
                 for tu in &tool_uses {
@@ -367,7 +371,8 @@ impl Agent {
                     });
                 }
             }
-            Ok(())
+
+            Err(Self::max_turns_error(self.config.max_turns))
         })();
 
         if let Err(ref e) = result {
@@ -552,10 +557,7 @@ impl Agent {
                 }
             }
 
-            Err(format!(
-                "Agent reached the maximum of {} turns before completing",
-                self.config.max_turns
-            ))
+            Err(Self::max_turns_error(self.config.max_turns))
         })();
 
         self.sync_live_mirror();
@@ -1357,5 +1359,128 @@ mod tests {
 
         assert!(result.unwrap_err().contains("Permission denied"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    struct InteractiveRunMock {
+        use_tools: bool,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl llm::Provider for InteractiveRunMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn default_model(&self) -> &str {
+            "mock-model"
+        }
+
+        fn available_models(&self) -> Vec<llm::ModelInfo> {
+            vec![llm::ModelInfo {
+                id: "mock-model".into(),
+                name: "Mock".into(),
+                max_ctx: 1000,
+            }]
+        }
+
+        fn stream_complete(
+            &self,
+            _messages: &[llm::Message],
+            _tools: &[llm::ToolDefinition],
+            _system: &str,
+            _model: &str,
+            _max_tokens: usize,
+            _on_chunk: llm::StreamingCallback,
+            _cancel: &AtomicBool,
+        ) -> Result<(Vec<llm::Message>, Usage), String> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let content = if self.use_tools {
+                llm::Content::ToolUse(llm::ToolUse {
+                    id: format!("tool-{call}"),
+                    name: "missing-tool".into(),
+                    input: "{}".into(),
+                })
+            } else {
+                llm::Content::Text("complete".into())
+            };
+            Ok((
+                vec![llm::Message {
+                    role: "assistant".into(),
+                    content,
+                }],
+                Usage::default(),
+            ))
+        }
+
+        fn complete(
+            &self,
+            _messages: &[llm::Message],
+            _tools: &[llm::ToolDefinition],
+            _system: &str,
+            _model: &str,
+            _max_tokens: usize,
+        ) -> Result<(Vec<llm::Message>, Usage), String> {
+            unreachable!("interactive tests only use streaming completion")
+        }
+    }
+
+    fn run_interactive_with_max_turns(
+        max_turns: usize,
+        use_tools: bool,
+    ) -> (Result<(), String>, Vec<AgentEvent>, usize) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut config = Config::default();
+        config.max_turns = max_turns;
+        let mut agent = Agent::new(
+            Box::new(InteractiveRunMock {
+                use_tools,
+                calls: calls.clone(),
+            }),
+            "mock-model".into(),
+            crate::tools::registry::Registry::new(),
+            config,
+        );
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_perm_tx, perm_rx) = mpsc::channel();
+
+        let result = agent.run("prompt", event_tx, &AtomicBool::new(false), &perm_rx);
+        let events = event_rx.try_iter().collect();
+        (result, events, calls.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn interactive_run_errors_when_tool_calls_exhaust_turns() {
+        let (result, events, calls) = run_interactive_with_max_turns(2, true);
+        let expected = "Agent reached the maximum of 2 turns before completing";
+
+        assert_eq!(result.unwrap_err(), expected);
+        assert_eq!(calls, 2);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Error(error) if error == expected)));
+    }
+
+    #[test]
+    fn interactive_run_completes_and_emits_done_without_tool_calls() {
+        let (result, events, calls) = run_interactive_with_max_turns(1, false);
+
+        result.unwrap();
+        assert_eq!(calls, 1);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Error(_))));
+        assert!(matches!(events.last(), Some(AgentEvent::Done)));
+    }
+
+    #[test]
+    fn interactive_run_defines_zero_turns_as_immediate_exhaustion() {
+        let (result, events, calls) = run_interactive_with_max_turns(0, false);
+        let expected = "Agent reached the maximum of 0 turns before completing";
+
+        assert_eq!(result.unwrap_err(), expected);
+        assert_eq!(calls, 0);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Error(error) if error == expected)));
     }
 }

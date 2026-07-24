@@ -124,59 +124,77 @@ pub fn parse_streaming_response(raw: &str) -> Result<(Vec<Message>, Usage), Stri
     let mut usage = Usage::default();
     let mut collected = String::new();
     let mut tool_calls: HashMap<u64, (String, String, String)> = HashMap::new();
-    for line in raw.lines() {
+    let mut saw_done = false;
+    for (line_index, line) in raw.lines().enumerate() {
         if let Some(data) = line.strip_prefix("data: ") {
             if data == "[DONE]" {
-                continue;
+                saw_done = true;
+                break;
             }
-            if let Ok(val) = json::parse(data) {
-                if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
-                    if let Some(choice) = choices.first() {
-                        if let Some(delta) = choice.get("delta") {
-                            if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-                                collected.push_str(text);
-                            }
-                            if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array())
-                            {
-                                for tc in tc_arr {
-                                    let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                                    let entry = tool_calls.entry(idx).or_insert_with(|| {
-                                        (String::new(), String::new(), String::new())
-                                    });
-                                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                                        if !id.is_empty() {
-                                            entry.0 = id.to_string();
+            let val = json::parse(data).map_err(|e| {
+                format!(
+                    "Malformed OpenAI-compatible stream event on line {}: {e}",
+                    line_index + 1
+                )
+            })?;
+            if val.as_object().is_none() {
+                return Err(format!(
+                    "Malformed OpenAI-compatible stream event on line {}: expected a JSON object",
+                    line_index + 1
+                ));
+            }
+            if let Some(error) = val.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("provider returned an error event");
+                return Err(format!("OpenAI-compatible API stream error: {message}"));
+            }
+            if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
+                if let Some(choice) = choices.first() {
+                    if let Some(delta) = choice.get("delta") {
+                        if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+                            collected.push_str(text);
+                        }
+                        if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                            for tc in tc_arr {
+                                let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let entry = tool_calls.entry(idx).or_insert_with(|| {
+                                    (String::new(), String::new(), String::new())
+                                });
+                                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                    if !id.is_empty() {
+                                        entry.0 = id.to_string();
+                                    }
+                                }
+                                if let Some(func) = tc.get("function") {
+                                    if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                        if !name.is_empty() {
+                                            entry.1 = name.to_string();
                                         }
                                     }
-                                    if let Some(func) = tc.get("function") {
-                                        if let Some(name) =
-                                            func.get("name").and_then(|v| v.as_str())
-                                        {
-                                            if !name.is_empty() {
-                                                entry.1 = name.to_string();
-                                            }
-                                        }
-                                        if let Some(args) =
-                                            func.get("arguments").and_then(|v| v.as_str())
-                                        {
-                                            entry.2.push_str(args);
-                                        }
+                                    if let Some(args) =
+                                        func.get("arguments").and_then(|v| v.as_str())
+                                    {
+                                        entry.2.push_str(args);
                                     }
                                 }
                             }
                         }
                     }
                 }
-                if let Some(u) = val.get("usage") {
-                    usage.input_tokens =
-                        u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    usage.output_tokens = u
-                        .get("completion_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                }
+            }
+            if let Some(u) = val.get("usage") {
+                usage.input_tokens = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                usage.output_tokens = u
+                    .get("completion_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
             }
         }
+    }
+    if !saw_done {
+        return Err("Incomplete OpenAI-compatible stream: missing [DONE] completion marker".into());
     }
     if !collected.is_empty() {
         messages.push(Message {
@@ -188,14 +206,17 @@ pub fn parse_streaming_response(raw: &str) -> Result<(Vec<Message>, Usage), Stri
         let mut calls: Vec<_> = tool_calls.into_iter().collect();
         calls.sort_by_key(|(idx, _)| *idx);
         for (_, (id, name, args)) in calls {
-            let input = if args.is_empty() {
-                "{}".to_string()
-            } else {
-                args
+            let tool_use = ToolUse {
+                id,
+                name,
+                input: args,
             };
+            tool_use
+                .validate()
+                .map_err(|e| format!("Invalid OpenAI-compatible stream: {e}"))?;
             messages.push(Message {
                 role: "assistant".into(),
-                content: Content::ToolUse(ToolUse { id, name, input }),
+                content: Content::ToolUse(tool_use),
             });
         }
     }
@@ -226,30 +247,31 @@ pub fn parse_complete_response(raw: &str) -> Result<(Vec<Message>, Usage), Strin
                 }
                 if let Some(tc_arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
                     for tc in tc_arr {
-                        let id = tc
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let name = tc
-                            .get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let args = tc
-                            .get("function")
-                            .and_then(|f| f.get("arguments"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("{}")
-                            .to_string();
+                        let tool_use = ToolUse {
+                            id: tc
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            name: tc
+                                .get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            input: tc
+                                .get("function")
+                                .and_then(|f| f.get("arguments"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        };
+                        tool_use
+                            .validate()
+                            .map_err(|e| format!("Invalid OpenAI-compatible response: {e}"))?;
                         messages.push(Message {
                             role: role.clone(),
-                            content: Content::ToolUse(ToolUse {
-                                id,
-                                name,
-                                input: args,
-                            }),
+                            content: Content::ToolUse(tool_use),
                         });
                     }
                 }
@@ -315,6 +337,77 @@ mod tests {
     }
 
     #[test]
+    fn test_streaming_rejects_malformed_event() {
+        let raw = "data: not-json\ndata: [DONE]\n";
+        let error = parse_streaming_response(raw).unwrap_err();
+
+        assert!(error.contains("Malformed OpenAI-compatible stream event"));
+    }
+
+    #[test]
+    fn test_streaming_surfaces_provider_error_event() {
+        let raw = "data: {\"error\":{\"message\":\"rate limited\"}}\n";
+        let error = parse_streaming_response(raw).unwrap_err();
+
+        assert!(error.contains("rate limited"), "{error}");
+    }
+
+    #[test]
+    fn test_streaming_rejects_truncated_event_at_eof() {
+        let raw = r#"data: {"choices":[{"delta":{"content":"partial"}}]
+"#;
+        let error = parse_streaming_response(raw).unwrap_err();
+
+        assert!(error.contains("Malformed OpenAI-compatible stream event"));
+    }
+
+    #[test]
+    fn test_streaming_requires_done_marker() {
+        let raw = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n";
+        let error = parse_streaming_response(raw).unwrap_err();
+
+        assert!(error.contains("missing [DONE] completion marker"));
+    }
+
+    #[test]
+    fn test_streaming_rejects_tool_calls_missing_id_or_name() {
+        let missing_id = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"glob\",\"arguments\":\"{}\"}}]}}]}\n",
+            "data: [DONE]\n",
+        );
+        let missing_name = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"arguments\":\"{}\"}}]}}]}\n",
+            "data: [DONE]\n",
+        );
+
+        let id_error = parse_streaming_response(missing_id).unwrap_err();
+        assert!(id_error.contains("missing an id"), "{id_error}");
+        let name_error = parse_streaming_response(missing_name).unwrap_err();
+        assert!(name_error.contains("missing a name"), "{name_error}");
+    }
+
+    #[test]
+    fn test_streaming_rejects_tool_call_missing_arguments() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"glob\"}}]}}]}\n",
+            "data: [DONE]\n",
+        );
+        let error = parse_streaming_response(raw).unwrap_err();
+
+        assert!(error.contains("invalid JSON arguments"), "{error}");
+    }
+
+    #[test]
+    fn test_streaming_rejects_invalid_tool_arguments() {
+        let raw = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"glob","arguments":"{\"pattern\":"}}]}}]}
+data: [DONE]
+"#;
+        let error = parse_streaming_response(raw).unwrap_err();
+
+        assert!(error.contains("invalid JSON arguments"), "{error}");
+    }
+
+    #[test]
     fn test_complete_response_multiple_tool_calls_all_survive() {
         let raw = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[
             {"id":"call_1","function":{"name":"glob","arguments":"{\"pattern\":\"*.rs\"}"}},
@@ -330,6 +423,16 @@ mod tests {
             Content::ToolUse(tu) => assert_eq!(tu.id, "call_2"),
             _ => panic!("expected ToolUse"),
         }
+    }
+
+    #[test]
+    fn test_complete_response_rejects_invalid_tool_call() {
+        let raw = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[
+            {"id":"call_1","function":{"name":"glob","arguments":"not-json"}}
+        ]}}]}"#;
+        let error = parse_complete_response(raw).unwrap_err();
+
+        assert!(error.contains("invalid JSON arguments"), "{error}");
     }
 
     #[test]

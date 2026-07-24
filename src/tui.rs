@@ -13,7 +13,7 @@ use ratatui::{
         execute,
     },
     layout::{Constraint, Direction, Layout, Position},
-    style::Modifier,
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Paragraph, Wrap},
     DefaultTerminal, Frame,
@@ -47,6 +47,27 @@ enum State {
 
 // Same frames as charmbracelet MiniDot (Grok Build / zero).
 const SPINNER_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+// Claude Code / OpenClaude-style loading verbs (subset of their spinner verb list).
+const SPINNER_VERBS: &[&str] = &[
+    "Thinking",
+    "Brewing",
+    "Composing",
+    "Crafting",
+    "Crunching",
+    "Deciphering",
+    "Exploring",
+    "Figuring",
+    "Forging",
+    "Generating",
+    "Mulling",
+    "Noodling",
+    "Pondering",
+    "Reasoning",
+    "Sculpting",
+    "Synthesizing",
+    "Unraveling",
+    "Working",
+];
 // MiniDot FPS is time.Second/12 (~83ms). Faster ticks look like flicker; slower feels sticky.
 const SPINNER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 12);
 // Cap full-frame redraws while the agent runs. Zero coalesces stream text to ~16ms
@@ -68,6 +89,8 @@ pub struct Tui {
     history: Vec<String>,
     hist_idx: usize,
     spinner_idx: usize,
+    /// Index into SPINNER_VERBS for the current agent turn (Claude Code-style).
+    spinner_verb_idx: usize,
     streaming_text: String,
     stream_thinking: String,
     state: State,
@@ -174,6 +197,7 @@ impl Tui {
             history: Vec::new(),
             hist_idx: 0,
             spinner_idx: 0,
+            spinner_verb_idx: 0,
             streaming_text: String::new(),
             stream_thinking: String::new(),
             state: State::Idle,
@@ -275,6 +299,17 @@ impl Tui {
             .iter()
             .position(|t| t.name == self.theme.name)
             .unwrap_or(0);
+    }
+
+    fn begin_running(&mut self) {
+        self.state = State::Running;
+        // New verb each turn (Claude Code / OpenClaude spinner style).
+        let seed = self
+            .spinner_idx
+            .wrapping_add(self.total_usage.input_tokens as usize)
+            .wrapping_add(self.output_lines.len())
+            .wrapping_add(1);
+        self.spinner_verb_idx = seed % SPINNER_VERBS.len();
     }
 
     pub fn set_show_thinking(&mut self, show: bool) {
@@ -715,12 +750,16 @@ impl Tui {
         }
     }
 
+    /// Max transcript scroll offset from the last paint (0 = everything fits).
+    fn transcript_max_off(&self) -> usize {
+        self.last_body_wrapped
+            .saturating_sub(self.last_body_h.max(1))
+    }
+
     /// Scroll the transcript by `delta` wrapped lines (negative = up / older).
     /// Mirrors videre's rowoff model: free scroll until the bottom, then re-follow.
     fn scroll_transcript(&mut self, delta: isize) {
-        let max_off = self
-            .last_body_wrapped
-            .saturating_sub(self.last_body_h.max(1));
+        let max_off = self.transcript_max_off();
         if max_off == 0 {
             self.transcript_rowoff = 0;
             self.transcript_follow = true;
@@ -738,6 +777,27 @@ impl Tui {
         };
         self.transcript_rowoff = next;
         self.transcript_follow = next >= max_off;
+    }
+
+    /// Previous entry in the local prompt history (shell-style).
+    fn history_prev(&mut self) {
+        if self.hist_idx > 0 {
+            self.hist_idx -= 1;
+            self.input_buf = self.history[self.hist_idx].clone();
+            self.cursor = self.input_buf.len();
+        }
+    }
+
+    /// Next entry in the local prompt history (shell-style).
+    fn history_next(&mut self) {
+        if self.hist_idx < self.history.len().saturating_sub(1) {
+            self.hist_idx += 1;
+            self.input_buf = self.history[self.hist_idx].clone();
+        } else {
+            self.hist_idx = self.history.len();
+            self.input_buf.clear();
+        }
+        self.cursor = self.input_buf.len();
     }
 
     fn scroll_page(&mut self, down: bool) {
@@ -775,12 +835,13 @@ impl Tui {
         }
 
         // Transcript scroll (videre-style Page / Ctrl-U/D + arrows with Ctrl).
-        // Skip when a picker owns navigation keys.
+        // Skip when a list picker owns navigation keys. Slash ghost completion is
+        // inline (not a multi-line list), so page/wheel scroll still works while
+        // typing `/…`. Bare Up/Down still cycle slash candidates first.
         let picker_nav = self.show_model_picker
             || self.show_provider_picker
             || self.show_theme_picker
             || self.show_session_picker
-            || self.show_command_picker
             || self.show_permission_prompt
             || self.confirm_remove_provider.is_some()
             || self.confirm_history_provider.is_some();
@@ -804,6 +865,19 @@ impl Tui {
                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     self.scroll_half_page(true);
+                    return true;
+                }
+                // Readline-style history that works even when Up/Down scroll the chat.
+                KeyCode::Char('p') | KeyCode::Char('P')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.history_prev();
+                    return true;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.history_next();
                     return true;
                 }
                 KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1018,11 +1092,14 @@ impl Tui {
                     }
                     return true;
                 }
-                if self.hist_idx > 0 {
-                    self.hist_idx -= 1;
-                    self.input_buf = self.history[self.hist_idx].clone();
-                    self.cursor = self.input_buf.len();
+                // Windows Terminal (and others) on the alt screen often send the
+                // mouse wheel as bare Up/Down. Prefer transcript scroll whenever
+                // the chat overflows so wheel does not walk prompt history.
+                if self.transcript_max_off() > 0 {
+                    self.scroll_transcript(-3);
+                    return true;
                 }
+                self.history_prev();
                 true
             }
             KeyCode::Down => {
@@ -1061,14 +1138,11 @@ impl Tui {
                     }
                     return true;
                 }
-                if self.hist_idx < self.history.len().saturating_sub(1) {
-                    self.hist_idx += 1;
-                    self.input_buf = self.history[self.hist_idx].clone();
-                } else {
-                    self.hist_idx = self.history.len();
-                    self.input_buf.clear();
+                if self.transcript_max_off() > 0 {
+                    self.scroll_transcript(3);
+                    return true;
                 }
-                self.cursor = self.input_buf.len();
+                self.history_next();
                 true
             }
             KeyCode::Left => {
@@ -1354,7 +1428,7 @@ impl Tui {
                     tool_name: String::new(),
                     duration: String::new(),
                 });
-                self.state = State::Running;
+                self.begin_running();
                 if let Some(tx) = &self.agent_tx {
                     let _ = tx.send(input);
                 }
@@ -1610,7 +1684,7 @@ impl Tui {
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /auth /clear /compact /copy /cost /delete /exit /help /mcp /model /mouse /provider /resume /save /select /sessions /skills /suggestions /theme /thinking\nExtensibility: skills (SKILL.md) + MCP stdio (config mcp.servers or mcpServers)\n/skills · /mcp — list skills and MCP servers\nMouse: wheel scrolls · Shift+drag selects (terminal-native) · /mouse off disables capture\n/select [last|all] or Ctrl+O — plain-text view if you need a full select dump\n/copy or Ctrl+Y — copy last assistant message to clipboard\n/thinking [on|off] · /suggestions [on|off]\nTab completes slash commands · Scroll: PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End\nSounds: CAIRN_SOUND=0 to mute · /provider xai — OAuth; /auth login xai".into(),
+                    content: "Commands: /auth /clear /compact /copy /cost /delete /exit /help /mcp /model /mouse /provider /resume /save /select /sessions /skills /suggestions /theme /thinking\nExtensibility: skills (SKILL.md) + MCP stdio (config mcp.servers or mcpServers)\n/skills · /mcp — list skills and MCP servers\nMouse: wheel scrolls · Shift+drag selects (terminal-native) · /mouse off disables capture\n/select [last|all] or Ctrl+O — plain-text view if you need a full select dump\n/copy or Ctrl+Y — copy last assistant message to clipboard\n/thinking [on|off] · /suggestions [on|off]\nTab completes slash commands · Scroll: wheel · PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End (Up/Down scroll when chat overflows; Ctrl+P/N for prompt history)\nSounds: CAIRN_SOUND=0 to mute · /provider xai — OAuth; /auth login xai".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
             }
@@ -1735,15 +1809,19 @@ impl Tui {
                     }
                     "logout" => {
                         let provider = parts.get(2).copied().unwrap_or("xai").to_ascii_lowercase();
-                        if let Some(tx) = &self.agent_tx {
-                            self.state = State::Running;
-                            let _ = tx.send(format!("__auth_logout__:{provider}"));
+                        if self.agent_tx.is_some() {
+                            self.begin_running();
+                            if let Some(tx) = &self.agent_tx {
+                                let _ = tx.send(format!("__auth_logout__:{provider}"));
+                            }
                         }
                     }
                     "status" | _ => {
-                        if let Some(tx) = &self.agent_tx {
-                            self.state = State::Running;
-                            let _ = tx.send("__auth_status__".into());
+                        if self.agent_tx.is_some() {
+                            self.begin_running();
+                            if let Some(tx) = &self.agent_tx {
+                                let _ = tx.send("__auth_status__".into());
+                            }
                         }
                     }
                 }
@@ -1778,9 +1856,11 @@ impl Tui {
                         tool_name: String::new(),
                         duration: String::new(),
                     });
-                } else if let Some(tx) = &self.agent_tx {
-                    self.state = State::Running;
-                    let _ = tx.send("__compact__".into());
+                } else if self.agent_tx.is_some() {
+                    self.begin_running();
+                    if let Some(tx) = &self.agent_tx {
+                        let _ = tx.send("__compact__".into());
+                    }
                 }
             }
             "/save" => {
@@ -2122,7 +2202,7 @@ impl Tui {
             });
             return;
         }
-        let Some(tx) = &self.agent_tx else {
+        if self.agent_tx.is_none() {
             self.output_lines.push(OutputLine {
                 type_: "error".into(),
                 content: "Agent channel not ready; cannot start OAuth.".into(),
@@ -2130,19 +2210,21 @@ impl Tui {
                 duration: String::new(),
             });
             return;
-        };
+        }
         if let Some(flag) = &self.cancel_flag {
             flag.store(false, Ordering::Relaxed);
         }
         self.pending_model_after_auth = then_model_picker;
-        self.state = State::Running;
+        self.begin_running();
         self.output_lines.push(OutputLine {
             type_: "system".into(),
             content: "Starting xAI browser OAuth (device code)… A browser window should open. Approve the code shown next, or open the URL manually.".into(),
             tool_name: String::new(),
             duration: String::new(),
         });
-        let _ = tx.send(format!("__auth_login__:{provider}"));
+        if let Some(tx) = &self.agent_tx {
+            let _ = tx.send(format!("__auth_login__:{provider}"));
+        }
     }
 
     /// Finish provider/model selection and synchronize the Agent.
@@ -2390,11 +2472,7 @@ impl Tui {
         let mut msg = String::from("Saved sessions:\n");
         for s in &sessions {
             let time_str = format_timestamp(s.updated_at);
-            let summary = if s.summary.len() > 60 {
-                format!("{}…", &s.summary[..60])
-            } else {
-                s.summary.clone()
-            };
+            let summary = truncate_summary(&s.summary, 60);
             msg.push_str(&format!(
                 "  {}  {}  {} msgs  {}\n",
                 &s.id[..8],
@@ -2569,7 +2647,7 @@ impl Tui {
 
         let mut lines: Vec<Line> = Vec::new();
 
-        // Banner
+        // Welcome box (Claude Code style: rounded frame in accent orange/red).
         let w = area.width.saturating_sub(2) as usize;
         let pw = w.min(58);
         let pad = |s: &str| {
@@ -2594,42 +2672,44 @@ impl Tui {
             }
         };
         let sp = " ".repeat((area.width as usize).saturating_sub(pw + 4));
+        let box_style = orange;
 
         lines.push(Line::from(Span::styled(
             format!("╭{}╮", "─".repeat(pw)),
-            dim,
+            box_style,
         )));
         lines.push(Line::from(vec![
-            Span::styled("│", dim),
+            Span::styled("│", box_style),
             Span::styled(pad(&format!("  ⚡ Cairn Code v{}", self.version)), bright),
-            Span::styled(format!("│{sp}"), dim),
+            Span::styled(format!("│{sp}"), box_style),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("│", dim),
-            Span::styled(pad("  open terminal coding agent"), dim),
-            Span::styled(format!("│{sp}"), dim),
+            Span::styled("│", box_style),
+            Span::styled(pad("  open terminal coding agent  ·  /help"), dim),
+            Span::styled(format!("│{sp}"), box_style),
         ]));
         lines.push(Line::from(Span::styled(
             format!("├{}┤", "─".repeat(pw)),
-            dim,
+            box_style,
         )));
         lines.push(Line::from(vec![
-            Span::styled("│", dim),
+            Span::styled("│", box_style),
             Span::styled(
                 pad(&format!("  Model   {} / {}", self.provider, self.model)),
                 dim,
             ),
-            Span::styled(format!("│{sp}"), dim),
+            Span::styled(format!("│{sp}"), box_style),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("│", dim),
+            Span::styled("│", box_style),
             Span::styled(pad(&format!("  Path    {}", self.work_dir)), dim),
-            Span::styled(format!("│{sp}"), dim),
+            Span::styled(format!("│{sp}"), box_style),
         ]));
         lines.push(Line::from(Span::styled(
             format!("╰{}╯", "─".repeat(pw)),
-            dim,
+            box_style,
         )));
+        lines.push(Line::from(""));
 
         // Output
         for line in &self.output_lines {
@@ -2746,26 +2826,17 @@ impl Tui {
         }
         // Spinner while waiting / thinking without answer text. Skip when full
         // thinking body is already on screen (show_thinking on).
+        // OpenClaude-style: glyph + rotating verb + ellipsis.
         let show_spin = matches!(self.state, State::Running)
             && self.streaming_text.is_empty()
             && !(self.show_thinking && !self.stream_thinking.is_empty());
         if show_spin {
             let spin = SPINNER_CHARS[self.spinner_idx % SPINNER_CHARS.len()];
+            let verb = SPINNER_VERBS[self.spinner_verb_idx % SPINNER_VERBS.len()];
             lines.push(Line::from(vec![
                 Span::styled(spin, orange),
-                Span::styled(" Thinking…", dim),
+                Span::styled(format!(" {verb}…"), dim),
             ]));
-        }
-
-        // Usage
-        if self.total_usage.input_tokens > 0 {
-            lines.push(Line::from(vec![Span::styled(
-                format!(
-                    "\nTokens: {} in, {} out  •  {}",
-                    self.total_usage.input_tokens, self.total_usage.output_tokens, self.model
-                ),
-                dim,
-            )]));
         }
 
         // Composer / pickers live in a fixed bottom chrome region so typing never
@@ -2943,11 +3014,7 @@ impl Tui {
                 let s = &self.picker_sessions[i];
                 let is_sel = i == self.picker_session_sel;
                 let prefix = if is_sel { "▸ " } else { "  " };
-                let summary = if s.summary.len() > 50 {
-                    format!("{}…", &s.summary[..50])
-                } else {
-                    s.summary.clone()
-                };
+                let summary = truncate_summary(&s.summary, 50);
                 let time_str = format_timestamp(s.updated_at);
                 chrome.push(Line::from(vec![Span::styled(
                     format!(
@@ -3130,6 +3197,48 @@ impl Tui {
                 chrome.push(Line::from(spans));
                 cursor_pos = Some((display_width("❯ ") as u16 + display_width(before) as u16, 0));
             }
+
+            // Status row under the prompt (model · cwd · tokens · cost).
+            // Always keep this while the normal composer is visible, including
+            // slash ghost completion. Hiding it when `/` sets show_command_picker
+            // shrinks chrome and drops the prompt to the terminal bottom.
+            // Other pickers/dialogs take earlier branches and never reach here.
+            chrome.push(Line::from(""));
+            let mut status = Vec::new();
+            status.push(Span::styled(
+                format!("{}/{}", self.provider, self.model),
+                dim,
+            ));
+            // Shorten home-ish paths for the footer.
+            let path = self.work_dir.as_str();
+            let short_path = path
+                .rsplit(['/', '\\'])
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(path);
+            status.push(Span::styled(" · ", bold_dim));
+            status.push(Span::styled(short_path, dim));
+            if self.total_usage.input_tokens > 0 || self.total_usage.output_tokens > 0 {
+                let est = crate::cost::estimate_cost(&self.model, &self.total_usage);
+                let cost_str = crate::cost::format_cost(est);
+                status.push(Span::styled(" · ", bold_dim));
+                status.push(Span::styled(
+                    format!(
+                        "{}↓ {}↑",
+                        self.total_usage.input_tokens, self.total_usage.output_tokens
+                    ),
+                    dim,
+                ));
+                if est > 0.0 {
+                    status.push(Span::styled(" · ", bold_dim));
+                    status.push(Span::styled(cost_str, dim));
+                }
+            }
+            if matches!(self.state, State::Idle) && self.input_buf.is_empty() {
+                status.push(Span::styled(" · ", bold_dim));
+                status.push(Span::styled("? for shortcuts", bold_dim));
+            }
+            chrome.push(Line::from(status));
         }
 
         let width = area.width as usize;
@@ -3142,39 +3251,22 @@ impl Tui {
             .max(1);
         let chrome_h = chrome_wrapped.min(max_chrome) as u16;
         let chrome_scroll = chrome_wrapped.saturating_sub(chrome_h as usize);
-        let term_h = area.height as usize;
 
-        // Short chats: sit the composer directly under the transcript (top of the
-        // window), not glued to the bottom with a huge empty gap that looks like a
-        // second orphaned prompt.
-        // Long chats: pin chrome to the bottom and scroll the transcript above.
-        let fits = body_wrapped.saturating_add(chrome_h as usize) <= term_h;
-        let (body_area, chrome_area) = if fits {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(body_wrapped.max(1) as u16),
-                    Constraint::Length(chrome_h),
-                    Constraint::Min(0),
-                ])
-                .split(area);
-            (chunks[0], chunks[1])
-        } else {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(chrome_h)])
-                .split(area);
-            (chunks[0], chunks[1])
-        };
+        // Claude Code style: always pin the composer/status chrome to the bottom
+        // of the terminal. Transcript fills the space above and scrolls.
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(chrome_h)])
+            .split(area);
+        let body_area = chunks[0];
+        let chrome_area = chunks[1];
 
         // videre-style rowoff: free scroll when not following; pin to bottom when following.
         let body_h = body_area.height as usize;
         let max_off = body_wrapped.saturating_sub(body_h.max(1));
         self.last_body_h = body_h;
         self.last_body_wrapped = body_wrapped;
-        let body_scroll = if fits {
-            0
-        } else if self.transcript_follow {
+        let body_scroll = if self.transcript_follow {
             self.transcript_rowoff = max_off;
             max_off
         } else {
@@ -3200,23 +3292,32 @@ impl Tui {
         );
 
         // Scroll position hint when not pinned to bottom (videre shows %).
-        if !fits && !self.transcript_follow && max_off > 0 {
+        // Must fully reset cell style (incl. BOLD from the welcome box border):
+        // ratatui patches styles, so a dim-only overlay over accent BOLD keeps
+        // bold and looks heavier / glitched where the % chip touches the frame.
+        if !self.transcript_follow && max_off > 0 {
             let pct = (body_scroll * 100) / max_off;
             let hint = format!(" ↑ {pct}% · PgUp/PgDn · wheel · Ctrl+U/D ");
+            let hint_w = display_width(&hint) as u16;
             let hx = body_area
                 .x
-                .saturating_add(body_area.width.saturating_sub(hint.len() as u16 + 1));
+                .saturating_add(body_area.width.saturating_sub(hint_w.saturating_add(1)));
             let hy = body_area.y;
-            if body_area.width > 8 {
+            if body_area.width > 8 && hint_w > 0 {
+                // Style::reset clears bold/colors from underlying cells; patch
+                // muted fg so the chip matches the footer without inheriting
+                // the orange box border weight.
+                let hint_style = Style::reset().patch(dim);
                 f.render_widget(
-                    Paragraph::new(Span::styled(hint, dim)),
+                    Paragraph::new(Span::styled(hint, hint_style)),
                     ratatui::layout::Rect {
                         x: hx,
                         y: hy,
-                        width: body_area
-                            .width
-                            .saturating_sub(hx.saturating_sub(body_area.x))
-                            .min(40),
+                        width: hint_w.min(
+                            body_area
+                                .width
+                                .saturating_sub(hx.saturating_sub(body_area.x)),
+                        ),
                         height: 1,
                     },
                 );
@@ -3496,6 +3597,112 @@ fn completion_wants_trailing_space(completion: &str) -> bool {
     )
 }
 
+/// Strip terminal controls before writing untrusted text directly to a terminal.
+///
+/// This is intentionally used only at raw stdout boundaries. Ratatui should
+/// continue receiving the original text so its normal rendering is unchanged.
+pub fn sanitize_terminal_output(input: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum State {
+        Text,
+        Escape,
+        EscapeIntermediate,
+        Csi,
+        ControlString { osc: bool },
+        ControlStringEscape { osc: bool },
+    }
+
+    let mut output = String::with_capacity(input.len());
+    let mut state = State::Text;
+
+    for character in input.chars() {
+        state = match state {
+            State::Text => match character {
+                '\n' | '\t' => {
+                    output.push(character);
+                    State::Text
+                }
+                '\u{001b}' => State::Escape,
+                '\u{009b}' => State::Csi,
+                '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
+                    State::ControlString {
+                        osc: character == '\u{009d}',
+                    }
+                }
+                '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}' => State::Text,
+                _ => {
+                    output.push(character);
+                    State::Text
+                }
+            },
+            State::Escape => match character {
+                '[' => State::Csi,
+                ']' => State::ControlString { osc: true },
+                'P' | 'X' | '^' | '_' => State::ControlString { osc: false },
+                '\u{001b}' => State::Escape,
+                '\u{009b}' => State::Csi,
+                '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
+                    State::ControlString {
+                        osc: character == '\u{009d}',
+                    }
+                }
+                '\n' | '\t' => {
+                    output.push(character);
+                    State::Text
+                }
+                '\u{0020}'..='\u{002f}' => State::EscapeIntermediate,
+                '\u{0030}'..='\u{007e}' | '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}' => {
+                    State::Text
+                }
+                _ => {
+                    output.push(character);
+                    State::Text
+                }
+            },
+            State::EscapeIntermediate => match character {
+                '\u{0020}'..='\u{002f}' => State::EscapeIntermediate,
+                '\u{0030}'..='\u{007e}' => State::Text,
+                '\u{001b}' => State::Escape,
+                '\n' | '\t' => {
+                    output.push(character);
+                    State::Text
+                }
+                '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}' => State::Text,
+                _ => {
+                    output.push(character);
+                    State::Text
+                }
+            },
+            State::Csi => match character {
+                '\u{0040}'..='\u{007e}' => State::Text,
+                '\u{001b}' => State::Escape,
+                '\u{009b}' => State::Csi,
+                '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
+                    State::ControlString {
+                        osc: character == '\u{009d}',
+                    }
+                }
+                '\u{009c}' => State::Text,
+                _ => State::Csi,
+            },
+            State::ControlString { osc } => match character {
+                '\u{009c}' => State::Text,
+                '\u{0007}' if osc => State::Text,
+                '\u{001b}' => State::ControlStringEscape { osc },
+                _ => State::ControlString { osc },
+            },
+            State::ControlStringEscape { osc } => match character {
+                '\\' | '\u{009c}' => State::Text,
+                '\u{0007}' if osc => State::Text,
+                '\u{001b}' => State::ControlStringEscape { osc },
+                _ => State::ControlString { osc },
+            },
+        };
+    }
+
+    output
+}
+
 /// Leave the ratatui alt-screen and print plain text so the host terminal can
 /// drag-select (Windows Terminal does not reliably select inside a redrawing TUI).
 fn enter_plain_select_mode(terminal: &mut DefaultTerminal, text: &str) -> Result<(), String> {
@@ -3512,6 +3719,7 @@ fn enter_plain_select_mode(terminal: &mut DefaultTerminal, text: &str) -> Result
          Press Enter to return to Cairn.\n\
          ==================================\n"
     );
+    let text = sanitize_terminal_output(text);
     let _ = writeln!(out, "{text}");
     let _ = writeln!(out, "\n======== end — press Enter to return ========\n");
     let _ = out.flush();
@@ -3523,6 +3731,58 @@ fn enter_plain_select_mode(terminal: &mut DefaultTerminal, text: &str) -> Result
     *terminal = ratatui::init();
     terminal.clear().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod terminal_output_tests {
+    use super::sanitize_terminal_output;
+
+    #[test]
+    fn strips_osc_clipboard_title_and_hyperlink_payloads() {
+        let input = concat!(
+            "before",
+            "\u{001b}]52;c;YXR0YWNrZXItY29udHJvbGxlZA==\u{0007}",
+            "\u{001b}]0;forged title\u{001b}\\",
+            "\u{001b}]8;;https://evil.example/\u{001b}\\link text\u{001b}]8;;\u{001b}\\",
+            "after"
+        );
+
+        assert_eq!(sanitize_terminal_output(input), "beforelink textafter");
+        assert_eq!(
+            sanitize_terminal_output("safe\u{001b}]52;c;unterminated payload"),
+            "safe"
+        );
+    }
+
+    #[test]
+    fn strips_csi_other_escape_sequences_and_their_payloads() {
+        let input = concat!(
+            "plain ",
+            "\u{001b}[31mred\u{001b}[0m",
+            "\u{009b}2J",
+            " visible",
+            "\u{001b}P1;2|dcs payload\u{001b}\\",
+            " end"
+        );
+
+        assert_eq!(sanitize_terminal_output(input), "plain red visible end");
+    }
+
+    #[test]
+    fn strips_c0_c1_controls_and_eight_bit_control_strings() {
+        let input = "a\u{0000}b\u{0007}c\u{0008}d\r e\u{007f}f\u{0085}g\u{001b}";
+        assert_eq!(sanitize_terminal_output(input), "abcd efg");
+        assert_eq!(
+            sanitize_terminal_output("left\u{009d}52;c;secret\u{009c}right"),
+            "leftright"
+        );
+    }
+
+    #[test]
+    fn preserves_normal_unicode_newlines_and_tabs() {
+        let input = "Grüße from 東京 🏔️\n\tcafé\n";
+        assert_eq!(sanitize_terminal_output(input), input);
+    }
 }
 
 /// Best-effort clipboard write: Windows PowerShell first, then OSC 52.
@@ -4055,6 +4315,69 @@ mod exit_tests {
 }
 
 #[cfg(test)]
+mod scroll_history_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn bare_up_scrolls_when_transcript_overflows_instead_of_history() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.history = vec!["first".into(), "second".into()];
+        tui.hist_idx = tui.history.len();
+        // Simulate a painted frame where the body is taller than the viewport.
+        tui.last_body_wrapped = 100;
+        tui.last_body_h = 20;
+        tui.transcript_follow = true;
+        tui.transcript_rowoff = 80;
+
+        tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        assert!(
+            !tui.transcript_follow,
+            "Up should leave follow mode when content overflows"
+        );
+        assert!(
+            tui.transcript_rowoff < 80,
+            "Up should move rowoff toward older content"
+        );
+        assert!(
+            tui.input_buf.is_empty(),
+            "Up must not load prompt history while chat can scroll"
+        );
+    }
+
+    #[test]
+    fn bare_up_uses_history_when_transcript_fits() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.history = vec!["prior prompt".into()];
+        tui.hist_idx = tui.history.len();
+        tui.last_body_wrapped = 10;
+        tui.last_body_h = 40;
+        tui.transcript_follow = true;
+
+        tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        assert_eq!(tui.input_buf, "prior prompt");
+        assert_eq!(tui.hist_idx, 0);
+    }
+
+    #[test]
+    fn ctrl_p_always_walks_prompt_history() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.history = vec!["a".into(), "b".into()];
+        tui.hist_idx = tui.history.len();
+        tui.last_body_wrapped = 100;
+        tui.last_body_h = 20;
+        tui.transcript_follow = true;
+
+        tui.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+        assert_eq!(tui.input_buf, "b");
+        assert_eq!(tui.hist_idx, 1);
+    }
+}
+
+#[cfg(test)]
 mod unicode_input_tests {
     use super::*;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -4293,6 +4616,40 @@ fn char_width(c: char) -> usize {
 
 fn display_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
+}
+
+fn truncate_summary(summary: &str, max_chars: usize) -> String {
+    if summary.chars().count() > max_chars {
+        format!("{}…", summary.chars().take(max_chars).collect::<String>())
+    } else {
+        summary.to_string()
+    }
+}
+
+#[cfg(test)]
+mod summary_truncation_tests {
+    use super::*;
+
+    fn assert_unicode_boundaries(max_chars: usize) {
+        for boundary_char in ['🙂', '界', 'é'] {
+            let prefix = "a".repeat(max_chars - 1);
+            let summary = format!("{prefix}{boundary_char}tail");
+            assert_eq!(
+                truncate_summary(&summary, max_chars),
+                format!("{prefix}{boundary_char}…")
+            );
+        }
+    }
+
+    #[test]
+    fn list_summary_truncates_unicode_at_60_characters() {
+        assert_unicode_boundaries(60);
+    }
+
+    #[test]
+    fn picker_summary_truncates_unicode_at_50_characters() {
+        assert_unicode_boundaries(50);
+    }
 }
 
 fn terminal_height() -> Option<usize> {

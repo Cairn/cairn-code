@@ -262,18 +262,30 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let marker = marker.display().to_string().replace('\'', "''");
+        // PowerShell accepts forward slashes; also double-quote for LiteralPath.
+        let marker_ps = marker
+            .display()
+            .to_string()
+            .replace('\\', "/")
+            .replace('\'', "''");
         let command = format!(
-            "Start-Process powershell -ArgumentList @('-NoProfile','-Command','Start-Sleep -Milliseconds 1000; Set-Content -LiteralPath ''{marker}'' -Value survived'); Start-Sleep -Seconds 5"
+            "Start-Process powershell -ArgumentList @('-NoProfile','-Command','Start-Sleep -Milliseconds 1000; Set-Content -LiteralPath ''{marker_ps}'' -Value survived'); Start-Sleep -Seconds 5"
         );
-        let input = serde_json::json!({ "command": command, "timeout": 200 }).to_string();
+        // marker_ps uses forward slashes for PowerShell -LiteralPath; keep
+        // marker as PathBuf for the filesystem assertion below.
+        let input = serde_json::json!({
+            "command": command,
+            "timeout": 200
+        })
+        .to_string();
 
         let err = ShellTool.execute(&input).unwrap_err();
         assert!(err.contains("timed out"), "unexpected error: {err}");
         std::thread::sleep(Duration::from_millis(1200));
         assert!(
-            !std::path::Path::new(&marker).exists(),
-            "descendant survived timeout and wrote {marker}"
+            !marker.exists(),
+            "descendant survived timeout and wrote {}",
+            marker.display()
         );
     }
 

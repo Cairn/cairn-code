@@ -8,6 +8,26 @@ pub struct ToolUse {
     pub input: String,
 }
 
+impl ToolUse {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.id.trim().is_empty() {
+            return Err("tool call is missing an id".into());
+        }
+        if self.name.trim().is_empty() {
+            return Err("tool call is missing a name".into());
+        }
+        let input = crate::json::parse(&self.input)
+            .map_err(|e| format!("tool call '{}' has invalid JSON arguments: {e}", self.name))?;
+        if input.as_object().is_none() {
+            return Err(format!(
+                "tool call '{}' arguments must be a JSON object",
+                self.name
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     pub tool_use_id: String,
