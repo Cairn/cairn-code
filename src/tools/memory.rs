@@ -7,9 +7,21 @@ use cap_std::{
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 pub struct MemoryTool;
 static MEMORY_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Match the aggregate byte and result caps used by grep/glob. A normal memory
+/// store is much smaller, while one invocation accepts at most 1 MiB of memory
+/// file content and returns at most 1,000 entries.
+const MAX_MEMORY_READ_BYTES: usize = 1_048_576;
+const MAX_MEMORY_RESULTS: usize = 1_000;
+/// Match the grep/glob traversal cap and add a wall-clock backstop for slow
+/// storage. Both limits apply to one permission-free memory invocation.
+const MAX_MEMORY_VISITED_ENTRIES: usize = 100_000;
+const MEMORY_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const MEMORY_TRUNCATED_MESSAGE: &str = "Memory scan truncated at safety limit.";
 
 impl Tool for MemoryTool {
     fn name(&self) -> &str {
@@ -71,46 +83,19 @@ impl Tool for MemoryTool {
                     .get("key")
                     .and_then(|v| v.as_str())
                     .ok_or("key required for recall")?;
+                let mut budget = MemoryBudget::new();
                 let Some(root) = open_existing_memory_dir()? else {
                     return Err(format!("Memory '{}' not found", key));
                 };
-                let content = read_memory(&root, key)?;
-                let (_, body) = parse_frontmatter(&content);
-                Ok(format!("---\n{}\n{}", key, body.trim()))
+                recall_memory(&root, key, &mut budget)
             }
             "list" => {
                 let query = obj.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                let mut budget = MemoryBudget::new();
                 let Some(root) = open_existing_memory_dir()? else {
                     return Ok("No memories found.".to_string());
                 };
-                let mut entries: Vec<String> = Vec::new();
-                for entry in root.entries().map_err(|e| format!("read dir: {e}"))? {
-                    let entry = entry.map_err(|e| format!("entry: {e}"))?;
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if let Some(key) = name.strip_suffix(".md") {
-                        if memory_file_name(key).is_err() {
-                            continue;
-                        }
-                        if query.is_empty() {
-                            if validate_memory_file(&root, &name, key).is_err() {
-                                continue;
-                            }
-                        } else {
-                            if let Ok(content) = read_memory(&root, key) {
-                                if !content.contains(query) {
-                                    continue;
-                                }
-                            } else {
-                                continue;
-                            }
-                        }
-                        entries.push(key.to_string());
-                    }
-                }
-                if entries.is_empty() {
-                    return Ok("No memories found.".to_string());
-                }
-                Ok(format!("Memories:\n{}", entries.join("\n")))
+                list_memories(&root, query, &mut budget)
             }
             "delete" => {
                 let key = obj
@@ -136,34 +121,241 @@ impl Tool for MemoryTool {
                 if query.is_empty() {
                     return Err("query required for search".into());
                 }
+                let mut budget = MemoryBudget::new();
                 let Some(root) = open_existing_memory_dir()? else {
                     return Ok("No memories match query.".to_string());
                 };
-                let mut results: Vec<(String, String)> = Vec::new();
-                for entry in root.entries().map_err(|e| format!("read dir: {e}"))? {
-                    let entry = entry.map_err(|e| format!("entry: {e}"))?;
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if let Some(key) = name.strip_suffix(".md") {
-                        if memory_file_name(key).is_err() {
-                            continue;
-                        }
-                        if let Ok(content) = read_memory(&root, key) {
-                            let (_, body) = parse_frontmatter(&content);
-                            if body.contains(query) || key.contains(query) {
-                                let preview: String = body.chars().take(200).collect();
-                                results.push((key.to_string(), preview));
-                            }
-                        }
-                    }
-                }
-                if results.is_empty() {
-                    return Ok("No memories match query.".to_string());
-                }
-                let out: Vec<String> = results.iter().map(|(k, b)| format!("{k}: {b}")).collect();
-                Ok(format!("Search results:\n{}", out.join("\n---\n")))
+                search_memories(&root, query, &mut budget)
             }
             _ => Err(format!("Unknown action: {action}")),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemoryLimit {
+    Bytes,
+    Results,
+    Work,
+    Deadline,
+}
+
+struct MemoryBudget {
+    max_bytes: usize,
+    max_results: usize,
+    max_visited: usize,
+    deadline: Instant,
+    bytes_read: usize,
+    results: usize,
+    visited: usize,
+    limit: Option<MemoryLimit>,
+}
+
+impl MemoryBudget {
+    fn new() -> Self {
+        Self::with_limits(
+            MAX_MEMORY_READ_BYTES,
+            MAX_MEMORY_RESULTS,
+            MAX_MEMORY_VISITED_ENTRIES,
+            Instant::now()
+                .checked_add(MEMORY_READ_TIMEOUT)
+                .unwrap_or_else(Instant::now),
+        )
+    }
+
+    fn with_limits(
+        max_bytes: usize,
+        max_results: usize,
+        max_visited: usize,
+        deadline: Instant,
+    ) -> Self {
+        Self {
+            max_bytes,
+            max_results,
+            max_visited,
+            deadline,
+            bytes_read: 0,
+            results: 0,
+            visited: 0,
+            limit: None,
+        }
+    }
+
+    fn check_deadline(&mut self) -> bool {
+        if Instant::now() >= self.deadline {
+            self.stop(MemoryLimit::Deadline);
+            false
+        } else {
+            true
+        }
+    }
+
+    fn visit(&mut self) -> bool {
+        if !self.check_deadline() {
+            return false;
+        }
+        if self.visited >= self.max_visited {
+            self.stop(MemoryLimit::Work);
+            return false;
+        }
+        self.visited += 1;
+        true
+    }
+
+    fn record_result(&mut self) -> bool {
+        if !self.check_deadline() {
+            return false;
+        }
+        if self.results >= self.max_results {
+            self.stop(MemoryLimit::Results);
+            return false;
+        }
+        self.results += 1;
+        true
+    }
+
+    fn remaining_bytes(&self) -> usize {
+        self.max_bytes.saturating_sub(self.bytes_read)
+    }
+
+    fn record_bytes(&mut self, bytes: usize) -> bool {
+        if bytes > self.remaining_bytes() {
+            self.stop(MemoryLimit::Bytes);
+            return false;
+        }
+        self.bytes_read += bytes;
+        true
+    }
+
+    fn stop(&mut self, limit: MemoryLimit) {
+        if self.limit.is_none() {
+            self.limit = Some(limit);
+        }
+    }
+
+    fn truncated(&self) -> bool {
+        self.limit.is_some()
+    }
+
+    fn recall_error(&self, key: &str) -> String {
+        match self.limit {
+            Some(MemoryLimit::Bytes) => format!(
+                "Memory '{key}' exceeds the {} byte read limit",
+                self.max_bytes
+            ),
+            Some(MemoryLimit::Deadline) => format!(
+                "Memory '{key}' exceeded the {} ms read deadline",
+                MEMORY_READ_TIMEOUT.as_millis()
+            ),
+            Some(MemoryLimit::Results | MemoryLimit::Work) | None => {
+                format!("Memory '{key}' exceeded a safety limit")
+            }
+        }
+    }
+}
+
+fn recall_memory(root: &Dir, key: &str, budget: &mut MemoryBudget) -> Result<String, String> {
+    let Some(content) = read_memory_bounded(root, key, budget)? else {
+        return Err(budget.recall_error(key));
+    };
+    if !budget.record_result() {
+        return Err(budget.recall_error(key));
+    }
+    let (_, body) = parse_frontmatter(&content);
+    Ok(format!("---\n{}\n{}", key, body.trim()))
+}
+
+fn list_memories(root: &Dir, query: &str, budget: &mut MemoryBudget) -> Result<String, String> {
+    let mut entries: Vec<String> = Vec::new();
+    for entry in root.entries().map_err(|e| format!("read dir: {e}"))? {
+        if !budget.visit() {
+            break;
+        }
+        let entry = entry.map_err(|e| format!("entry: {e}"))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(key) = name.strip_suffix(".md") else {
+            continue;
+        };
+        if memory_file_name(key).is_err() {
+            continue;
+        }
+
+        if query.is_empty() {
+            if validate_memory_file(root, &name, key).is_err() || !budget.check_deadline() {
+                continue;
+            }
+        } else {
+            let content = match read_memory_bounded(root, key, budget) {
+                Ok(Some(content)) => content,
+                Ok(None) => break,
+                Err(_) => continue,
+            };
+            if !content.contains(query) {
+                continue;
+            }
+        }
+        if !budget.record_result() {
+            break;
+        }
+        entries.push(key.to_string());
+    }
+
+    let mut output = if entries.is_empty() {
+        "No memories found.".to_string()
+    } else {
+        format!("Memories:\n{}", entries.join("\n"))
+    };
+    append_truncation(&mut output, budget);
+    Ok(output)
+}
+
+fn search_memories(root: &Dir, query: &str, budget: &mut MemoryBudget) -> Result<String, String> {
+    let mut results: Vec<(String, String)> = Vec::new();
+    for entry in root.entries().map_err(|e| format!("read dir: {e}"))? {
+        if !budget.visit() {
+            break;
+        }
+        let entry = entry.map_err(|e| format!("entry: {e}"))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(key) = name.strip_suffix(".md") else {
+            continue;
+        };
+        if memory_file_name(key).is_err() {
+            continue;
+        }
+
+        let content = match read_memory_bounded(root, key, budget) {
+            Ok(Some(content)) => content,
+            Ok(None) => break,
+            Err(_) => continue,
+        };
+        let (_, body) = parse_frontmatter(&content);
+        if body.contains(query) || key.contains(query) {
+            if !budget.record_result() {
+                break;
+            }
+            let preview: String = body.chars().take(200).collect();
+            results.push((key.to_string(), preview));
+        }
+    }
+
+    let mut output = if results.is_empty() {
+        "No memories match query.".to_string()
+    } else {
+        let out: Vec<String> = results
+            .iter()
+            .map(|(key, body)| format!("{key}: {body}"))
+            .collect();
+        format!("Search results:\n{}", out.join("\n---\n"))
+    };
+    append_truncation(&mut output, budget);
+    Ok(output)
+}
+
+fn append_truncation(output: &mut String, budget: &MemoryBudget) {
+    if budget.truncated() {
+        output.push('\n');
+        output.push_str(MEMORY_TRUNCATED_MESSAGE);
     }
 }
 
@@ -314,15 +506,49 @@ fn read_memory_file(root: &Dir, name: &str, key: &str) -> std::io::Result<String
     Ok(content)
 }
 
+fn read_memory_file_bounded(
+    root: &Dir,
+    name: &str,
+    key: &str,
+    budget: &mut MemoryBudget,
+) -> std::io::Result<Option<String>> {
+    if !budget.check_deadline() {
+        return Ok(None);
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    let mut file = open_memory_file(root, name, key, &options)?;
+    let remaining = budget.remaining_bytes();
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(remaining.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if !budget.record_bytes(bytes.len()) || !budget.check_deadline() {
+        return Ok(None);
+    }
+
+    String::from_utf8(bytes).map(Some).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("stream did not contain valid UTF-8: {error}"),
+        )
+    })
+}
+
 fn validate_memory_file(root: &Dir, name: &str, key: &str) -> std::io::Result<()> {
     let mut options = OpenOptions::new();
     options.read(true);
     open_memory_file(root, name, key, &options).map(|_| ())
 }
 
-fn read_memory(root: &Dir, key: &str) -> Result<String, String> {
+fn read_memory_bounded(
+    root: &Dir,
+    key: &str,
+    budget: &mut MemoryBudget,
+) -> Result<Option<String>, String> {
     let name = memory_file_name(key)?;
-    read_memory_file(root, &name, key).map_err(|e| {
+    read_memory_file_bounded(root, &name, key, budget).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!("Memory '{}' not found", key)
         } else {
@@ -383,6 +609,126 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("cairn-memory-{label}-{nanos}"))
+    }
+
+    fn test_budget(max_bytes: usize, max_results: usize, max_visited: usize) -> MemoryBudget {
+        MemoryBudget::with_limits(
+            max_bytes,
+            max_results,
+            max_visited,
+            Instant::now() + Duration::from_secs(30),
+        )
+    }
+
+    fn write_test_memory(base: &Path, key: &str, content: &str) {
+        fs::write(
+            base.join(format!(".config/cairn-code/memory/{key}.md")),
+            content,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn recall_enforces_the_byte_boundary() {
+        let base = temp_path("recall-byte-budget");
+        fs::create_dir_all(&base).unwrap();
+        let root = open_memory_dir_at(&base, true).unwrap();
+        write_test_memory(&base, "bounded", "123456");
+
+        let mut exact = test_budget(6, 1, 1);
+        assert_eq!(
+            recall_memory(&root, "bounded", &mut exact).unwrap(),
+            "---\nbounded\n123456"
+        );
+        assert!(!exact.truncated());
+
+        let mut too_small = test_budget(5, 1, 1);
+        let error = recall_memory(&root, "bounded", &mut too_small).unwrap_err();
+        assert!(error.contains("5 byte read limit"), "{error}");
+        assert_eq!(too_small.limit, Some(MemoryLimit::Bytes));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn search_enforces_the_cumulative_byte_boundary() {
+        let base = temp_path("search-byte-budget");
+        fs::create_dir_all(&base).unwrap();
+        let root = open_memory_dir_at(&base, true).unwrap();
+        write_test_memory(&base, "first", "needle");
+        write_test_memory(&base, "second", "needle");
+
+        let mut exact = test_budget(12, 10, 10);
+        let output = search_memories(&root, "needle", &mut exact).unwrap();
+        assert_eq!(output.matches(": needle").count(), 2, "{output}");
+        assert!(!output.contains(MEMORY_TRUNCATED_MESSAGE), "{output}");
+
+        let mut too_small = test_budget(11, 10, 10);
+        let output = search_memories(&root, "needle", &mut too_small).unwrap();
+        assert_eq!(output.matches(": needle").count(), 1, "{output}");
+        assert!(output.contains(MEMORY_TRUNCATED_MESSAGE), "{output}");
+        assert_eq!(too_small.limit, Some(MemoryLimit::Bytes));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn list_enforces_the_result_count_boundary() {
+        let base = temp_path("list-result-budget");
+        fs::create_dir_all(&base).unwrap();
+        let root = open_memory_dir_at(&base, true).unwrap();
+        write_test_memory(&base, "first", "one");
+        write_test_memory(&base, "second", "two");
+
+        let mut exact = test_budget(100, 2, 10);
+        let output = list_memories(&root, "", &mut exact).unwrap();
+        assert!(output.contains("first"), "{output}");
+        assert!(output.contains("second"), "{output}");
+        assert!(!output.contains(MEMORY_TRUNCATED_MESSAGE), "{output}");
+
+        let mut capped = test_budget(100, 1, 10);
+        let output = list_memories(&root, "", &mut capped).unwrap();
+        assert_eq!(capped.results, 1);
+        assert!(output.contains(MEMORY_TRUNCATED_MESSAGE), "{output}");
+        assert_eq!(capped.limit, Some(MemoryLimit::Results));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn list_enforces_the_visited_entry_boundary() {
+        let base = temp_path("list-work-budget");
+        fs::create_dir_all(&base).unwrap();
+        let root = open_memory_dir_at(&base, true).unwrap();
+        write_test_memory(&base, "first", "one");
+        write_test_memory(&base, "second", "two");
+
+        let mut exact = test_budget(100, 10, 2);
+        let output = list_memories(&root, "", &mut exact).unwrap();
+        assert!(!output.contains(MEMORY_TRUNCATED_MESSAGE), "{output}");
+
+        let mut capped = test_budget(100, 10, 1);
+        let output = list_memories(&root, "", &mut capped).unwrap();
+        assert_eq!(capped.visited, 1);
+        assert!(output.contains(MEMORY_TRUNCATED_MESSAGE), "{output}");
+        assert_eq!(capped.limit, Some(MemoryLimit::Work));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn recall_enforces_the_deadline_boundary() {
+        let base = temp_path("recall-deadline-budget");
+        fs::create_dir_all(&base).unwrap();
+        let root = open_memory_dir_at(&base, true).unwrap();
+        write_test_memory(&base, "bounded", "content");
+        let mut budget = MemoryBudget::with_limits(100, 1, 1, Instant::now());
+
+        let error = recall_memory(&root, "bounded", &mut budget).unwrap_err();
+        assert!(error.contains("read deadline"), "{error}");
+        assert_eq!(budget.limit, Some(MemoryLimit::Deadline));
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -471,8 +817,11 @@ mod tests {
         fs::write(&outside, "secret").unwrap();
         symlink(&outside, base.join(".config/cairn-code/memory/linked.md")).unwrap();
 
-        let error = read_memory(&root, "linked").unwrap_err();
-        assert!(error.contains("symlink"), "unexpected error: {error}");
+        let error = read_memory_file(&root, "linked.md", "linked").unwrap_err();
+        assert!(
+            error.to_string().contains("symlink"),
+            "unexpected error: {error}"
+        );
 
         let _ = fs::remove_dir_all(base);
     }
