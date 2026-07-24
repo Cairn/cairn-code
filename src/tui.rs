@@ -2765,7 +2765,7 @@ impl Tui {
         )));
         lines.push(Line::from(vec![
             Span::styled("│", box_style),
-            Span::styled(pad(&format!("  ⚡ Cairn Code v{}", self.version)), bright),
+            Span::styled(pad(&format!("  🪨 Cairn Code v{}", self.version)), bright),
             Span::styled("│", box_style),
         ]));
         lines.push(Line::from(vec![
