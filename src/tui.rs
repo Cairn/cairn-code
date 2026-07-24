@@ -3247,64 +3247,69 @@ impl Tui {
                 0,
             ));
         } else {
-            // Claude Code / OpenClaude: prompt lives in a rounded box above the
-            // status byline (model · cwd · tokens · hints).
-            let box_w = (area.width as usize).saturating_sub(0).max(8);
-            let inner_w = box_w.saturating_sub(2);
+            // Claude Code / OpenClaude: full-width rounded composer box above the
+            // status byline. Inner text is exactly (term_w - 2) display columns so
+            // │ … │ never wraps; caret x = 1 (left border) + width(mark + before).
+            let term_w = (area.width as usize).max(4);
+            let inner_w = term_w.saturating_sub(2).max(1);
             let box_style = orange_fg;
             let cursor = self.cursor.min(self.input_buf.len());
             let (before, after) = self.input_buf.split_at(cursor);
+            let mark = "❯ ";
 
-            // Build the prompt content spans (inside the box).
-            let mut prompt_spans: Vec<Span> = vec![Span::styled("❯ ", orange_fg)];
-            let mut cursor_x_in_prompt = display_width("❯ ") as u16;
-            if self.input_buf.is_empty()
+            let mut body = String::from(mark);
+            let show_idle_hint = self.input_buf.is_empty()
                 && matches!(self.state, State::Idle)
+                && self.idle_suggestion.is_some()
                 && !self.show_permission_prompt
                 && !self.show_recovery_prompt
-                && !self.awaiting_api_key
-            {
-                if let Some(hint) = &self.idle_suggestion {
-                    prompt_spans.push(Span::styled(hint.as_str(), bold_dim));
-                }
+                && !self.awaiting_api_key;
+            if show_idle_hint {
+                body.push_str(self.idle_suggestion.as_deref().unwrap_or(""));
             } else {
-                prompt_spans.push(Span::raw(before));
-                prompt_spans.push(Span::raw(after));
+                body.push_str(before);
+                body.push_str(after);
                 if cursor >= self.input_buf.len() {
                     if let Some(cmd) = self.selected_slash_completion() {
                         if let Some(suffix) = slash_ghost_suffix(&self.input_buf, cmd) {
-                            prompt_spans.push(Span::styled(suffix, bold_dim));
+                            body.push_str(&suffix);
                         }
                     }
                 }
-                cursor_x_in_prompt = display_width("❯ ") as u16 + display_width(before) as u16;
             }
+            // Exact inner width: prevents the right border from wrapping to the next line.
+            let body = pad_to_display_width(&body, inner_w);
+            debug_assert_eq!(display_width(&body), inner_w);
+
+            // Caret sits on the cell where the next character will be inserted.
+            let cursor_x = (1usize + display_width(mark) + display_width(before))
+                .min(term_w.saturating_sub(1)) as u16;
 
             chrome.push(Line::from(Span::styled(
                 format!("╭{}╮", "─".repeat(inner_w)),
                 box_style,
             )));
-            // │ + content (width = inner_w) + │  (Claude-style padded prompt row)
-            let mut content_spans: Vec<Span> = vec![Span::raw(" ")];
-            content_spans.extend(prompt_spans);
-            let used = spans_display_width(&content_spans);
-            if used < inner_w {
-                content_spans.push(Span::raw(" ".repeat(inner_w - used)));
-            }
-            let mut row = vec![Span::styled("│", box_style)];
-            row.extend(content_spans);
-            row.push(Span::styled("│", box_style));
             let prompt_line_idx = chrome.len();
-            chrome.push(Line::from(row));
+            // Split padded body into mark + remainder so the ❯ stays accent-colored
+            // without changing display width.
+            let mark_w = display_width(mark);
+            let (mark_part, rest_part) = split_at_display_width(&body, mark_w);
+            let rest_style = if show_idle_hint {
+                bold_dim
+            } else {
+                Style::default()
+            };
+            chrome.push(Line::from(vec![
+                Span::styled("│", box_style),
+                Span::styled(mark_part, orange_fg),
+                Span::styled(rest_part, rest_style),
+                Span::styled("│", box_style),
+            ]));
             chrome.push(Line::from(Span::styled(
                 format!("╰{}╯", "─".repeat(inner_w)),
                 box_style,
             )));
-            // Cursor: after left border + space + prompt offset.
-            cursor_pos = Some((
-                1 + 1 + cursor_x_in_prompt.min(inner_w.saturating_sub(3) as u16),
-                prompt_line_idx,
-            ));
+            cursor_pos = Some((cursor_x, prompt_line_idx));
 
             // Status byline under the box (OpenClaude PromptInput footer).
             chrome.push(Line::from(""));
@@ -4861,17 +4866,24 @@ fn pad_to_display_width(s: &str, width: usize) -> String {
     out
 }
 
+/// Split `s` after `at` display columns. Second half may be empty.
+fn split_at_display_width(s: &str, at: usize) -> (String, String) {
+    let mut w = 0;
+    for (i, c) in s.char_indices() {
+        if w >= at {
+            return (s[..i].to_string(), s[i..].to_string());
+        }
+        w += char_width(c);
+    }
+    (s.to_string(), String::new())
+}
+
 fn truncate_summary(summary: &str, max_chars: usize) -> String {
     if summary.chars().count() > max_chars {
         format!("{}…", summary.chars().take(max_chars).collect::<String>())
     } else {
         summary.to_string()
     }
-}
-
-/// Display width of consecutive spans (no wrap).
-fn spans_display_width(spans: &[Span<'_>]) -> usize {
-    spans.iter().map(|s| display_width(&s.content)).sum()
 }
 
 /// Compact elapsed time for spinner / footer (Claude Code style: `3s`, `1m 12s`).
