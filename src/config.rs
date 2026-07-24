@@ -47,6 +47,33 @@ pub enum HarnessPromptMode {
     Stdin,
 }
 
+/// Whether a subagent run gets its own git worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubagentIsolation {
+    /// Child runs in the parent workspace (or explicit `cwd`).
+    None,
+    /// Create a git worktree + branch under `.cairn/worktrees/` (default).
+    #[default]
+    Worktree,
+}
+
+impl SubagentIsolation {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "false" | "0" => Some(Self::None),
+            "worktree" | "wt" | "on" | "true" | "1" => Some(Self::Worktree),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Worktree => "worktree",
+        }
+    }
+}
+
 /// One external harness definition (builtin template or config override).
 #[derive(Debug, Clone)]
 pub struct HarnessConfig {
@@ -62,6 +89,8 @@ pub struct HarnessConfig {
 pub struct SubagentConfig {
     pub enabled: bool,
     pub default_timeout_ms: u64,
+    /// Default isolation when the tool/slash omits `isolation` (default: worktree).
+    pub default_isolation: SubagentIsolation,
     /// Named harnesses from config (override builtins or add custom names).
     pub harnesses: HashMap<String, HarnessConfig>,
 }
@@ -71,6 +100,7 @@ impl Default for SubagentConfig {
         Self {
             enabled: true,
             default_timeout_ms: 600_000,
+            default_isolation: SubagentIsolation::Worktree,
             harnesses: HashMap::new(),
         }
     }
@@ -99,6 +129,11 @@ impl SubagentConfig {
         if let Some(v) = obj.get("default_timeout_ms").and_then(|v| v.as_u64()) {
             if v > 0 {
                 cfg.default_timeout_ms = v;
+            }
+        }
+        if let Some(v) = obj.get("default_isolation").and_then(|v| v.as_str()) {
+            if let Some(iso) = SubagentIsolation::parse(v) {
+                cfg.default_isolation = iso;
             }
         }
         if let Some(map) = obj.get("harnesses").and_then(|v| v.as_object()) {
@@ -913,6 +948,10 @@ mod tests {
         );
         assert!(cfg.subagents.enabled, "subagents on by default");
         assert_eq!(cfg.subagents.default_timeout_ms, 600_000);
+        assert_eq!(
+            cfg.subagents.default_isolation,
+            SubagentIsolation::Worktree
+        );
     }
 
     #[test]
@@ -922,6 +961,7 @@ mod tests {
             "subagents": {
                 "enabled": false,
                 "default_timeout_ms": 120000,
+                "default_isolation": "none",
                 "harnesses": {
                     "reviewer": {
                         "command": "claude",
@@ -935,6 +975,7 @@ mod tests {
         .unwrap();
         assert!(!cfg.subagents.enabled);
         assert_eq!(cfg.subagents.default_timeout_ms, 120_000);
+        assert_eq!(cfg.subagents.default_isolation, SubagentIsolation::None);
         assert!(cfg.subagents.harnesses.contains_key("reviewer"));
     }
 

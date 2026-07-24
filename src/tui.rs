@@ -2528,7 +2528,7 @@ impl Tui {
         true
     }
 
-    /// `/subagent` [list|help|<harness> <prompt…>] — external harness runner.
+    /// `/subagent` [list|help|[worktree|none] <harness> <prompt…>]
     fn handle_subagent_command(&mut self, args: &[&str]) {
         let cfg = match crate::config::Config::load() {
             Ok(cfg) => cfg,
@@ -2555,7 +2555,7 @@ impl Tui {
                 Some("help" | "?")
             ) {
                 body.push_str(
-                    "\n\nExamples:\n  /subagent list\n  /subagent claude summarize this repo in one paragraph\n  /subagent agy review src/main.rs for error handling",
+                    "\n\nExamples:\n  /subagent list\n  /subagent claude summarize this repo\n  /subagent none agy quick question with no worktree\n  /subagent worktree claude implement the fix on an isolated branch",
                 );
             }
             self.output_lines.push(OutputLine {
@@ -2577,14 +2577,28 @@ impl Tui {
             return;
         }
 
-        let harness_name = args[0];
-        let prompt = args[1..].join(" ");
-        if prompt.trim().is_empty() {
+        let mut rest = args;
+        let isolation = if let Some(iso) =
+            crate::config::SubagentIsolation::parse(rest.first().copied().unwrap_or(""))
+        {
+            // Only treat as isolation if a harness name follows.
+            if rest.len() >= 2 {
+                rest = &rest[1..];
+                iso
+            } else {
+                sub.default_isolation
+            }
+        } else {
+            sub.default_isolation
+        };
+
+        let harness_name = rest.first().copied().unwrap_or("");
+        let prompt = rest.get(1..).unwrap_or(&[]).join(" ");
+        if harness_name.is_empty() || prompt.trim().is_empty() {
             self.output_lines.push(OutputLine {
                 type_: "system".into(),
-                content: format!(
-                    "Usage: /subagent {harness_name} <prompt…>\nOr: /subagent list"
-                ),
+                content: "Usage: /subagent [worktree|none] <harness> <prompt…>\nOr: /subagent list"
+                    .into(),
                 tool_name: String::new(),
                 duration: String::new(),
             });
@@ -2607,21 +2621,21 @@ impl Tui {
         self.output_lines.push(OutputLine {
             type_: "system".into(),
             content: format!(
-                "Running subagent harness={harness_name} (binary={})…",
+                "Running subagent harness={harness_name} isolation={} (binary={})…",
+                isolation.as_str(),
                 harness.command
             ),
             tool_name: String::new(),
             duration: String::new(),
         });
 
-        let timeout = harness
-            .timeout_ms
-            .unwrap_or(sub.default_timeout_ms);
-        let result = crate::tools::subagent::run_harness(
+        let timeout = harness.timeout_ms.unwrap_or(sub.default_timeout_ms);
+        let result = crate::tools::subagent::run_subagent(
             harness_name,
             &harness,
             &prompt,
             timeout,
+            isolation,
             None,
             &[],
             self.cancel_flag.as_deref(),

@@ -1,16 +1,18 @@
 //! External harness subagents: run Claude Code, AGY, Grok Build, Zero, or a
 //! user-configured CLI headlessly and return bounded stdout/stderr.
 //!
-//! This is not in-process subagents (worktrees, personas). The child is a
-//! separate binary already on PATH.
+//! The child is a separate binary on PATH (not an in-process Cairn session).
+//! By default each run gets a **git worktree** under `.cairn/worktrees/` so
+//! the harness edits an isolated branch instead of the parent working tree.
 
 use super::process_runner::{self, with_cleanup, RunError, RunOptions};
 use super::registry::Tool;
-use crate::config::{HarnessConfig, HarnessPromptMode, SubagentConfig};
+use crate::config::{HarnessConfig, HarnessPromptMode, SubagentConfig, SubagentIsolation};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::AtomicBool;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_OUTPUT_CHARS: usize = 12_000;
 const HEAD_CHARS: usize = 6_000;
@@ -38,9 +40,11 @@ impl Tool for SubagentTool {
 
     fn description(&self) -> &str {
         "Run a headless external coding harness (claude, agy, grok, zero, or a \
-         config-defined name) with a full task prompt. Use to delegate research \
-         or implementation to another agent CLI. Requires permission. Returns \
-         bounded stdout/stderr and the exit code. Does not stream the child TUI."
+         config-defined name) with a full task prompt. Default isolation is a \
+         git worktree under .cairn/worktrees/ so the child edits a separate \
+         branch. Set isolation to \"none\" to use the parent tree (or pass cwd). \
+         Requires permission. Returns bounded stdout/stderr, exit code, and \
+         worktree path when applicable. Does not stream the child TUI."
     }
 
     fn needs_permission(&self) -> bool {
@@ -48,7 +52,7 @@ impl Tool for SubagentTool {
     }
 
     fn input_schema(&self) -> String {
-        r#"{"type":"object","properties":{"harness":{"type":"string","description":"Harness name: claude, agy, grok, zero, or a custom name from config.subagents.harnesses"},"prompt":{"type":"string","description":"Full task for the child harness"},"timeout_ms":{"type":"integer","description":"Wall-clock timeout in milliseconds (default 600000)"},"cwd":{"type":"string","description":"Working directory (default: current workspace)"},"extra_args":{"type":"array","items":{"type":"string"},"description":"Extra argv appended after the harness template args"}},"required":["harness","prompt"]}"#.into()
+        r#"{"type":"object","properties":{"harness":{"type":"string","description":"Harness name: claude, agy, grok, zero, or a custom name from config.subagents.harnesses"},"prompt":{"type":"string","description":"Full task for the child harness"},"isolation":{"type":"string","description":"none | worktree (default from config, usually worktree)"},"timeout_ms":{"type":"integer","description":"Wall-clock timeout in milliseconds (default 600000)"},"cwd":{"type":"string","description":"Working directory; mutually exclusive with isolation=worktree"},"extra_args":{"type":"array","items":{"type":"string"},"description":"Extra argv appended after the harness template args"}},"required":["harness","prompt"]}"#.into()
     }
 
     fn execute(&self, input: &str) -> Result<String, String> {
@@ -62,15 +66,16 @@ impl Tool for SubagentTool {
                     .into(),
             );
         }
-        let req = parse_request(input)?;
+        let req = parse_request(input, self.config.default_isolation)?;
         let harness = resolve_harness(&self.config, &req.harness)?;
-        run_harness(
+        run_subagent(
             &req.harness,
             &harness,
             &req.prompt,
             req.timeout_ms
                 .or(harness.timeout_ms)
                 .unwrap_or(self.config.default_timeout_ms),
+            req.isolation,
             req.cwd.as_deref(),
             &req.extra_args,
             Some(cancel),
@@ -83,11 +88,15 @@ struct RunRequest {
     harness: String,
     prompt: String,
     timeout_ms: Option<u64>,
+    isolation: SubagentIsolation,
     cwd: Option<String>,
     extra_args: Vec<String>,
 }
 
-fn parse_request(input: &str) -> Result<RunRequest, String> {
+fn parse_request(
+    input: &str,
+    default_isolation: SubagentIsolation,
+) -> Result<RunRequest, String> {
     let val = crate::json::parse(input).map_err(|e| format!("invalid input: {e}"))?;
     let obj = val.as_object().ok_or("expected object")?;
     let harness = obj
@@ -108,11 +117,22 @@ fn parse_request(input: &str) -> Result<RunRequest, String> {
         return Err("prompt must be non-empty".into());
     }
     let timeout_ms = obj.get("timeout_ms").and_then(|v| v.as_u64());
+    let isolation = match obj.get("isolation").and_then(|v| v.as_str()) {
+        Some(s) => SubagentIsolation::parse(s)
+            .ok_or_else(|| format!("invalid isolation {s:?}; use none or worktree"))?,
+        None => default_isolation,
+    };
     let cwd = obj
         .get("cwd")
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    if isolation == SubagentIsolation::Worktree && cwd.is_some() {
+        return Err(
+            "isolation=worktree is mutually exclusive with cwd; omit cwd or set isolation=none"
+                .into(),
+        );
+    }
     let extra_args = obj
         .get("extra_args")
         .and_then(|v| v.as_array())
@@ -126,6 +146,7 @@ fn parse_request(input: &str) -> Result<RunRequest, String> {
         harness,
         prompt,
         timeout_ms,
+        isolation,
         cwd,
         extra_args,
     })
@@ -264,6 +285,182 @@ fn which_bin(command: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Created worktree for an isolated subagent run (left on disk for review).
+#[derive(Debug, Clone)]
+pub struct WorktreeInfo {
+    pub path: PathBuf,
+    pub branch: String,
+    pub repo_root: PathBuf,
+}
+
+static WORKTREE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn unique_worktree_id() -> String {
+    let n = WORKTREE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs:x}-{n:x}")
+}
+
+fn git_capture(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command.args(args).current_dir(cwd);
+    let options = RunOptions {
+        timeout: Some(Duration::from_secs(120)),
+        head_chars: HEAD_CHARS,
+        tail_chars: TAIL_CHARS,
+        stdin: None,
+    };
+    let result = process_runner::run(command, &options, None).map_err(|e| match e {
+        RunError::Spawn(s) => format!("git failed to start: {s}"),
+        RunError::TimedOut { .. } => "git timed out".into(),
+        RunError::Cancelled { .. } => "git cancelled".into(),
+        RunError::Wait { reason, .. } => format!("git wait failed: {reason}"),
+    })?;
+    if !result.success {
+        let mut msg = format!("git {} failed (exit {})", args.join(" "), result.code);
+        let body = result.stderr.trim();
+        if body.is_empty() {
+            let out = result.stdout.trim();
+            if !out.is_empty() {
+                msg.push_str(": ");
+                msg.push_str(out);
+            }
+        } else {
+            msg.push_str(": ");
+            msg.push_str(body);
+        }
+        return Err(msg);
+    }
+    Ok(result.stdout.trim().to_string())
+}
+
+/// Create an isolated git worktree under `<repo>/.cairn/worktrees/<id>`.
+pub fn create_worktree(base_cwd: &Path) -> Result<WorktreeInfo, String> {
+    let repo_root = git_capture(base_cwd, &["rev-parse", "--show-toplevel"])
+        .map_err(|e| {
+            format!(
+                "isolation=worktree requires a git repository ({e}). \
+                 Use isolation=none or run from a git checkout."
+            )
+        })?;
+    let repo_root = PathBuf::from(repo_root);
+    let id = unique_worktree_id();
+    let branch = format!("cairn/subagent-{id}");
+    let path = repo_root.join(".cairn").join("worktrees").join(&id);
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        // Keep worktree contents out of the main index if someone stages .cairn.
+        let gi = parent.join(".gitignore");
+        if !gi.exists() {
+            let _ = fs::write(&gi, "*\n!.gitignore\n");
+        }
+    }
+
+    // New branch at current HEAD so the child can commit without touching main.
+    git_capture(
+        &repo_root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            &path.to_string_lossy(),
+            "HEAD",
+        ],
+    )?;
+
+    Ok(WorktreeInfo {
+        path,
+        branch,
+        repo_root,
+    })
+}
+
+/// High-level entry: optional worktree isolation, then harness run.
+pub fn run_subagent(
+    name: &str,
+    harness: &HarnessConfig,
+    prompt: &str,
+    timeout_ms: u64,
+    isolation: SubagentIsolation,
+    cwd: Option<&str>,
+    extra_args: &[String],
+    cancel: Option<&AtomicBool>,
+) -> Result<String, String> {
+    if isolation == SubagentIsolation::Worktree && cwd.is_some() {
+        return Err(
+            "isolation=worktree is mutually exclusive with cwd; omit cwd or set isolation=none"
+                .into(),
+        );
+    }
+
+    let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let worktree = match isolation {
+        SubagentIsolation::None => None,
+        SubagentIsolation::Worktree => Some(create_worktree(&base)?),
+    };
+    let run_cwd = match (&worktree, cwd) {
+        (Some(wt), _) => Some(wt.path.to_string_lossy().into_owned()),
+        (None, Some(c)) => Some(c.to_string()),
+        (None, None) => None,
+    };
+
+    let mut body = match run_harness(
+        name,
+        harness,
+        prompt,
+        timeout_ms,
+        run_cwd.as_deref(),
+        extra_args,
+        cancel,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            if let Some(wt) = &worktree {
+                return Err(format!(
+                    "{e}\n\nisolation=worktree path={} branch={}\n\
+                     Worktree was kept for inspection. Remove with:\n\
+                       git -C {} worktree remove {}\n\
+                       git -C {} branch -D {}",
+                    wt.path.display(),
+                    wt.branch,
+                    wt.repo_root.display(),
+                    wt.path.display(),
+                    wt.repo_root.display(),
+                    wt.branch
+                ));
+            }
+            return Err(e);
+        }
+    };
+
+    if let Some(wt) = worktree {
+        let header = format!(
+            "isolation=worktree path={} branch={}\n\
+             Child edits are on this branch only. Review, then merge or discard:\n\
+               git -C {} worktree list\n\
+               git -C {} worktree remove {}\n\
+               git -C {} branch -D {}\n\n",
+            wt.path.display(),
+            wt.branch,
+            wt.repo_root.display(),
+            wt.repo_root.display(),
+            wt.path.display(),
+            wt.repo_root.display(),
+            wt.branch
+        );
+        body = format!("{header}{body}");
+    } else {
+        body = format!("isolation=none\n{body}");
+    }
+    Ok(body)
 }
 
 pub fn run_harness(
@@ -420,12 +617,15 @@ pub fn format_list(cfg: &SubagentConfig) -> String {
             name, h.command, on_path
         ));
     }
-    out.push_str(
-        "\nUsage: /subagent <harness> <prompt…>\n\
-         Tool:  subagent {\"harness\":\"claude\",\"prompt\":\"…\"}\n\
-         Config: subagents.harnesses.<name> = { command, args, prompt }\n\
-         Note: headless only; child permission UIs can hang until timeout.",
-    );
+    out.push_str(&format!(
+        "\nDefault isolation: {} (git worktree under .cairn/worktrees/)\n\
+         Usage: /subagent [worktree|none] <harness> <prompt…>\n\
+         Tool:  subagent {{\"harness\":\"claude\",\"prompt\":\"…\",\"isolation\":\"worktree\"}}\n\
+         Config: subagents.default_isolation, subagents.harnesses.<name>\n\
+         Note: headless only; child permission UIs can hang until timeout.\n\
+         Worktrees are kept after the run for review (not auto-removed).",
+        cfg.default_isolation.as_str()
+    ));
     out
 }
 
@@ -488,7 +688,11 @@ mod tests {
 
     #[test]
     fn parse_rejects_empty_prompt() {
-        let err = parse_request(r#"{"harness":"claude","prompt":"  "}"#).unwrap_err();
+        let err = parse_request(
+            r#"{"harness":"claude","prompt":"  "}"#,
+            SubagentIsolation::Worktree,
+        )
+        .unwrap_err();
         assert!(err.contains("prompt"));
     }
 
@@ -496,16 +700,69 @@ mod tests {
     fn parse_accepts_extra_args() {
         let r = parse_request(
             r#"{"harness":"claude","prompt":"hi","extra_args":["--model","x"],"timeout_ms":1000}"#,
+            SubagentIsolation::Worktree,
         )
         .unwrap();
         assert_eq!(r.extra_args, vec!["--model", "x"]);
         assert_eq!(r.timeout_ms, Some(1000));
+        assert_eq!(r.isolation, SubagentIsolation::Worktree);
     }
 
     #[test]
-    fn run_echo_harness_via_config() {
-        // Use a tiny custom harness that is always on PATH: `echo`.
+    fn parse_isolation_and_cwd_mutex() {
+        let err = parse_request(
+            r#"{"harness":"claude","prompt":"hi","isolation":"worktree","cwd":"/tmp"}"#,
+            SubagentIsolation::None,
+        )
+        .unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+        let r = parse_request(
+            r#"{"harness":"claude","prompt":"hi","isolation":"none"}"#,
+            SubagentIsolation::Worktree,
+        )
+        .unwrap();
+        assert_eq!(r.isolation, SubagentIsolation::None);
+    }
+
+    #[test]
+    fn create_worktree_in_temp_repo() {
+        let root = std::env::temp_dir().join(format!(
+            "cairn-wt-test-{}-{}",
+            std::process::id(),
+            unique_worktree_id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        git_capture(&root, &["init"]).unwrap();
+        git_capture(&root, &["config", "user.email", "test@example.com"]).unwrap();
+        git_capture(&root, &["config", "user.name", "test"]).unwrap();
+        fs::write(root.join("README"), "hi").unwrap();
+        git_capture(&root, &["add", "README"]).unwrap();
+        git_capture(&root, &["commit", "-m", "init"]).unwrap();
+
+        let wt = create_worktree(&root).unwrap();
+        assert!(wt.path.is_dir(), "{:?}", wt.path);
+        assert!(wt.branch.starts_with("cairn/subagent-"));
+        assert!(wt.path.join("README").is_file());
+
+        // Cleanup
+        let _ = git_capture(
+            &root,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &wt.path.to_string_lossy(),
+            ],
+        );
+        let _ = git_capture(&root, &["branch", "-D", &wt.branch]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_subagent_none_isolation_echo() {
         let mut cfg = SubagentConfig::default();
+        cfg.default_isolation = SubagentIsolation::None;
         cfg.harnesses.insert(
             "echo".into(),
             HarnessConfig {
@@ -517,7 +774,30 @@ mod tests {
         );
         let tool = SubagentTool::new(cfg);
         let out = tool
-            .execute(r#"{"harness":"echo","prompt":"hello-subagent"}"#)
+            .execute(r#"{"harness":"echo","prompt":"iso-none","isolation":"none"}"#)
+            .unwrap();
+        assert!(out.contains("iso-none"), "{out}");
+        assert!(out.contains("isolation=none"), "{out}");
+    }
+
+    #[test]
+    fn run_echo_harness_via_config() {
+        // Use a tiny custom harness that is always on PATH: `echo`.
+        // isolation=none so unit tests do not create real repo worktrees.
+        let mut cfg = SubagentConfig::default();
+        cfg.default_isolation = SubagentIsolation::None;
+        cfg.harnesses.insert(
+            "echo".into(),
+            HarnessConfig {
+                command: "echo".into(),
+                args: vec![],
+                prompt: HarnessPromptMode::Arg,
+                timeout_ms: Some(5_000),
+            },
+        );
+        let tool = SubagentTool::new(cfg);
+        let out = tool
+            .execute(r#"{"harness":"echo","prompt":"hello-subagent","isolation":"none"}"#)
             .unwrap();
         assert!(out.contains("hello-subagent"), "{out}");
         assert!(out.contains("harness=echo"), "{out}");
@@ -527,6 +807,7 @@ mod tests {
     #[test]
     fn run_stdin_harness() {
         let mut cfg = SubagentConfig::default();
+        cfg.default_isolation = SubagentIsolation::None;
         // `cat` echoes stdin.
         cfg.harnesses.insert(
             "cat".into(),
@@ -539,7 +820,7 @@ mod tests {
         );
         let tool = SubagentTool::new(cfg);
         let out = tool
-            .execute(r#"{"harness":"cat","prompt":"from-stdin"}"#)
+            .execute(r#"{"harness":"cat","prompt":"from-stdin","isolation":"none"}"#)
             .unwrap();
         assert!(out.contains("from-stdin"), "{out}");
     }
