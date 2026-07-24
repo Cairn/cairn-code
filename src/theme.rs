@@ -77,7 +77,10 @@ fn build(name: &'static str, label: &'static str, p: &Palette) -> Theme {
         amber: fg(p.amber),
         blue: fg(p.blue),
         selected: Style::new().bg(rgb(p.sel_bg)).fg(rgb(p.ink)),
-        badge: Style::new().bg(rgb(p.accent)).fg(rgb(p.on_accent)).add_modifier(Modifier::BOLD),
+        badge: Style::new()
+            .bg(rgb(p.accent))
+            .fg(rgb(p.on_accent))
+            .add_modifier(Modifier::BOLD),
         // Keep panel/prompt/line available for future surface fills without unused-field noise
         // by referencing them in a const-friendly way via debug assertion helpers.
     }
@@ -384,7 +387,11 @@ pub fn all_themes() -> Vec<Theme> {
         build("gruvbox", "Gruvbox", &GRUVBOX),
         build("tokyo-night", "Tokyo Night", &TOKYO_NIGHT),
         build("catppuccin-mocha", "Catppuccin Mocha", &CATPPUCCIN_MOCHA),
-        build("catppuccin-macchiato", "Catppuccin Macchiato", &CATPPUCCIN_MACCHIATO),
+        build(
+            "catppuccin-macchiato",
+            "Catppuccin Macchiato",
+            &CATPPUCCIN_MACCHIATO,
+        ),
         build("catppuccin-frappe", "Catppuccin Frappé", &CATPPUCCIN_FRAPPE),
         build("catppuccin-latte", "Catppuccin Latte", &CATPPUCCIN_LATTE),
         build("one-dark", "One Dark", &ONE_DARK),
@@ -462,9 +469,15 @@ mod tests {
         assert_eq!(lookup("catppuccin-frappe").name, "catppuccin-frappe");
         assert_eq!(lookup("catppuccin-latte").name, "catppuccin-latte");
         // Latte is light: ink should be dark purple-gray, not near-white
-        assert!(matches!(lookup("catppuccin-latte").ink.fg, Some(Color::Rgb(0x4c, 0x4f, 0x69))));
+        assert!(matches!(
+            lookup("catppuccin-latte").ink.fg,
+            Some(Color::Rgb(0x4c, 0x4f, 0x69))
+        ));
         // Mocha mauve accent
-        assert!(matches!(lookup("catppuccin-mocha").accent_fg.fg, Some(Color::Rgb(0xcb, 0xa6, 0xf7))));
+        assert!(matches!(
+            lookup("catppuccin-mocha").accent_fg.fg,
+            Some(Color::Rgb(0xcb, 0xa6, 0xf7))
+        ));
     }
 
     #[test]

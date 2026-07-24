@@ -1,3 +1,4 @@
+use super::registry::Tool;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::{
     ambient_authority,
@@ -6,24 +7,29 @@ use cap_std::{
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use super::registry::Tool;
 
 pub struct MemoryTool;
 static MEMORY_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl Tool for MemoryTool {
-    fn name(&self) -> &str { "memory" }
+    fn name(&self) -> &str {
+        "memory"
+    }
     fn description(&self) -> &str {
         "Store and retrieve cross-session information. Use for user preferences, project conventions, and important context."
     }
-    fn needs_permission(&self) -> bool { false }
+    fn needs_permission(&self) -> bool {
+        false
+    }
     fn needs_permission_for(&self, input: &str) -> bool {
         crate::json::parse(input)
             .ok()
-            .map(|value| matches!(
-                value.get("action").and_then(|action| action.as_str()),
-                Some("save" | "delete")
-            ))
+            .map(|value| {
+                matches!(
+                    value.get("action").and_then(|action| action.as_str()),
+                    Some("save" | "delete")
+                )
+            })
             .unwrap_or(false)
     }
     fn permission_key(&self, input: &str) -> String {
@@ -43,18 +49,28 @@ impl Tool for MemoryTool {
     fn execute(&self, input: &str) -> Result<String, String> {
         let val = crate::json::parse(input).map_err(|e| format!("invalid input: {e}"))?;
         let obj = val.as_object().ok_or("expected object")?;
-        let action = obj.get("action").and_then(|v| v.as_str()).ok_or("action required")?;
+        let action = obj
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or("action required")?;
 
         match action {
             "save" => {
-                let key = obj.get("key").and_then(|v| v.as_str()).ok_or("key required for save")?;
+                let key = obj
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .ok_or("key required for save")?;
                 let content = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                let root = open_memory_dir(true).map_err(|e| format!("open memory directory: {e}"))?;
+                let root =
+                    open_memory_dir(true).map_err(|e| format!("open memory directory: {e}"))?;
                 save_memory(&root, key, content)?;
                 Ok(format!("Saved memory '{}'", key))
             }
             "recall" => {
-                let key = obj.get("key").and_then(|v| v.as_str()).ok_or("key required for recall")?;
+                let key = obj
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .ok_or("key required for recall")?;
                 let Some(root) = open_existing_memory_dir()? else {
                     return Err(format!("Memory '{}' not found", key));
                 };
@@ -72,13 +88,21 @@ impl Tool for MemoryTool {
                     let entry = entry.map_err(|e| format!("entry: {e}"))?;
                     let name = entry.file_name().to_string_lossy().to_string();
                     if let Some(key) = name.strip_suffix(".md") {
-                        if memory_file_name(key).is_err() { continue; }
+                        if memory_file_name(key).is_err() {
+                            continue;
+                        }
                         if query.is_empty() {
-                            if validate_memory_file(&root, &name, key).is_err() { continue; }
+                            if validate_memory_file(&root, &name, key).is_err() {
+                                continue;
+                            }
                         } else {
                             if let Ok(content) = read_memory(&root, key) {
-                                if !content.contains(query) { continue; }
-                            } else { continue; }
+                                if !content.contains(query) {
+                                    continue;
+                                }
+                            } else {
+                                continue;
+                            }
                         }
                         entries.push(key.to_string());
                     }
@@ -89,7 +113,10 @@ impl Tool for MemoryTool {
                 Ok(format!("Memories:\n{}", entries.join("\n")))
             }
             "delete" => {
-                let key = obj.get("key").and_then(|v| v.as_str()).ok_or("key required for delete")?;
+                let key = obj
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .ok_or("key required for delete")?;
                 let Some(root) = open_existing_memory_dir()? else {
                     return Err(format!("Memory '{}' not found", key));
                 };
@@ -106,7 +133,9 @@ impl Tool for MemoryTool {
             }
             "search" => {
                 let query = obj.get("query").and_then(|v| v.as_str()).unwrap_or("");
-                if query.is_empty() { return Err("query required for search".into()); }
+                if query.is_empty() {
+                    return Err("query required for search".into());
+                }
                 let Some(root) = open_existing_memory_dir()? else {
                     return Ok("No memories match query.".to_string());
                 };
@@ -115,7 +144,9 @@ impl Tool for MemoryTool {
                     let entry = entry.map_err(|e| format!("entry: {e}"))?;
                     let name = entry.file_name().to_string_lossy().to_string();
                     if let Some(key) = name.strip_suffix(".md") {
-                        if memory_file_name(key).is_err() { continue; }
+                        if memory_file_name(key).is_err() {
+                            continue;
+                        }
                         if let Ok(content) = read_memory(&root, key) {
                             let (_, body) = parse_frontmatter(&content);
                             if body.contains(query) || key.contains(query) {
@@ -145,7 +176,9 @@ fn memory_home() -> Result<PathBuf, String> {
 
 fn validate_memory_key(key: &str) -> Result<(), String> {
     if key.is_empty()
-        || !key.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
     {
         return Err("memory key must contain only ASCII letters, numbers, '-' or '_'".into());
     }
@@ -158,7 +191,8 @@ fn memory_file_name(key: &str) -> Result<String, String> {
 }
 
 fn open_memory_dir(create: bool) -> std::io::Result<Dir> {
-    let home = memory_home().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let home =
+        memory_home().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     open_memory_dir_at(&home, create)
 }
 
@@ -190,13 +224,16 @@ fn save_memory(root: &Dir, key: &str, content: &str) -> Result<(), String> {
     let now = timestamp();
     let (created, existing_content) = match read_memory_file(root, &name, key) {
         Ok(existing) => parse_frontmatter(&existing),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            (now.clone(), String::new())
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (now.clone(), String::new()),
         Err(error) => return Err(format!("read existing memory: {error}")),
     };
-    let body = if content.is_empty() { &existing_content } else { content };
-    let output = format!("---\nkey: {key}\ncreated_at: {created}\nupdated_at: {now}\n---\n\n{body}");
+    let body = if content.is_empty() {
+        &existing_content
+    } else {
+        content
+    };
+    let output =
+        format!("---\nkey: {key}\ncreated_at: {created}\nupdated_at: {now}\n---\n\n{body}");
     write_memory_file_atomic(root, &name, output.as_bytes()).map_err(|e| format!("write: {e}"))
 }
 
@@ -253,7 +290,8 @@ fn open_memory_file(
     let mut options = options.clone();
     options.follow(FollowSymlinks::No);
     root.open_with(name, &options).map_err(|error| {
-        if root.symlink_metadata(name)
+        if root
+            .symlink_metadata(name)
             .map(|metadata| metadata.file_type().is_symlink())
             .unwrap_or(false)
         {
@@ -295,7 +333,9 @@ fn read_memory(root: &Dir, key: &str) -> Result<String, String> {
 
 fn timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = dur.as_secs();
     let nanos = dur.subsec_nanos();
     let days = secs / 86400;
@@ -386,17 +426,34 @@ mod tests {
         let tool = MemoryTool;
         assert!(tool.needs_permission_for(r#"{"action":"save","key":"test"}"#));
         assert!(tool.needs_permission_for(r#"{"action":"delete","key":"test"}"#));
-        assert_eq!(tool.permission_key(r#"{"action":"save","key":"test"}"#), "memory:save");
-        assert_eq!(tool.permission_key(r#"{"action":"delete","key":"test"}"#), "memory:delete");
+        assert_eq!(
+            tool.permission_key(r#"{"action":"save","key":"test"}"#),
+            "memory:save"
+        );
+        assert_eq!(
+            tool.permission_key(r#"{"action":"delete","key":"test"}"#),
+            "memory:delete"
+        );
         assert!(!tool.needs_permission_for(r#"{"action":"recall","key":"test"}"#));
-        assert_eq!(tool.permission_key(r#"{"action":"recall","key":"test"}"#), "memory");
+        assert_eq!(
+            tool.permission_key(r#"{"action":"recall","key":"test"}"#),
+            "memory"
+        );
         assert!(!tool.needs_permission_for(r#"{"action":"list"}"#));
         assert!(!tool.needs_permission_for("invalid"));
     }
 
     #[test]
     fn test_memory_file_name_rejects_unsafe_keys() {
-        for key in ["", "../secret", "..\\secret", "nested/key", "nested\\key", ".", "two words"] {
+        for key in [
+            "",
+            "../secret",
+            "..\\secret",
+            "nested/key",
+            "nested\\key",
+            ".",
+            "two words",
+        ] {
             assert!(memory_file_name(key).is_err(), "accepted unsafe key: {key}");
         }
         assert_eq!(memory_file_name("safe-key_123").unwrap(), "safe-key_123.md");
@@ -449,7 +506,11 @@ mod tests {
         let outside = base.join("outside");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(outside.join("cairn-code/memory")).unwrap();
-        fs::write(outside.join("cairn-code/memory/sentinel.md"), "outside secret").unwrap();
+        fs::write(
+            outside.join("cairn-code/memory/sentinel.md"),
+            "outside secret",
+        )
+        .unwrap();
         symlink(&outside, home.join(".config")).unwrap();
 
         assert!(open_memory_dir_at(&home, false).is_err());
@@ -472,7 +533,11 @@ mod tests {
         let junction = home.join(".config");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(outside.join("cairn-code/memory")).unwrap();
-        fs::write(outside.join("cairn-code/memory/sentinel.md"), "outside secret").unwrap();
+        fs::write(
+            outside.join("cairn-code/memory/sentinel.md"),
+            "outside secret",
+        )
+        .unwrap();
 
         let status = Command::new("cmd")
             .args(["/C", "mklink", "/J"])
@@ -504,7 +569,9 @@ mod tests {
         save_memory(&root, "linked", "new memory").unwrap();
 
         assert_eq!(fs::read_to_string(&outside).unwrap(), "outside content");
-        assert!(fs::read_to_string(&memory_path).unwrap().contains("new memory"));
+        assert!(fs::read_to_string(&memory_path)
+            .unwrap()
+            .contains("new memory"));
         let _ = fs::remove_dir_all(base);
     }
 
@@ -519,7 +586,10 @@ mod tests {
 
         let error = save_memory(&root, "binary", "replacement").unwrap_err();
 
-        assert!(error.contains("read existing memory"), "unexpected error: {error}");
+        assert!(
+            error.contains("read existing memory"),
+            "unexpected error: {error}"
+        );
         assert_eq!(fs::read(&memory_path).unwrap(), original);
         let _ = fs::remove_dir_all(base);
     }
@@ -529,11 +599,18 @@ mod tests {
         let tool = MemoryTool;
         let schema = tool.input_schema();
         let parsed = crate::json::parse(&schema);
-        assert!(parsed.is_ok(), "Schema should be valid JSON: {:?}", parsed.err());
+        assert!(
+            parsed.is_ok(),
+            "Schema should be valid JSON: {:?}",
+            parsed.err()
+        );
         let obj = parsed.unwrap();
         let props = obj.get("properties").and_then(|v| v.as_object());
         assert!(props.is_some(), "Schema should have properties");
-        assert!(props.unwrap().contains_key("action"), "Schema should have action property");
+        assert!(
+            props.unwrap().contains_key("action"),
+            "Schema should have action property"
+        );
     }
 
     #[test]

@@ -14,6 +14,89 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  quality:
+    name: formatting, lint, docs, and package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # action pin, as of 2026-07-16
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Check formatting
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          mapfile -d '' files < <(git diff --name-only --diff-filter=ACMR -z "$BASE_SHA" "$GITHUB_SHA" -- '*.rs')
+          if ((${#files[@]})); then
+            rustfmt --edition 2021 --check "${files[@]}"
+          fi
+
+      - name: Run Clippy
+        env:
+          # Existing Clippy debt is reported without blocking unrelated changes.
+          RUSTFLAGS: ""
+        run: cargo clippy --locked --all-targets --all-features -- -A clippy::approx_constant
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+        run: cargo doc --locked --no-deps
+
+      - name: Check package
+        run: cargo package --locked
+
+  msrv:
+    name: MSRV (Rust 1.96)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.96
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # action pin, as of 2026-07-16
+        with:
+          toolchain: "1.96"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: msrv
+
+      - name: Check MSRV
+        run: cargo check --locked --all-targets
+
+  dependency-policy:
+    name: advisories, licenses, and sources
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Check dependency policy
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          arguments: --all-features --locked
+          command: check
+          command-arguments: advisories licenses sources
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -25,6 +108,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # action pin, as of 2026-07-16
@@ -42,4 +127,12 @@ jobs:
         run: cargo build --locked
 
       - name: Test
+        if: runner.os != 'Windows'
         run: cargo test --locked
+
+      - name: Test (Windows without OS keyring integration)
+        if: runner.os == 'Windows'
+        run: >-
+          cargo test --locked --
+          --skip config::tests::test_keyring_set_get_delete_roundtrip
+          --skip config::tests::test_migrate_plaintext_keys_moves_to_keyring_and_strips_file

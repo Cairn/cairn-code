@@ -1,6 +1,6 @@
+use super::registry::Tool;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use super::registry::Tool;
 
 /// Max chars returned to the model. Prefer head+tail so summaries
 /// (e.g. `cargo test` "147 passed") survive even when the middle is huge.
@@ -11,13 +11,17 @@ const TAIL_CHARS: usize = 4_000;
 pub struct ShellTool;
 
 impl Tool for ShellTool {
-    fn name(&self) -> &str { "shell" }
+    fn name(&self) -> &str {
+        "shell"
+    }
     fn description(&self) -> &str {
         "Execute a shell command. On Windows this uses PowerShell (-Command); \
          on Unix it uses bash (-c). For intentional PowerShell work on Windows, \
          prefer the dedicated `powershell` tool. Always check the exit code footer."
     }
-    fn needs_permission(&self) -> bool { true }
+    fn needs_permission(&self) -> bool {
+        true
+    }
 
     fn input_schema(&self) -> String {
         r#"{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"]}"#.into()
@@ -26,7 +30,10 @@ impl Tool for ShellTool {
     fn execute(&self, input: &str) -> Result<String, String> {
         let val = crate::json::parse(input).map_err(|e| format!("invalid input: {e}"))?;
         let obj = val.as_object().ok_or("expected object")?;
-        let cmd = obj.get("command").and_then(|v| v.as_str()).ok_or("command required")?;
+        let cmd = obj
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or("command required")?;
         let timeout_ms = obj.get("timeout").and_then(|v| v.as_u64());
 
         let shell = if cfg!(windows) { "powershell" } else { "bash" };
@@ -58,7 +65,9 @@ impl Tool for ShellTool {
             }
         }
 
-        let output = child.wait_with_output().map_err(|e| format!("exec error: {e}"))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("exec error: {e}"))?;
         let code = output.status.code().unwrap_or(-1);
         let ok = output.status.success();
 
@@ -206,7 +215,10 @@ mod tests {
         };
         let input = format!(r#"{{"command":"{cmd}"}}"#);
         let err = tool.execute(&input).unwrap_err();
-        assert!(err.contains("visible-fail-body"), "lost stdout on failure: {err}");
+        assert!(
+            err.contains("visible-fail-body"),
+            "lost stdout on failure: {err}"
+        );
         assert!(err.contains("exit code"), "missing exit code: {err}");
     }
 }

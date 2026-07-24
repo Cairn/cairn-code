@@ -21,7 +21,9 @@ pub struct OpenGatewayProvider {
 
 impl OpenGatewayProvider {
     pub fn new() -> Self {
-        OpenGatewayProvider { api_key: String::new() }
+        OpenGatewayProvider {
+            api_key: String::new(),
+        }
     }
 
     pub fn with_api_key(mut self, key: &str) -> Self {
@@ -34,38 +36,106 @@ impl OpenGatewayProvider {
             return self.api_key.clone();
         }
         if let Ok(k) = std::env::var("GITLAWB_OPENGATEWAY_API_KEY") {
-            if !k.is_empty() { return k; }
+            if !k.is_empty() {
+                return k;
+            }
         }
         if let Ok(k) = std::env::var("OPENGATEWAY_API_KEY") {
-            if !k.is_empty() { return k; }
+            if !k.is_empty() {
+                return k;
+            }
         }
         crate::config::config_get_api_key("opengateway").unwrap_or_default()
     }
 }
 
 impl Provider for OpenGatewayProvider {
-    fn name(&self) -> &str { "opengateway" }
-    fn default_model(&self) -> &str { DEFAULT_MODEL }
+    fn name(&self) -> &str {
+        "opengateway"
+    }
+    fn default_model(&self) -> &str {
+        DEFAULT_MODEL
+    }
 
     fn available_models(&self) -> Vec<ModelInfo> {
         // Curated coding defaults from zero's OpenGateway catalog. The gateway
         // accepts any model id its upstreams expose; the picker lists common ones.
         vec![
-            ModelInfo { id: "mimo-v2.5-pro".into(), name: "Xiaomi MiMo V2.5 Pro".into(), max_ctx: 128_000 },
-            ModelInfo { id: "xiaomi/mimo-v2.5-pro".into(), name: "Xiaomi MiMo V2.5 Pro (namespaced)".into(), max_ctx: 128_000 },
-            ModelInfo { id: "mimo-v2.5-pro-ultraspeed".into(), name: "Xiaomi MiMo Ultraspeed".into(), max_ctx: 128_000 },
-            ModelInfo { id: "xiaomi/mimo-v2.5".into(), name: "Xiaomi MiMo V2.5".into(), max_ctx: 128_000 },
-            ModelInfo { id: "MiniMax-M3".into(), name: "MiniMax M3".into(), max_ctx: 262_144 },
-            ModelInfo { id: "minimax/minimax-m3".into(), name: "MiniMax M3 (namespaced)".into(), max_ctx: 262_144 },
-            ModelInfo { id: "qwen-plus".into(), name: "Qwen Plus".into(), max_ctx: 128_000 },
-            ModelInfo { id: "qwen/qwen3.7-max".into(), name: "Qwen 3.7 Max".into(), max_ctx: 128_000 },
-            ModelInfo { id: "gemini-2.5-pro".into(), name: "Gemini 2.5 Pro".into(), max_ctx: 1_000_000 },
-            ModelInfo { id: "google/gemini-3.1-flash-lite".into(), name: "Gemini 3.1 Flash Lite".into(), max_ctx: 1_000_000 },
-            ModelInfo { id: "glm-4.6".into(), name: "Z.ai GLM 4.6".into(), max_ctx: 128_000 },
-            ModelInfo { id: "z-ai/glm-5.2".into(), name: "Z.ai GLM 5.2".into(), max_ctx: 128_000 },
-            ModelInfo { id: "tencent/hy3".into(), name: "Tencent HY3 (free)".into(), max_ctx: 262_144 },
-            ModelInfo { id: "nvidia/llama-3.1-nemotron-70b-instruct".into(), name: "NVIDIA Nemotron 70B".into(), max_ctx: 128_000 },
-            ModelInfo { id: "nvidia/nemotron-3-ultra-550b-a55b:free".into(), name: "Nemotron 3 Ultra free".into(), max_ctx: 128_000 },
+            ModelInfo {
+                id: "mimo-v2.5-pro".into(),
+                name: "Xiaomi MiMo V2.5 Pro".into(),
+                max_ctx: 128_000,
+            },
+            ModelInfo {
+                id: "xiaomi/mimo-v2.5-pro".into(),
+                name: "Xiaomi MiMo V2.5 Pro (namespaced)".into(),
+                max_ctx: 128_000,
+            },
+            ModelInfo {
+                id: "mimo-v2.5-pro-ultraspeed".into(),
+                name: "Xiaomi MiMo Ultraspeed".into(),
+                max_ctx: 128_000,
+            },
+            ModelInfo {
+                id: "xiaomi/mimo-v2.5".into(),
+                name: "Xiaomi MiMo V2.5".into(),
+                max_ctx: 128_000,
+            },
+            ModelInfo {
+                id: "MiniMax-M3".into(),
+                name: "MiniMax M3".into(),
+                max_ctx: 262_144,
+            },
+            ModelInfo {
+                id: "minimax/minimax-m3".into(),
+                name: "MiniMax M3 (namespaced)".into(),
+                max_ctx: 262_144,
+            },
+            ModelInfo {
+                id: "qwen-plus".into(),
+                name: "Qwen Plus".into(),
+                max_ctx: 128_000,
+            },
+            ModelInfo {
+                id: "qwen/qwen3.7-max".into(),
+                name: "Qwen 3.7 Max".into(),
+                max_ctx: 128_000,
+            },
+            ModelInfo {
+                id: "gemini-2.5-pro".into(),
+                name: "Gemini 2.5 Pro".into(),
+                max_ctx: 1_000_000,
+            },
+            ModelInfo {
+                id: "google/gemini-3.1-flash-lite".into(),
+                name: "Gemini 3.1 Flash Lite".into(),
+                max_ctx: 1_000_000,
+            },
+            ModelInfo {
+                id: "glm-4.6".into(),
+                name: "Z.ai GLM 4.6".into(),
+                max_ctx: 128_000,
+            },
+            ModelInfo {
+                id: "z-ai/glm-5.2".into(),
+                name: "Z.ai GLM 5.2".into(),
+                max_ctx: 128_000,
+            },
+            ModelInfo {
+                id: "tencent/hy3".into(),
+                name: "Tencent HY3 (free)".into(),
+                max_ctx: 262_144,
+            },
+            ModelInfo {
+                id: "nvidia/llama-3.1-nemotron-70b-instruct".into(),
+                name: "NVIDIA Nemotron 70B".into(),
+                max_ctx: 128_000,
+            },
+            ModelInfo {
+                id: "nvidia/nemotron-3-ultra-550b-a55b:free".into(),
+                name: "Nemotron 3 Ultra free".into(),
+                max_ctx: 128_000,
+            },
         ]
     }
 
@@ -75,46 +145,59 @@ impl Provider for OpenGatewayProvider {
         tools: &[ToolDefinition],
         system: &str,
         model: &str,
-        _max_tokens: usize,
+        max_tokens: usize,
         mut on_chunk: StreamingCallback,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(Vec<Message>, Usage), String> {
         let key = self.get_key();
         if key.is_empty() {
-            return Err(crate::llm::provider::missing_api_key("GITLAWB_OPENGATEWAY_API_KEY"));
+            return Err(crate::llm::provider::missing_api_key(
+                "GITLAWB_OPENGATEWAY_API_KEY",
+            ));
         }
-        let body = request_body(messages, tools, system, model, true)?;
+        let body = request_body(messages, tools, system, model, max_tokens, true)?;
         let req = http_client::HttpRequest {
             url: CHAT_URL.into(),
             headers: vec![
                 ("Authorization".into(), format!("Bearer {key}")),
                 ("Content-Type".into(), "application/json".into()),
-                ("HTTP-Referer".into(), "https://github.com/Cairn/cairn-code".into()),
+                (
+                    "HTTP-Referer".into(),
+                    "https://github.com/Cairn/cairn-code".into(),
+                ),
                 ("X-Title".into(), "Cairn Code".into()),
             ],
             body: Some(body),
         };
         let response_data: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let response_data2 = response_data.clone();
-        http_client::request_streaming_with_cancel(&req, move |line| {
-            let mut data = response_data2.lock().unwrap();
-            data.push_str(line);
-            data.push('\n');
-            if let Some(json_str) = line.strip_prefix("data: ") {
-                if json_str == "[DONE]" { return; }
-                if let Ok(val) = crate::json::parse(json_str) {
-                    if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
-                        if let Some(choice) = choices.first() {
-                            if let Some(delta) = choice.get("delta") {
-                                if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-                                    on_chunk(text, "text");
+        http_client::request_streaming_with_cancel(
+            &req,
+            move |line| {
+                let mut data = response_data2.lock().unwrap();
+                data.push_str(line);
+                data.push('\n');
+                if let Some(json_str) = line.strip_prefix("data: ") {
+                    if json_str == "[DONE]" {
+                        return;
+                    }
+                    if let Ok(val) = crate::json::parse(json_str) {
+                        if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
+                            if let Some(choice) = choices.first() {
+                                if let Some(delta) = choice.get("delta") {
+                                    if let Some(text) =
+                                        delta.get("content").and_then(|v| v.as_str())
+                                    {
+                                        on_chunk(text, "text");
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-        }, Some(cancel))?;
+            },
+            Some(cancel),
+        )?;
         let raw = response_data.lock().unwrap().clone();
         openai_compat::parse_streaming_response(&raw)
     }
@@ -125,19 +208,24 @@ impl Provider for OpenGatewayProvider {
         tools: &[ToolDefinition],
         system: &str,
         model: &str,
-        _max_tokens: usize,
+        max_tokens: usize,
     ) -> Result<(Vec<Message>, Usage), String> {
         let key = self.get_key();
         if key.is_empty() {
-            return Err(crate::llm::provider::missing_api_key("GITLAWB_OPENGATEWAY_API_KEY"));
+            return Err(crate::llm::provider::missing_api_key(
+                "GITLAWB_OPENGATEWAY_API_KEY",
+            ));
         }
-        let body = request_body(messages, tools, system, model, false)?;
+        let body = request_body(messages, tools, system, model, max_tokens, false)?;
         let req = http_client::HttpRequest {
             url: CHAT_URL.into(),
             headers: vec![
                 ("Authorization".into(), format!("Bearer {key}")),
                 ("Content-Type".into(), "application/json".into()),
-                ("HTTP-Referer".into(), "https://github.com/Cairn/cairn-code".into()),
+                (
+                    "HTTP-Referer".into(),
+                    "https://github.com/Cairn/cairn-code".into(),
+                ),
                 ("X-Title".into(), "Cairn Code".into()),
             ],
             body: Some(body),
@@ -152,9 +240,12 @@ fn request_body(
     tools: &[ToolDefinition],
     system: &str,
     model: &str,
+    max_tokens: usize,
     stream: bool,
 ) -> Result<String, String> {
+    let model = openai_compat::escape_json_str(model);
     let mut body = format!("{{\"model\":\"{model}\",\"stream\":{stream}");
+    body.push_str(&format!(",\"max_tokens\":{max_tokens}"));
     body.push_str(",\"messages\":");
     body.push_str(&openai_compat::build_messages_json(messages, system));
     body.push_str(&openai_compat::build_tools_json(tools));
@@ -191,12 +282,27 @@ mod tests {
             role: "user".into(),
             content: Content::Text("hi".into()),
         }];
-        let body = request_body(&msgs, &[], "sys", DEFAULT_MODEL, true).unwrap();
+        let body = request_body(&msgs, &[], "sys", DEFAULT_MODEL, 12_345, true).unwrap();
         let val = crate::json::parse(&body).unwrap();
         let obj = val.as_object().unwrap();
-        assert_eq!(obj.get("model").and_then(|v| v.as_str()), Some(DEFAULT_MODEL));
+        assert_eq!(
+            obj.get("model").and_then(|v| v.as_str()),
+            Some(DEFAULT_MODEL)
+        );
         assert_eq!(obj.get("stream").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(obj.get("max_tokens").and_then(|v| v.as_u64()), Some(12_345));
+        assert!(obj.get("max_completion_tokens").is_none());
         assert!(obj.get("messages").and_then(|v| v.as_array()).is_some());
+    }
+
+    #[test]
+    fn request_body_escapes_model_name() {
+        let model = "model\",\"injected\":true,\"tail";
+        let body = request_body(&[], &[], "", model, 8192, false).unwrap();
+        let value = crate::json::parse(&body).unwrap();
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.get("model").and_then(|v| v.as_str()), Some(model));
+        assert!(obj.get("injected").is_none());
     }
 
     #[test]
@@ -207,7 +313,7 @@ mod tests {
         // not be empty — still assert with_api_key overrides.
         let p = OpenGatewayProvider::new().with_api_key("");
         // with empty stored key falls through to env; just check request_body works
-        let body = request_body(&[], &[], "", "mimo-v2.5-pro", false).unwrap();
+        let body = request_body(&[], &[], "", "mimo-v2.5-pro", 8192, false).unwrap();
         assert!(body.contains("mimo-v2.5-pro"));
         let _ = p;
     }

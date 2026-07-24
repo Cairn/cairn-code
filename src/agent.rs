@@ -454,7 +454,7 @@ impl Agent {
                 if !always_allowed {
                     self.config.auto_allow.push(permission_key);
                 }
-                let _ = crate::config::save_full_config(&self.config);
+                let _ = crate::config::save_permissions(&self.config);
                 self.dispatch_tool(tu)
             }
             "allow" => self.dispatch_tool(tu),

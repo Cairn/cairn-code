@@ -1134,6 +1134,7 @@ impl Tui {
                 } else if self.show_command_picker || !self.cmd_picker_filtered.is_empty() {
                     self.show_command_picker = false;
                     self.cmd_picker_filtered.clear();
+                    self.cmd_picker_sel = 0;
                 } else if self.show_provider_picker {
                     self.show_provider_picker = false;
                 } else if self.show_model_picker {
@@ -1319,8 +1320,7 @@ impl Tui {
                 }
 
                 if input.starts_with('/') {
-                    self.handle_command(&input);
-                    return true;
+                    return self.handle_command(&input);
                 }
 
                 self.history.push(input.clone());
@@ -1397,10 +1397,10 @@ impl Tui {
         }
     }
 
-    fn handle_command(&mut self, cmd: &str) {
+    fn handle_command(&mut self, cmd: &str) -> bool {
         let parts: Vec<&str> = cmd.split_whitespace().collect();
         if parts.is_empty() {
-            return;
+            return true;
         }
 
         match parts[0] {
@@ -1409,9 +1409,10 @@ impl Tui {
                     self.output_lines.push(OutputLine {
                         type_: "system".into(),
                         content: "Wait for the current turn to finish before clearing.".into(),
-                        tool_name: String::new(), duration: String::new(),
+                        tool_name: String::new(),
+                        duration: String::new(),
                     });
-                    return;
+                    return true;
                 }
                 self.autosave_session(false);
                 self.output_lines.clear();
@@ -1434,7 +1435,8 @@ impl Tui {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
                     content: "Cleared conversation and session state.".into(),
-                    tool_name: String::new(), duration: String::new(),
+                    tool_name: String::new(),
+                    duration: String::new(),
                 });
             }
             "/thinking" => {
@@ -1451,7 +1453,7 @@ impl Tui {
                             tool_name: String::new(),
                             duration: String::new(),
                         });
-                        return;
+                        return true;
                     }
                     None => !self.show_thinking,
                 };
@@ -1483,7 +1485,7 @@ impl Tui {
                             tool_name: String::new(),
                             duration: String::new(),
                         });
-                        return;
+                        return true;
                     }
                     None => !self.show_suggestions,
                 };
@@ -1516,7 +1518,7 @@ impl Tui {
                             tool_name: String::new(),
                             duration: String::new(),
                         });
-                        return;
+                        return true;
                     }
                     None => !self.mouse_capture,
                 };
@@ -1550,7 +1552,7 @@ impl Tui {
                             tool_name: String::new(),
                             duration: String::new(),
                         });
-                        return;
+                        return true;
                     }
                 };
                 self.pending_select = Some(kind);
@@ -1654,7 +1656,9 @@ impl Tui {
                         type_: "system".into(),
                         content: format!(
                             "No MCP servers in config. Add mcp.servers (or mcpServers) to {}.",
-                            crate::config::config_path().display()
+                            crate::config::config_path()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "~/.config/cairn-code/config.json".into())
                         ),
                         tool_name: String::new(),
                         duration: String::new(),
@@ -1819,7 +1823,7 @@ impl Tui {
                 }
             }
             "/exit" | "/quit" | "/q" => {
-                std::process::exit(0);
+                return false;
             }
             _ => {
                 self.output_lines.push(OutputLine {
@@ -1830,6 +1834,7 @@ impl Tui {
                 });
             }
         }
+        true
     }
 
     fn sessions_dir(&self) -> String {
@@ -2872,10 +2877,14 @@ impl Tui {
                 Span::raw(after),
             ]));
             chrome.push(Line::from(""));
-            chrome.push(Line::from(vec![Span::styled(
-                format!("Tool '{}' wants to run:", self.perm_tool_name),
-                white,
-            )]));
+            chrome.push(Line::from(vec![
+                Span::styled(format!("Tool '{}' wants to run:", self.perm_tool_name), white),
+            ]));
+            if let Some(warning) = permission_risk_warning(&self.perm_tool_name) {
+                chrome.push(Line::from(vec![
+                    Span::styled(format!("  {warning}"), orange_fg),
+                ]));
+            }
             if !self.perm_tool_input.is_empty() {
                 chrome.push(Line::from(vec![Span::styled(
                     format!("  {}", self.perm_tool_input),
@@ -3851,6 +3860,26 @@ mod provider_privacy_tests {
 }
 
 #[cfg(test)]
+mod exit_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn exit_commands_stop_the_event_loop() {
+        for command in ["/exit", "/quit", "/q"] {
+            let mut tui = Tui::new("test", "test-model", "test-provider", ".");
+            tui.input_buf = command.into();
+            tui.cursor = tui.input_buf.len();
+
+            assert!(
+                !tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                "{command} should request normal event-loop termination"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod completion_tests {
     use super::*;
 
@@ -4123,6 +4152,15 @@ fn truncate_display(s: &str, head_lines: usize, tail_lines: usize) -> String {
     out
 }
 
+fn permission_risk_warning(tool_name: &str) -> Option<&'static str> {
+    match tool_name {
+        "git" => Some(
+            "Shell-equivalent risk: Git may execute aliases, hooks, helpers, and configured commands.",
+        ),
+        _ => None,
+    }
+}
+
 /// One-line arg preview for tool_use rows (avoid dumping pretty JSON).
 fn compact_tool_arg_hint(input: &str) -> String {
     let trimmed = input.trim();
@@ -4148,6 +4186,17 @@ fn compact_tool_arg_hint(input: &str) -> String {
                     let ellipsis = if v.chars().count() > 64 { "…" } else { "" };
                     return format!("{key}={shown}{ellipsis}");
                 }
+            }
+            if let Some(args) = obj.get("args").and_then(|value| value.as_array()) {
+                let args = args
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(|value| format!("{value:?}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let shown: String = args.chars().take(64).collect();
+                let ellipsis = if args.chars().count() > 64 { "…" } else { "" };
+                return format!("args={shown}{ellipsis}");
             }
         }
     }
@@ -4307,5 +4356,18 @@ mod tool_display_tests {
     fn compact_tool_arg_hint_extracts_pattern() {
         let h = compact_tool_arg_hint(r#"{"pattern":"src/**/*.rs"}"#);
         assert!(h.contains("pattern=src/**/*.rs"), "{h}");
+    }
+
+    #[test]
+    fn compact_tool_arg_hint_preserves_array_boundaries() {
+        let hint = compact_tool_arg_hint(r#"{"args":["status","path with spaces",""]}"#);
+        assert_eq!(hint, r#"args="status" "path with spaces" """#);
+    }
+
+    #[test]
+    fn git_permission_warning_classifies_shell_equivalent_risk() {
+        let warning = permission_risk_warning("git").unwrap();
+        assert!(warning.contains("Shell-equivalent risk"));
+        assert!(permission_risk_warning("go").is_none());
     }
 }

@@ -52,6 +52,9 @@ fn main() {
     }
 
     let cfg = Config::load();
+    // Off by default (H-03): only write request metadata to disk when the
+    // user has explicitly opted in via config or CAIRN_DEBUG_HTTP=1.
+    http_client::set_debug_logging_enabled(cfg.debug_log_requests);
     let provider_name = std::env::var("CAIRN_PROVIDER").unwrap_or(cfg.default_provider.clone());
     let model_name = std::env::var("CAIRN_MODEL").unwrap_or(cfg.default_model.clone());
 
