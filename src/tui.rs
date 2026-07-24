@@ -237,6 +237,7 @@ impl Tui {
                 "/quit".into(),
                 "/copy".into(),
                 "/q".into(),
+                "/reset".into(),
                 "/resume".into(),
                 "/save".into(),
                 "/select".into(),
@@ -1684,8 +1685,9 @@ impl Tui {
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /auth /clear /compact /copy /cost /delete /exit /help /mcp /model /mouse /provider /resume /save /select /sessions /skills /suggestions /theme /thinking\nExtensibility: skills (SKILL.md) + MCP stdio (config mcp.servers or mcpServers)\n/skills · /mcp — list skills and MCP servers\nMouse: wheel scrolls · Shift+drag selects (terminal-native) · /mouse off disables capture\n/select [last|all] or Ctrl+O — plain-text view if you need a full select dump\n/copy or Ctrl+Y — copy last assistant message to clipboard\n/thinking [on|off] · /suggestions [on|off]\nTab completes slash commands · Scroll: wheel · PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End (Up/Down scroll when chat overflows; Ctrl+P/N for prompt history)\nSounds: CAIRN_SOUND=0 to mute · /provider xai — OAuth; /auth login xai".into(),
-                    tool_name: String::new(), duration: String::new(),
+                    content: "Commands: /auth /clear /compact /copy /cost /delete /exit /help /mcp /model /mouse /provider /reset /resume /save /select /sessions /skills /suggestions /theme /thinking\nExtensibility: skills (SKILL.md) + MCP stdio (config mcp.servers or mcpServers)\n/skills · /mcp — list skills and MCP servers\n/reset · /reset apply — redeem ChatGPT Plus/Pro banked rate-limit resets (OpenAI OAuth / Codex login only)\nMouse: wheel scrolls · Shift+drag selects (terminal-native) · /mouse off disables capture\n/select [last|all] or Ctrl+O — plain-text view if you need a full select dump\n/copy or Ctrl+Y — copy last assistant message to clipboard\n/thinking [on|off] · /suggestions [on|off]\nTab completes slash commands · Scroll: wheel · PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End (Up/Down scroll when chat overflows; Ctrl+P/N for prompt history)\nSounds: CAIRN_SOUND=0 to mute · /provider xai — OAuth; /auth login xai".into(),
+                    tool_name: String::new(),
+                    duration: String::new(),
                 });
             }
             "/skills" => {
@@ -1846,6 +1848,30 @@ impl Tui {
                     );
                 } else {
                     self.open_theme_picker();
+                }
+            }
+            "/reset" => {
+                // ChatGPT subscription banked rate-limit resets (Codex-compatible API).
+                // Only works with OpenAI ChatGPT OAuth (Codex auth.json or oauth:openai),
+                // not with plain API keys.
+                let args: Vec<&str> = parts.iter().skip(1).copied().collect();
+                match crate::openai_reset::run_reset_command(&args) {
+                    Ok(msg) => {
+                        self.output_lines.push(OutputLine {
+                            type_: "system".into(),
+                            content: msg,
+                            tool_name: String::new(),
+                            duration: String::new(),
+                        });
+                    }
+                    Err(e) => {
+                        self.output_lines.push(OutputLine {
+                            type_: "error".into(),
+                            content: e,
+                            tool_name: String::new(),
+                            duration: String::new(),
+                        });
+                    }
                 }
             }
             "/compact" => {
@@ -3586,6 +3612,7 @@ fn completion_wants_trailing_space(completion: &str) -> bool {
             | "/auth login"
             | "/auth logout"
             | "/auth key"
+            | "/reset"
             | "/theme"
             | "/model"
             | "/provider"
@@ -3939,6 +3966,21 @@ pub(crate) fn slash_completions(
                     .iter()
                     .filter(|s| s.starts_with(&p))
                     .map(|s| format!("{root} {s}"))
+                    .collect();
+            }
+            Vec::new()
+        }
+        "/reset" => {
+            let opts = ["list", "apply", "status"];
+            if parts.len() == 1 && ends_with_space {
+                return opts.iter().map(|s| format!("/reset {s}")).collect();
+            }
+            if parts.len() == 2 && !ends_with_space {
+                let p = parts[1].to_ascii_lowercase();
+                return opts
+                    .iter()
+                    .filter(|s| s.starts_with(&p))
+                    .map(|s| format!("/reset {s}"))
                     .collect();
             }
             Vec::new()
@@ -4423,6 +4465,7 @@ mod completion_tests {
             "/help".into(),
             "/model".into(),
             "/provider".into(),
+            "/reset".into(),
             "/resume".into(),
             "/delete".into(),
             "/suggestions".into(),
@@ -4521,6 +4564,17 @@ mod completion_tests {
         assert!(c.iter().any(|x| x == "/auth login xai"));
         let c = slash_completions("/auth login x", &base(), &[], &providers, &[], &[]);
         assert_eq!(c, vec!["/auth login xai".to_string()]);
+    }
+
+    #[test]
+    fn completes_reset_subcommands() {
+        let c = slash_completions("/re", &base(), &[], &[], &[], &[]);
+        assert!(c.contains(&"/reset".to_string()), "{c:?}");
+        let c = slash_completions("/reset ", &base(), &[], &[], &[], &[]);
+        assert!(c.iter().any(|x| x == "/reset list"));
+        assert!(c.iter().any(|x| x == "/reset apply"));
+        let c = slash_completions("/reset a", &base(), &[], &[], &[], &[]);
+        assert_eq!(c, vec!["/reset apply".to_string()]);
     }
 
     #[test]
