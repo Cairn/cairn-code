@@ -1,1 +1,9 @@
-pub mod provider;pub mod openai_compat;pub mod anthropic;pub mod openai;pub mod openrouter;pub mod opengateway;pub mod xai;pub mod ollama;pub use provider::*;
+pub mod anthropic;
+pub mod ollama;
+pub mod openai;
+pub mod openai_compat;
+pub mod opengateway;
+pub mod openrouter;
+pub mod provider;
+pub mod xai;
+pub use provider::*;

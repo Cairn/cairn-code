@@ -52,7 +52,12 @@ pub struct Usage {
 
 impl Default for Usage {
     fn default() -> Self {
-        Usage { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0 }
+        Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read: 0,
+            cache_create: 0,
+        }
     }
 }
 
@@ -100,7 +105,10 @@ pub fn missing_api_key(env_var: &str) -> String {
 
 pub fn default_providers() -> HashMap<String, Box<dyn Provider>> {
     let mut map: HashMap<String, Box<dyn Provider>> = HashMap::new();
-    map.insert("anthropic".into(), Box::new(crate::llm::anthropic::AnthropicProvider::new()));
+    map.insert(
+        "anthropic".into(),
+        Box::new(crate::llm::anthropic::AnthropicProvider::new()),
+    );
     let openai = match crate::config::config_get_api_key("openai") {
         Some(key) => crate::llm::openai::OpenAIProvider::new().with_api_key(&key),
         None => crate::llm::openai::OpenAIProvider::new(),
@@ -121,6 +129,9 @@ pub fn default_providers() -> HashMap<String, Box<dyn Provider>> {
         None => crate::llm::xai::XaiProvider::new(),
     };
     map.insert("xai".into(), Box::new(xai));
-    map.insert("ollama".into(), Box::new(crate::llm::ollama::OllamaProvider::new()));
+    map.insert(
+        "ollama".into(),
+        Box::new(crate::llm::ollama::OllamaProvider::new()),
+    );
     map
 }
