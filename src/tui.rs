@@ -114,6 +114,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "session management",
     ),
     ("/skills · /mcp", "list skills and MCP servers"),
+    ("/roast-me", "architecture roast (optional topic)"),
     (
         "/reset · /reset apply",
         "ChatGPT banked rate-limit resets (OpenAI OAuth)",
@@ -2080,13 +2081,96 @@ impl Tui {
                     for s in &list {
                         body.push_str(&format!("  {} - {}\n", s.name, s.description));
                     }
-                    body.push_str("Load in-chat with the skill tool: {\"name\":\"...\"}");
+                    body.push_str(
+                        "Load in-chat with the skill tool: {\"name\":\"...\"}. \
+                         Built-in: /roast-me [topic].",
+                    );
                     self.output_lines.push(OutputLine {
                         type_: "system".into(),
                         content: body,
                         tool_name: String::new(),
                         duration: String::new(),
                     });
+                }
+            }
+            "/roast-me" => {
+                if !matches!(self.state, State::Idle) {
+                    self.output_lines.push(OutputLine {
+                        type_: "system".into(),
+                        content: "Wait for the current turn to finish before /roast-me.".into(),
+                        tool_name: String::new(),
+                        duration: String::new(),
+                    });
+                    return true;
+                }
+                if self.agent_tx.is_none() {
+                    self.output_lines.push(OutputLine {
+                        type_: "error".into(),
+                        content: "Agent channel not ready; cannot start /roast-me.".into(),
+                        tool_name: String::new(),
+                        duration: String::new(),
+                    });
+                    return true;
+                }
+                let cfg = match crate::config::Config::load() {
+                    Ok(cfg) => cfg,
+                    Err(error) => {
+                        self.output_lines.push(OutputLine {
+                            type_: "error".into(),
+                            content: format!("Error loading configuration: {error}"),
+                            tool_name: String::new(),
+                            duration: String::new(),
+                        });
+                        return true;
+                    }
+                };
+                if let Some(ref d) = cfg.skills_dir {
+                    std::env::set_var("CAIRN_SKILLS_DIR", d);
+                }
+                let list = crate::skills::load_skills();
+                let Some(skill) = crate::skills::find_skill(&list, "roast-me") else {
+                    self.output_lines.push(OutputLine {
+                        type_: "error".into(),
+                        content: "roast-me skill is not available.".into(),
+                        tool_name: String::new(),
+                        duration: String::new(),
+                    });
+                    return true;
+                };
+                let topic = if parts.len() > 1 {
+                    parts[1..].join(" ")
+                } else {
+                    String::new()
+                };
+                let prompt = format!(
+                    "Load and follow the roast-me skill instructions below.\n\n\
+                     Target (optional, may be empty): {topic}\n\n\
+                     ---\n\
+                     {}",
+                    skill.content
+                );
+                let label = if topic.is_empty() {
+                    "/roast-me".to_string()
+                } else {
+                    format!("/roast-me {topic}")
+                };
+                self.show_recovery_prompt = false;
+                self.transcript_follow = true;
+                self.expect_turn_notify = true;
+                self.idle_suggestion = None;
+                self.ensure_session_identity();
+                self.output_lines.push(OutputLine {
+                    type_: "user".into(),
+                    content: label,
+                    tool_name: String::new(),
+                    duration: String::new(),
+                });
+                if let Some(flag) = &self.cancel_flag {
+                    flag.store(false, Ordering::Relaxed);
+                }
+                self.begin_running();
+                if let Some(tx) = &self.agent_tx {
+                    let _ = tx.send(prompt);
                 }
             }
             "/mcp" => {
@@ -4663,6 +4747,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/quit", "Exit Cairn"),
     ("/reset", "Show ChatGPT rate-limit reset times"),
     ("/resume", "Resume a saved session"),
+    ("/roast-me", "Start a constructive architecture roast"),
     ("/save", "Save the current session"),
     ("/select", "Plain-text view for terminal selection"),
     ("/sessions", "List saved sessions"),
@@ -5370,6 +5455,57 @@ mod help_overlay_tests {
 }
 
 #[cfg(test)]
+mod roast_me_command_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn roast_me_starts_turn_with_skill_body_and_topic() {
+        let (tx, rx) = mpsc::channel();
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.agent_tx = Some(tx);
+        assert!(tui.handle_command("/roast-me the auth refactor"));
+        assert!(matches!(tui.state, State::Running));
+        let last = tui.output_lines.last().expect("user line");
+        assert_eq!(last.type_, "user");
+        assert_eq!(last.content, "/roast-me the auth refactor");
+        let prompt = rx.try_recv().expect("agent prompt");
+        assert!(prompt.contains("Load and follow the roast-me skill"));
+        assert!(prompt.contains("Target (optional, may be empty): the auth refactor"));
+        assert!(
+            prompt.contains("Operating Mode") || prompt.contains("# Roast Me"),
+            "expected skill body in prompt"
+        );
+    }
+
+    #[test]
+    fn roast_me_bare_allows_empty_topic() {
+        let (tx, rx) = mpsc::channel();
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.agent_tx = Some(tx);
+        assert!(tui.handle_command("/roast-me"));
+        let prompt = rx.try_recv().expect("agent prompt");
+        assert!(prompt.contains("Target (optional, may be empty): \n"));
+        let last = tui.output_lines.last().unwrap();
+        assert_eq!(last.content, "/roast-me");
+    }
+
+    #[test]
+    fn roast_me_waits_when_not_idle() {
+        let (tx, rx) = mpsc::channel();
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.agent_tx = Some(tx);
+        tui.state = State::Running;
+        assert!(tui.handle_command("/roast-me topic"));
+        assert!(rx.try_recv().is_err());
+        assert!(tui
+            .output_lines
+            .iter()
+            .any(|l| l.content.contains("Wait for the current turn")));
+    }
+}
+
+#[cfg(test)]
 mod claude_chrome_tests {
     use super::*;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -5617,6 +5753,23 @@ mod completion_tests {
             assert!(!help.is_empty(), "{cmd} has no help text");
             assert_eq!(slash_completion_help(cmd), Some(*help));
         }
+    }
+
+    #[test]
+    fn roast_me_in_slash_commands() {
+        assert!(
+            SLASH_COMMANDS.iter().any(|(c, _)| *c == "/roast-me"),
+            "expected /roast-me in SLASH_COMMANDS"
+        );
+        let c = slash_completions("/roast", &all(), &[], &[], &[], &[]);
+        assert!(
+            c.iter().any(|s| s == "/roast-me"),
+            "expected /roast-me in completions for /roast: {c:?}"
+        );
+        assert_eq!(
+            slash_completion_help("/roast-me"),
+            Some("Start a constructive architecture roast")
+        );
     }
 
     #[test]
