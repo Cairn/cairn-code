@@ -561,7 +561,11 @@ mod tests {
                 .as_nanos()
         ));
         // PowerShell accepts forward slashes; also double-quote for LiteralPath.
-        let marker_ps = marker.display().to_string().replace('\\', "/").replace('\'', "''");
+        let marker_ps = marker
+            .display()
+            .to_string()
+            .replace('\\', "/")
+            .replace('\'', "''");
         let command = format!(
             "Start-Process powershell -ArgumentList @('-NoProfile','-Command','Start-Sleep -Milliseconds 1000; Set-Content -LiteralPath ''{marker_ps}'' -Value survived'); Start-Sleep -Seconds 5"
         );
