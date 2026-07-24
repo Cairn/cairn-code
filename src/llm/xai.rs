@@ -283,9 +283,7 @@ fn model_supports_effort(id: &str) -> bool {
     let lower = id.to_ascii_lowercase();
     // Current picker models use reasoning effort; keep multi-agent for any
     // residual request path even though it is no longer listed.
-    lower.starts_with("grok-4.5")
-        || lower.starts_with("grok-5")
-        || lower.contains("multi-agent")
+    lower.starts_with("grok-4.5") || lower.starts_with("grok-5") || lower.contains("multi-agent")
 }
 
 fn efforts_for(id: &str) -> Option<&'static [&'static str]> {
