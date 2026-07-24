@@ -412,8 +412,7 @@ impl Tui {
     /// Whether the transcript shows the waiting verb line vs a trailing glyph.
     /// Waiting: no answer tokens yet, and not already painting a full thinking body.
     fn spinner_is_waiting(&self) -> bool {
-        self.streaming_text.is_empty()
-            && !(self.show_thinking && !self.stream_thinking.is_empty())
+        self.streaming_text.is_empty() && !(self.show_thinking && !self.stream_thinking.is_empty())
     }
 
     pub fn set_show_thinking(&mut self, show: bool) {
@@ -5147,7 +5146,10 @@ mod provider_privacy_tests {
     fn spinner_waiting_until_answer_or_full_thinking_streams() {
         let mut tui = Tui::new("test", "model", "provider", ".");
         tui.begin_running();
-        assert!(tui.spinner_is_waiting(), "pre-token should use verb spinner");
+        assert!(
+            tui.spinner_is_waiting(),
+            "pre-token should use verb spinner"
+        );
         assert!(
             SPINNER_CHARS.contains(&tui.spinner_glyph()),
             "glyph must be a MiniDot frame"
