@@ -1,7 +1,5 @@
 use super::provider::*;
 use crate::http_client;
-use crate::json;
-use std::sync::{Arc, Mutex};
 
 pub struct OpenAIProvider {
     api_key: String,
@@ -131,37 +129,13 @@ impl Provider for OpenAIProvider {
             ],
             body: Some(body),
         };
-        let response_data: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-        let response_data2 = response_data.clone();
+        let mut response = crate::llm::openai_compat::StreamingResponse::default();
         http_client::request_streaming_with_cancel(
             &req,
-            move |line| {
-                let mut data = response_data2.lock().unwrap();
-                data.push_str(line);
-                data.push('\n');
-                if let Some(json_str) = line.strip_prefix("data: ") {
-                    if json_str == "[DONE]" {
-                        return;
-                    }
-                    if let Ok(val) = json::parse(json_str) {
-                        if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
-                            if let Some(choice) = choices.first() {
-                                if let Some(delta) = choice.get("delta") {
-                                    if let Some(text) =
-                                        delta.get("content").and_then(|v| v.as_str())
-                                    {
-                                        on_chunk(text, "text");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
+            |line| response.push_line(line, &mut on_chunk, false),
             Some(cancel),
         )?;
-        let raw = response_data.lock().unwrap().clone();
-        parse_openai_response(&raw)
+        response.finish()
     }
 
     fn complete(
@@ -208,10 +182,6 @@ fn openai_request_body(
     body.push_str(&crate::llm::openai_compat::build_tools_json(tools));
     body.push('}');
     crate::llm::openai_compat::validate_json_body(body)
-}
-
-fn parse_openai_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
-    crate::llm::openai_compat::parse_streaming_response(raw)
 }
 
 fn parse_openai_complete_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {

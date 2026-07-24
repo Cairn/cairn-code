@@ -1,5 +1,9 @@
+use super::process_runner::{self, ByteLimitedRunError};
 use super::registry::Tool;
-use std::process::{Command, Stdio};
+use std::process::Command;
+
+const MAX_RESPONSE_BYTES: usize = 1_000_000;
+const MAX_STDERR_BYTES: usize = 16 * 1024;
 
 pub struct WebSearchTool;
 
@@ -28,15 +32,19 @@ impl Tool for WebSearchTool {
 
         let url = format!("https://lite.duckduckgo.com/lite/?q={}", urlencode(query));
 
-        let child = Command::new("curl")
-            .args(["-sS", "-L", &url])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("curl: {e}"))?;
-
-        let output = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
-        let html = String::from_utf8_lossy(&output.stdout);
+        let mut command = Command::new("curl");
+        command.args([
+            "-q",
+            "-sS",
+            "-L",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "15",
+            &url,
+        ]);
+        let html = run_search_command(command)?;
+        let html = String::from_utf8_lossy(&html);
 
         let results = parse_ddg_results(&html);
         if results.is_empty() {
@@ -55,6 +63,54 @@ impl Tool for WebSearchTool {
         }
         buf.push_str(&format!("{} results returned.", results.len()));
         Ok(buf)
+    }
+}
+
+fn run_search_command(command: Command) -> Result<Vec<u8>, String> {
+    let output =
+        process_runner::run_with_byte_limits(command, None, MAX_RESPONSE_BYTES, MAX_STDERR_BYTES)
+            .map_err(format_search_process_error)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        return Err(format!(
+            "curl: {}",
+            if detail.is_empty() {
+                "request failed"
+            } else {
+                detail
+            }
+        ));
+    }
+    Ok(output.stdout)
+}
+
+fn format_search_process_error(error: ByteLimitedRunError) -> String {
+    match error {
+        ByteLimitedRunError::Spawn(reason) => format!("curl: {reason}"),
+        ByteLimitedRunError::StdoutLimit {
+            limit,
+            cleanup_error,
+        } => process_runner::with_cleanup(
+            format!("web_search: response exceeds {limit} bytes"),
+            &cleanup_error,
+        ),
+        ByteLimitedRunError::StderrLimit {
+            limit,
+            cleanup_error,
+        } => process_runner::with_cleanup(
+            format!("curl: stderr exceeds {limit} bytes"),
+            &cleanup_error,
+        ),
+        ByteLimitedRunError::Read {
+            stream,
+            reason,
+            cleanup_error,
+        } => process_runner::with_cleanup(
+            format!("curl: failed reading {stream}: {reason}"),
+            &cleanup_error,
+        ),
+        ByteLimitedRunError::Wait(reason) => format!("curl: wait failed: {reason}"),
     }
 }
 
@@ -182,6 +238,43 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn output_command(stderr: bool, bytes: usize) -> Command {
+        let mut command = Command::new(if cfg!(windows) { "powershell" } else { "bash" });
+        if cfg!(windows) {
+            let stream = if stderr { "Error" } else { "Out" };
+            command
+                .arg("-Command")
+                .arg(format!("[Console]::{stream}.Write(('x' * {bytes}))"));
+        } else {
+            let redirect = if stderr { " >&2" } else { "" };
+            command
+                .arg("-c")
+                .arg(format!("head -c {bytes} /dev/zero{redirect}"));
+        }
+        command
+    }
+
+    #[test]
+    fn search_command_accepts_normal_response() {
+        let response = run_search_command(output_command(false, 128)).unwrap();
+        assert_eq!(response.len(), 128);
+    }
+
+    #[test]
+    fn search_command_rejects_fast_oversized_stdout() {
+        let error = run_search_command(output_command(false, MAX_RESPONSE_BYTES + 1)).unwrap_err();
+        assert!(error.contains("response exceeds"), "{error}");
+    }
+
+    #[test]
+    fn search_command_rejects_fast_oversized_stderr() {
+        let response = run_search_command(output_command(false, 1)).unwrap();
+        assert_eq!(response.len(), 1);
+
+        let error = run_search_command(output_command(true, MAX_STDERR_BYTES + 1)).unwrap_err();
+        assert!(error.contains("stderr exceeds"), "{error}");
+    }
 
     #[test]
     fn url_codec_preserves_accented_cjk_and_emoji_text() {
