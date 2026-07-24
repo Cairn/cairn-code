@@ -1,10 +1,11 @@
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use cairn_code::agent::Agent;
 use cairn_code::config::Config;
@@ -96,7 +97,7 @@ fn serve_once(listener: TcpListener, response: &[u8], capture: &PathBuf) {
     for _ in 0..3 {
         // Idle-out between connections so a finished CLI cannot leave this
         // thread blocked on accept forever (main waits on server.join()).
-        let idle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let idle_deadline = std::time::Instant::now() + Duration::from_secs(5);
         let (mut stream, _) = loop {
             match listener.accept() {
                 Ok(pair) => break pair,
@@ -104,21 +105,32 @@ fn serve_once(listener: TcpListener, response: &[u8], capture: &PathBuf) {
                     if std::time::Instant::now() >= idle_deadline {
                         return;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(_) => return,
             }
         };
-        // Bound each client read so a half-open connection cannot hang serve_once.
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .unwrap();
+        // Accepted sockets can inherit nonblocking from the listener (macOS).
+        // Force blocking + timeouts so WouldBlock is not treated as EOF and the
+        // client does not see Connection reset mid-request.
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
         let mut request = Vec::new();
         let mut buffer = [0; 4096];
         let body_end = loop {
             let read = match stream.read(&mut buffer) {
-                Ok(n) if n > 0 => n,
-                _ => break 0,
+                Ok(0) => break 0,
+                Ok(n) => n,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break 0;
+                }
+                Err(_) => break 0,
             };
             request.extend_from_slice(&buffer[..read]);
             if let Some(index) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
@@ -126,7 +138,8 @@ fn serve_once(listener: TcpListener, response: &[u8], capture: &PathBuf) {
             }
         };
         if body_end == 0 {
-            break;
+            let _ = stream.shutdown(Shutdown::Both);
+            continue;
         }
         let headers = String::from_utf8_lossy(&request[..body_end]);
         let content_length = headers
@@ -139,14 +152,16 @@ fn serve_once(listener: TcpListener, response: &[u8], capture: &PathBuf) {
             .unwrap_or(0);
         while request.len() - body_end < content_length {
             let read = match stream.read(&mut buffer) {
-                Ok(n) if n > 0 => n,
-                _ => break,
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
             };
             request.extend_from_slice(&buffer[..read]);
         }
         // Read timeout can stop body collection early; never slice past what
         // actually arrived or the server thread panics and join().unwrap fails.
         if request.len() < body_end.saturating_add(content_length) {
+            let _ = stream.shutdown(Shutdown::Both);
             continue;
         }
         if first {
@@ -167,6 +182,8 @@ fn serve_once(listener: TcpListener, response: &[u8], capture: &PathBuf) {
             let _ = stream.write_all(resp_header.as_bytes());
             let _ = stream.write_all(done_resp.as_bytes());
         }
+        let _ = stream.flush();
+        let _ = stream.shutdown(Shutdown::Write);
     }
 }
 
