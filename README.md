@@ -30,12 +30,22 @@ A Rust-based CLI LLM coding agent, inspired by Claude Code and Zero. Built by Ca
 ### Prerequisites
 
 - Rust 1.96+
-- [curl](https://curl.se/) installed and on PATH (used by the `web_fetch` and `web_search` tools)
+- [curl](https://curl.se/) installed and on PATH (used for all provider HTTP requests and web tools)
 
 ### Build
 
 ```bash
 cargo build --release
+```
+
+Before submitting changes, run the same core quality checks enforced by CI:
+
+```bash
+rustfmt --edition 2021 --check path/to/changed.rs
+cargo clippy --locked --all-targets --all-features -- -A clippy::approx_constant
+cargo test --locked
+cargo doc --locked --no-deps
+cargo package --locked
 ```
 
 ### Configure
@@ -93,7 +103,7 @@ src/
   agent.rs               Core agentic loop (LLM call -> tool use -> repeat)
   config.rs              Configuration loading and merging (JSON + env vars)
   cost.rs                Model pricing tables and cost estimation
-  http_client.rs         HTTP client via ureq (blocking + streaming)
+  http_client.rs         Provider HTTP transport via curl (blocking + streaming)
   json.rs                Hand-written recursive descent JSON parser
   markdown.rs            Markdown rendering + syntect code-block highlighting
   session.rs             Session persistence (save/load/list)
