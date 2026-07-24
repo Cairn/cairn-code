@@ -127,7 +127,8 @@ fn main() -> ExitCode {
     }
     let skills = skills::load_skills();
     let skills_for_agent = skills.clone();
-    let (tool_registry, mcp_runtime) = tools::registry::build_registry(skills, &cfg.mcp);
+    let (tool_registry, mcp_runtime) =
+        tools::registry::build_registry(skills, &cfg.mcp, &cfg.subagents);
     let mcp_warnings = mcp_runtime.warnings.clone();
     let mcp_tool_count = mcp_runtime.tool_names.len();
     let skill_count = skills_for_agent.len();

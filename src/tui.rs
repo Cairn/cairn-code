@@ -114,6 +114,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "session management",
     ),
     ("/skills · /mcp", "list skills and MCP servers"),
+    ("/subagent", "list or run external harnesses (claude, agy, …)"),
     (
         "/reset · /reset apply",
         "ChatGPT banked rate-limit resets (OpenAI OAuth)",
@@ -137,6 +138,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Sounds", "CAIRN_SOUND=0 to mute"),
     ("Skills", "packs as <dir>/<name>/SKILL.md"),
     ("MCP", "stdio servers in config · tools need permission"),
+    ("Subagent", "headless external harnesses; see /subagent list"),
 ];
 /// Rows for the `?` shortcuts panel (keys must match real bindings in handle_key).
 const SHORTCUT_ROWS: &[(&str, &str)] = &[
@@ -2089,6 +2091,9 @@ impl Tui {
                     });
                 }
             }
+            "/subagent" => {
+                self.handle_subagent_command(&parts[1..]);
+            }
             "/mcp" => {
                 let cfg = match crate::config::Config::load() {
                     Ok(cfg) => cfg,
@@ -2521,6 +2526,124 @@ impl Tui {
         }
         self.ctrl_c_exit_armed = true;
         true
+    }
+
+    /// `/subagent` [list|help|<harness> <prompt…>] — external harness runner.
+    fn handle_subagent_command(&mut self, args: &[&str]) {
+        let cfg = match crate::config::Config::load() {
+            Ok(cfg) => cfg,
+            Err(error) => {
+                self.output_lines.push(OutputLine {
+                    type_: "error".into(),
+                    content: format!("Error loading configuration: {error}"),
+                    tool_name: String::new(),
+                    duration: String::new(),
+                });
+                return;
+            }
+        };
+        let sub = &cfg.subagents;
+        if args.is_empty()
+            || matches!(
+                args[0].to_ascii_lowercase().as_str(),
+                "list" | "ls" | "help" | "?"
+            )
+        {
+            let mut body = crate::tools::subagent::format_list(sub);
+            if matches!(
+                args.first().map(|s| s.to_ascii_lowercase()).as_deref(),
+                Some("help" | "?")
+            ) {
+                body.push_str(
+                    "\n\nExamples:\n  /subagent list\n  /subagent claude summarize this repo in one paragraph\n  /subagent agy review src/main.rs for error handling",
+                );
+            }
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: body,
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        }
+
+        if !matches!(self.state, State::Idle) {
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: "Wait for the current turn to finish before running /subagent.".into(),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        }
+
+        let harness_name = args[0];
+        let prompt = args[1..].join(" ");
+        if prompt.trim().is_empty() {
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: format!(
+                    "Usage: /subagent {harness_name} <prompt…>\nOr: /subagent list"
+                ),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        }
+
+        let harness = match crate::tools::subagent::resolve_harness(sub, harness_name) {
+            Ok(h) => h,
+            Err(e) => {
+                self.output_lines.push(OutputLine {
+                    type_: "error".into(),
+                    content: e,
+                    tool_name: String::new(),
+                    duration: String::new(),
+                });
+                return;
+            }
+        };
+
+        self.output_lines.push(OutputLine {
+            type_: "system".into(),
+            content: format!(
+                "Running subagent harness={harness_name} (binary={})…",
+                harness.command
+            ),
+            tool_name: String::new(),
+            duration: String::new(),
+        });
+
+        let timeout = harness
+            .timeout_ms
+            .unwrap_or(sub.default_timeout_ms);
+        let result = crate::tools::subagent::run_harness(
+            harness_name,
+            &harness,
+            &prompt,
+            timeout,
+            None,
+            &[],
+            self.cancel_flag.as_deref(),
+        );
+        match result {
+            Ok(out) => {
+                self.output_lines.push(OutputLine {
+                    type_: "tool_result".into(),
+                    content: out,
+                    tool_name: "subagent".into(),
+                    duration: String::new(),
+                });
+            }
+            Err(e) => {
+                self.output_lines.push(OutputLine {
+                    type_: "error".into(),
+                    content: e,
+                    tool_name: String::new(),
+                    duration: String::new(),
+                });
+            }
+        }
     }
 
     fn open_theme_picker(&mut self) {
@@ -4256,6 +4379,7 @@ fn completion_wants_trailing_space(completion: &str) -> bool {
             | "/thinking"
             | "/suggestions"
             | "/mouse"
+            | "/subagent"
     )
 }
 
@@ -4667,6 +4791,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/select", "Plain-text view for terminal selection"),
     ("/sessions", "List saved sessions"),
     ("/skills", "List available skills"),
+    ("/subagent", "List or run an external harness subagent"),
     ("/suggestions", "Toggle idle prompt suggestions"),
     ("/theme", "Change the color theme"),
     ("/thinking", "Toggle thinking output"),
@@ -4686,6 +4811,10 @@ pub(crate) fn slash_completion_help(completion: &str) -> Option<&'static str> {
         ["/auth", "status"] => Some("Show credential status"),
         ["/auth", "key"] => Some("Paste an API key"),
         ["/theme", "list"] => Some("List theme names"),
+        ["/subagent", "list"] => Some("List harnesses"),
+        ["/subagent", "help"] => Some("Usage"),
+        ["/subagent", _, _, ..] => Some("prompt"),
+        ["/subagent", _] => Some("harness"),
         ["/reset", "list"] => Some("List banked rate-limit resets"),
         ["/reset", "apply"] => Some("Apply a banked rate-limit reset"),
         ["/reset", "status"] => Some("Show rate-limit reset status"),

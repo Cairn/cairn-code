@@ -51,6 +51,7 @@ impl Tool for GoTool {
             timeout: Some(GO_TIMEOUT),
             head_chars: HEAD_CHARS,
             tail_chars: TAIL_CHARS,
+            stdin: None,
         };
         let result = match process_runner::run(command, &options, Some(cancel)) {
             Ok(result) => result,

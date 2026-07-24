@@ -188,6 +188,7 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | `/theme` | Pick a TUI theme (live preview); `/theme list` or `/theme <name>` |
 | `/auth` | OAuth: `/auth login xai` (browser), `/auth logout xai`, `/auth status`; `/auth key xai` to paste an API key instead |
 | `/reset` | List or redeem ChatGPT Plus/Pro banked Codex rate-limit resets (`/reset apply`). Requires OpenAI ChatGPT OAuth (Codex `auth.json` or cairn `oauth:openai`); not API keys |
+| `/subagent` | List external harnesses, or run one headlessly: `/subagent <harness> <prompt…>` (builtins: `claude`, `agy`, `grok`, `zero`). Also available as the `subagent` tool. Disable with `subagents.enabled: false` or `CAIRN_SUBAGENTS=0` |
 | `Ctrl+C` | Interrupt a run; clear prompt when idle with text; press again on empty prompt to exit |
 | *(after LLM error)* | Prompt: switch model (`m`), switch provider (`p`), or dismiss (`d`/Esc) |
 | `/save` | Save the current session |
@@ -210,6 +211,9 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | `permissions.ask` | []string | `[]` | Tools that require confirmation |
 | `permissions.deny` | []string | `[]` | Tools to block |
 | `debug_log_requests` | bool | `false` | Write provider request *metadata* (URL origin only, header names, body size - never URL paths, header values, body content, or secrets) to `~/.config/cairn-code/debug_request.json` for troubleshooting. Also toggled with `CAIRN_DEBUG_HTTP=1`. Any legacy full-request dump is removed at startup. The file is overwritten (never appended) on every request and, on Unix, created with owner-only (`0600`) permissions. |
+| `subagents.enabled` | bool | `true` | Register the `subagent` tool and allow `/subagent`. Also disabled by `CAIRN_SUBAGENTS=0`. |
+| `subagents.default_timeout_ms` | int | `600000` | Default wall-clock timeout for harness runs (10 minutes). |
+| `subagents.harnesses.<name>` | object | (builtins) | Override or add a harness: `{ "command", "args", "prompt": "arg"\|"stdin", "timeout_ms"? }`. Builtins: `claude` (`claude -p`), `agy` (`agy -p`), `grok` (`grok -p`), `zero` (`zero exec`). |
 
 ## License
 
