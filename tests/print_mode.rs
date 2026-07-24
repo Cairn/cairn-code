@@ -2,6 +2,37 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[test]
+fn unknown_option_uses_stderr_and_nonzero_status() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cairn-code"))
+        .arg("--unknown")
+        .output()
+        .expect("run cairn-code");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "unexpected success: {output:?}");
+    assert!(output.stdout.is_empty(), "unexpected stdout: {output:?}");
+    assert!(stderr.contains("unknown option '--unknown'"), "{stderr}");
+    assert!(stderr.contains("--help"), "{stderr}");
+}
+
+#[test]
+fn multiple_prompts_use_stderr_and_nonzero_status() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cairn-code"))
+        .args(["first prompt", "second prompt"])
+        .output()
+        .expect("run cairn-code");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "unexpected success: {output:?}");
+    assert!(output.stdout.is_empty(), "unexpected stdout: {output:?}");
+    assert!(
+        stderr.contains("unexpected positional argument 'second prompt'"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("one quoted argument"), "{stderr}");
+}
+
+#[test]
 fn stdin_provider_failure_uses_stderr_and_nonzero_status() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_cairn-code"))
         .arg("--print")
