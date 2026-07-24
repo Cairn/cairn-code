@@ -62,21 +62,45 @@ fn validate_id(id: &str) -> Result<(), String> {
 pub fn save(sessions_dir: &str, session: &Session) -> Result<(), String> {
     validate_id(&session.id)?;
     let dir = PathBuf::from(sessions_dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(&dir).map_err(|e| format!("mkdir: {e}"))?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("set session directory permissions: {e}"))?;
+    }
+    #[cfg(not(unix))]
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
 
     let path = dir.join(&session.id);
     let temp_path = dir.join(format!(".{}.{}.tmp", session.id, new_id()));
     let json = session_to_json(session)?;
     let write_result = (|| -> Result<(), String> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(&temp_path)
             .map_err(|e| format!("create temporary session: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("set temporary session permissions: {e}"))?;
+        }
         file.write_all(json.as_bytes())
             .map_err(|e| format!("write temporary session: {e}"))?;
         file.sync_all()
             .map_err(|e| format!("sync temporary session: {e}"))?;
+        drop(file);
         fs::rename(&temp_path, &path).map_err(|e| format!("replace session: {e}"))?;
         Ok(())
     })();
@@ -422,7 +446,7 @@ mod tests {
             },
         ];
 
-        let session = Session {
+        let mut session = Session {
             id: test_id.clone(),
             messages: msgs,
             model: "claude-sonnet-4".into(),
@@ -445,6 +469,71 @@ mod tests {
         assert_eq!(loaded.model, "claude-sonnet-4");
         assert_eq!(loaded.tokens_in, 10);
         assert_eq!(loaded.tokens_out, 20);
+
+        session.messages.push(Message {
+            role: "user".into(),
+            content: crate::llm::Content::Text("follow-up".into()),
+        });
+        session.updated_at = 1;
+        save(&dir_str, &session).unwrap();
+
+        let loaded = load(&dir_str, &test_id).unwrap();
+        assert_eq!(loaded.messages.len(), 3);
+        assert_eq!(loaded.updated_at, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_enforces_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("sessions");
+        let dir_str = dir.to_string_lossy().to_string();
+        let test_id = format!("test-{}", new_id());
+        let mut session = Session {
+            id: test_id.clone(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: crate::llm::Content::Text("first".into()),
+            }],
+            model: "mock".into(),
+            provider: "mock".into(),
+            tokens_in: 1,
+            tokens_out: 2,
+            created_at: 3,
+            updated_at: 4,
+        };
+
+        save(&dir_str, &session).unwrap();
+        let path = dir.join(&test_id);
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        session.messages[0].content = crate::llm::Content::Text("replacement".into());
+        save(&dir_str, &session).unwrap();
+
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let loaded = load(&dir_str, &test_id).unwrap();
+        assert!(matches!(
+            &loaded.messages[0].content,
+            crate::llm::Content::Text(text) if text == "replacement"
+        ));
     }
 
     #[test]
