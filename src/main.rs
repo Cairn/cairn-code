@@ -158,7 +158,6 @@ fn main() {
                                 match crate::oauth::poll_xai_device_token(&auth, &cancel2) {
                                     Ok(token) => match crate::oauth::save_token("xai", &token) {
                                         Ok(()) => {
-                                            std::env::set_var("XAI_API_KEY", &token.access_token);
                                             "xAI OAuth login saved to the OS keyring. You can select provider xai now.".to_string()
                                         }
                                         Err(e) => {

@@ -528,7 +528,8 @@ pub fn apply_key_to_env(provider: &str, key: &str) {
     }
 }
 
-/// Load any keyring-stored keys into the environment when the env var is unset.
+/// Load any keyring-stored API keys into the environment when the env var is unset.
+/// OAuth tokens stay in the OAuth keyring so providers use the refresh-aware accessor.
 pub fn hydrate_env_from_keyring() {
     for provider in ["anthropic", "openai", "openrouter", "opengateway", "xai"] {
         if env_key_for(provider).is_some() {
@@ -536,13 +537,6 @@ pub fn hydrate_env_from_keyring() {
         }
         if let Some(key) = config_get_api_key(provider) {
             apply_key_to_env(provider, &key);
-            continue;
-        }
-        // OAuth access token for providers that support device login (xAI).
-        if crate::oauth::supports_oauth(provider) {
-            if let Some(tok) = crate::oauth::access_token(provider) {
-                apply_key_to_env(provider, &tok);
-            }
         }
     }
 }
@@ -1032,7 +1026,10 @@ mod tests {
             obj.get("system_prompt_file").and_then(|v| v.as_str()),
             Some("user-prompt.md")
         );
-        assert_eq!(obj.get("theme").and_then(|v| v.as_str()), Some("user-theme"));
+        assert_eq!(
+            obj.get("theme").and_then(|v| v.as_str()),
+            Some("user-theme")
+        );
         assert_eq!(
             obj.get("show_thinking").and_then(|v| v.as_bool()),
             Some(false)
@@ -1042,10 +1039,7 @@ mod tests {
             Some(true)
         );
         assert!(obj.get("trusted_workspaces").is_some());
-        let permissions = obj
-            .get("permissions")
-            .and_then(|v| v.as_object())
-            .unwrap();
+        let permissions = obj.get("permissions").and_then(|v| v.as_object()).unwrap();
         assert_eq!(
             permissions
                 .get("auto_allow")
