@@ -338,6 +338,7 @@ dependencies = [
  "cap-std",
  "keyring",
  "ratatui",
+ "serde_json",
  "syntect",
 ]
 

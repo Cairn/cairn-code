@@ -16,8 +16,8 @@ impl fmt::Display for JsonValue {
         match self {
             JsonValue::Null => write!(f, "null"),
             JsonValue::Bool(b) => write!(f, "{b}"),
-            JsonValue::Number(n) => write!(f, "{n}"),
-            JsonValue::String(s) => write!(f, "\"{s}\""),
+            JsonValue::Number(n) => write!(f, "{}", serde_json::to_string(n).map_err(|_| fmt::Error)?),
+            JsonValue::String(s) => write!(f, "{}", serde_json::to_string(s).map_err(|_| fmt::Error)?),
             JsonValue::Array(arr) => {
                 write!(f, "[")?;
                 for (i, v) in arr.iter().enumerate() {
@@ -32,7 +32,7 @@ impl fmt::Display for JsonValue {
                 for (k, v) in obj {
                     if !first { write!(f, ",")?; }
                     first = false;
-                    write!(f, "\"{k}\":{v}")?;
+                    write!(f, "{}:{v}", serde_json::to_string(k).map_err(|_| fmt::Error)?)?;
                 }
                 write!(f, "}}")
             }
@@ -123,15 +123,11 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> Result<JsonValue, JsonError> {
-        self.skip_whitespace();
-        if self.pos >= self.input.len() {
-            return Err(self.err("unexpected end of input"));
-        }
-        let val = self.parse_value()?;
-        self.skip_whitespace();
-        Ok(val)
+        let input = std::str::from_utf8(&self.input).map_err(|_| self.err("invalid UTF-8"))?;
+        parse_standard(input)
     }
 
+    #[allow(dead_code)]
     fn parse_value(&mut self) -> Result<JsonValue, JsonError> {
         self.skip_whitespace();
         if self.pos >= self.input.len() {
@@ -170,6 +166,8 @@ impl Parser {
                         b'"' => s.push('"'),
                         b'\\' => s.push('\\'),
                         b'/' => s.push('/'),
+                        b'b' => s.push('\u{0008}'),
+                        b'f' => s.push('\u{000c}'),
                         b'n' => s.push('\n'),
                         b'r' => s.push('\r'),
                         b't' => s.push('\t'),
@@ -347,6 +345,43 @@ pub fn parse(input: &str) -> Result<JsonValue, JsonError> {
     Parser::new(input).parse()
 }
 
+fn parse_standard(input: &str) -> Result<JsonValue, JsonError> {
+    const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+
+    if input.len() > MAX_INPUT_BYTES {
+        return Err(JsonError {
+            message: format!("input exceeds {MAX_INPUT_BYTES} byte limit"),
+            pos: MAX_INPUT_BYTES,
+        });
+    }
+
+    let value = serde_json::from_str(input).map_err(|error| JsonError {
+        message: error.to_string(),
+        pos: input
+            .split_inclusive('\n')
+            .take(error.line().saturating_sub(1))
+            .map(str::len)
+            .sum::<usize>()
+            + error.column().saturating_sub(1),
+    })?;
+    Ok(from_serde_json(value))
+}
+
+fn from_serde_json(value: serde_json::Value) -> JsonValue {
+    match value {
+        serde_json::Value::Null => JsonValue::Null,
+        serde_json::Value::Bool(value) => JsonValue::Bool(value),
+        serde_json::Value::Number(value) => JsonValue::Number(value.as_f64().unwrap()),
+        serde_json::Value::String(value) => JsonValue::String(value),
+        serde_json::Value::Array(values) => {
+            JsonValue::Array(values.into_iter().map(from_serde_json).collect())
+        }
+        serde_json::Value::Object(values) => JsonValue::Object(
+            values.into_iter().map(|(key, value)| (key, from_serde_json(value))).collect(),
+        ),
+    }
+}
+
 pub fn serialize(val: &JsonValue) -> String {
     val.to_string()
 }
@@ -453,6 +488,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_rejects_trailing_data() {
+        assert!(parse("null true").is_err());
+    }
+
+    #[test]
+    fn test_parse_rejects_excessive_nesting() {
+        let input = format!("{}null{}", "[".repeat(128), "]".repeat(128));
+        assert!(parse(&input).is_err());
+    }
+
+    #[test]
+    fn test_parse_rejects_oversized_input() {
+        let input = format!(r#""{}""#, "a".repeat(16 * 1024 * 1024));
+        assert!(parse(&input).is_err());
+    }
+
+    #[test]
     fn test_roundtrip_null() {
         let v = JsonValue::Null;
         let s = serialize(&v);
@@ -471,6 +523,42 @@ mod tests {
         let s = serialize(&v);
         let back = parse(&s).unwrap();
         assert_eq!(v, back);
+    }
+
+    #[test]
+    fn test_serialize_escapes_string_characters() {
+        let value = JsonValue::String("quote\" slash\\ line\nreturn\rtab\tbackspace\u{0008}formfeed\u{000c}nul\u{0000}".into());
+
+        let serialized = serialize(&value);
+
+        assert_eq!(
+            serialized,
+            r#""quote\" slash\\ line\nreturn\rtab\tbackspace\bformfeed\fnul\u0000""#
+        );
+        assert_eq!(parse(&serialized).unwrap(), value);
+        assert!(serde_json::from_str::<serde_json::Value>(&serialized).is_ok());
+    }
+
+    #[test]
+    fn test_serialize_escapes_object_keys() {
+        let key = "quote\" slash\\ line\ncontrol\u{0001}";
+        let value = JsonValue::Object(HashMap::from([(
+            key.into(),
+            JsonValue::String("value".into()),
+        )]));
+
+        let serialized = serialize(&value);
+
+        assert_eq!(serialized, r#"{"quote\" slash\\ line\ncontrol\u0001":"value"}"#);
+        assert_eq!(parse(&serialized).unwrap(), value);
+        assert!(serde_json::from_str::<serde_json::Value>(&serialized).is_ok());
+    }
+
+    #[test]
+    fn test_serialize_non_finite_numbers_as_null() {
+        assert_eq!(serialize(&JsonValue::Number(f64::NAN)), "null");
+        assert_eq!(serialize(&JsonValue::Number(f64::INFINITY)), "null");
+        assert_eq!(serialize(&JsonValue::Number(f64::NEG_INFINITY)), "null");
     }
 
     #[test]
