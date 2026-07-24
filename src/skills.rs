@@ -83,8 +83,7 @@ pub fn builtin_skills() -> Vec<Skill> {
 
 /// Merge disk-loaded skills with builtins. Existing names are kept (disk wins).
 pub fn with_builtins(mut disk: Vec<Skill>) -> Vec<Skill> {
-    let mut seen: std::collections::HashSet<String> =
-        disk.iter().map(|s| s.name.clone()).collect();
+    let mut seen: std::collections::HashSet<String> = disk.iter().map(|s| s.name.clone()).collect();
     for skill in builtin_skills() {
         if seen.insert(skill.name.clone()) {
             disk.push(skill);
@@ -335,8 +334,10 @@ mod tests {
         let skills = with_builtins(Vec::new());
         let s = find_skill(&skills, "roast-me").expect("builtin roast-me");
         assert!(s.content.contains("Roast Me") || s.content.contains("# Roast"));
-        assert!(s.description.to_ascii_lowercase().contains("architecture")
-            || s.description.to_ascii_lowercase().contains("constructive"));
+        assert!(
+            s.description.to_ascii_lowercase().contains("architecture")
+                || s.description.to_ascii_lowercase().contains("constructive")
+        );
         assert!(s.path.to_string_lossy().starts_with("builtin:"));
     }
 
@@ -354,10 +355,7 @@ mod tests {
         assert!(s.content.contains("Custom disk body"));
         assert!(!s.path.to_string_lossy().starts_with("builtin:"));
         // Builtin still fills other names only; roast-me must appear once.
-        assert_eq!(
-            skills.iter().filter(|s| s.name == "roast-me").count(),
-            1
-        );
+        assert_eq!(skills.iter().filter(|s| s.name == "roast-me").count(), 1);
     }
 
     #[test]
