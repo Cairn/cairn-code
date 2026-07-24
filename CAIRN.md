@@ -52,8 +52,8 @@ All commits made with Cairn Code must co-attribute the bot account so GitHub sho
 Co-Authored-By: cairn-code <282421612+cairn-code@users.noreply.github.com>
 ```
 
-- Prefer the **git** tool for commits: it appends this trailer automatically when you pass `-m` / `--message` (or `-F`).
-- If you must commit via **shell**, end the message with a blank line and that trailer yourself. Do not duplicate it if it is already present.
+- Prefer the **git** tool for commits: it adds this via `git commit --trailer` automatically (works with `-m`, `-F`, `-C`, etc.).
+- If you must commit via **shell**, pass the same trailer with `--trailer` or end the message with a blank line and that line. Do not duplicate it if it is already present.
 - Do not invent a different name or email for this trailer.
 
 ## Response Style
