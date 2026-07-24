@@ -4,7 +4,7 @@
 //! never written to the config file. Device-code (RFC 8628) is used so login
 //! works in SSH/headless sessions without a local browser callback.
 
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
@@ -84,47 +84,13 @@ pub fn xai_client_id() -> Result<String, String> {
     )
 }
 
+/// POST a form body to an OAuth endpoint. Delegates to the hardened HTTP
+/// helper so credential-bearing requests ignore the user's `.curlrc` (`-q`),
+/// carry connect/total timeouts, are size-bounded, and validate curl's exit
+/// status. Returns the raw `(status, body)` because the device-code and
+/// refresh flows must read error bodies (e.g. `authorization_pending`).
 fn form_post(url: &str, body: &str) -> Result<(u16, String), String> {
-    let mut cmd = Command::new("curl");
-    cmd.args([
-        "-sS",
-        "-i",
-        "-X",
-        "POST",
-        url,
-        "-H",
-        "Content-Type: application/x-www-form-urlencoded",
-        "-H",
-        "Accept: application/json",
-        "-H",
-        "Expect:",
-        "--data-binary",
-        "@-",
-    ]);
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("curl: {e}"))?;
-    let body = body.to_string();
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        let _ = stdin.write_all(body.as_bytes());
-    }
-    let output = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let split_at = raw
-        .find("\r\n\r\n")
-        .map(|i| i + 4)
-        .or_else(|| raw.find("\n\n").map(|i| i + 2))
-        .unwrap_or(0);
-    let status = raw
-        .get(..split_at)
-        .and_then(|h| h.lines().next())
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let body = raw.get(split_at..).unwrap_or("").to_string();
-    Ok((status, body))
+    crate::http_client::form_post(url, body)
 }
 
 fn form_encode(pairs: &[(&str, &str)]) -> String {
