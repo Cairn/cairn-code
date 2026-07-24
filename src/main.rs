@@ -122,6 +122,9 @@ fn main() {
                     }
                     let _ = event_tx.send(AgentEvent::Done);
                 }
+                Ok(cmd) if cmd == "__clear__" => {
+                    agent.reset_state();
+                }
                 Ok(cmd) if cmd.starts_with("__auth_login__:") => {
                     let provider = cmd.trim_start_matches("__auth_login__:").to_ascii_lowercase();
                     let msg = if provider == "xai" {
