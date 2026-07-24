@@ -14,6 +14,10 @@ pub enum AgentEvent {
     ToolUse(String, String),
     ToolResult(String, String, String),
     Error(String),
+    /// The run loop exited on a hard error rather than a user cancel, so the
+    /// transcript should be written to a crash log before it is lost.
+    /// Distinct from `Error`, which reports a recoverable per-turn failure.
+    Crashed(String),
     TurnEnd(llm::Usage),
     PermissionRequest(String, String),
     Compacted(usize),
@@ -411,7 +415,12 @@ impl Agent {
         if let Err(ref e) = result {
             let _ = tx.send(AgentEvent::Error(e.clone()));
         }
+        // Mirror first: the crash handler reads the transcript from it, so it
+        // has to hold this run's messages before `Crashed` is observed.
         self.sync_live_mirror();
+        if let Err(ref e) = result {
+            let _ = tx.send(AgentEvent::Crashed(e.clone()));
+        }
         let _ = tx.send(AgentEvent::Done);
         result
     }

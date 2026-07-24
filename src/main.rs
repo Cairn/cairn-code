@@ -9,6 +9,49 @@ use cairn_code::config::{self, Config};
 use cairn_code::llm::provider;
 use cairn_code::{http_client, llm, oauth, session, skills, tools, tui};
 
+/// Writes a crash log for a non-interactive run, where no TUI owns the
+/// transcript.
+///
+/// Best-effort by design: a failure to record the crash must not replace or
+/// mask the error that caused it, so problems here go to stderr and nothing
+/// else changes. A crash in `--print` or `exec` is exactly when the transcript
+/// matters most, since there is no scrollback to recover it from.
+fn write_noninteractive_crash_log(
+    mirror: &session::LiveMirror,
+    provider: &str,
+    model: &str,
+    error: &str,
+) {
+    let Ok(snapshot) = mirror.lock() else {
+        return;
+    };
+    if snapshot.messages.is_empty() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let sess = session::Session {
+        id: session::new_id(),
+        model: model.to_string(),
+        provider: provider.to_string(),
+        messages: snapshot.messages.clone(),
+        tokens_in: snapshot.tokens_in,
+        tokens_out: snapshot.tokens_out,
+        created_at: now,
+        updated_at: now,
+    };
+    let crash = session::CrashInfo {
+        error: error.to_string(),
+        backtrace: None,
+    };
+    match session::write_crash_log(&config::crash_logs_dir(), &sess, &crash) {
+        Ok(path) => eprintln!("Crash log saved to {path}"),
+        Err(e) => eprintln!("Could not write crash log: {e}"),
+    }
+}
+
 fn main() -> ExitCode {
     let version = env!("CARGO_PKG_VERSION");
     let mut is_print_mode = false;
@@ -185,6 +228,8 @@ fn main() -> ExitCode {
             }
         });
 
+        let exec_provider = chosen_provider.name().to_string();
+        let exec_model = p_model.clone();
         let mut agent = Agent::new_with_skills(
             chosen_provider,
             p_model,
@@ -192,6 +237,8 @@ fn main() -> ExitCode {
             cfg,
             skills_for_agent,
         );
+        let exec_mirror = session::new_live_mirror();
+        agent.set_live_mirror(exec_mirror.clone());
 
         thread::spawn(move || {
             let _ = agent.run(&prompt, event_tx, &cancel2, &perm_rx);
@@ -251,6 +298,12 @@ fn main() -> ExitCode {
                         })
                     );
                 }
+                AgentEvent::Crashed(err) => {
+                    // The structured `error` event above already told the
+                    // caller what failed; this preserves the transcript so the
+                    // run can be resumed rather than retyped.
+                    write_noninteractive_crash_log(&exec_mirror, &exec_provider, &exec_model, &err);
+                }
                 AgentEvent::Done => break,
                 _ => {}
             }
@@ -297,6 +350,8 @@ fn main() -> ExitCode {
             }
         };
 
+        let print_provider = chosen_provider.name().to_string();
+        let print_model = p_model.clone();
         let mut agent = Agent::new_with_skills(
             chosen_provider,
             p_model.clone(),
@@ -304,6 +359,8 @@ fn main() -> ExitCode {
             cfg,
             skills_for_agent,
         );
+        let print_mirror = session::new_live_mirror();
+        agent.set_live_mirror(print_mirror.clone());
         return match agent.run_simple(&prompt) {
             Ok(output) => {
                 println!("{}", tui::sanitize_terminal_output(&output));
@@ -311,6 +368,12 @@ fn main() -> ExitCode {
             }
             Err(error) => {
                 eprintln!("Error: {error}");
+                write_noninteractive_crash_log(
+                    &print_mirror,
+                    &print_provider,
+                    &print_model,
+                    &error,
+                );
                 ExitCode::FAILURE
             }
         };

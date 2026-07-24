@@ -660,6 +660,9 @@ impl Tui {
                             // drop everything since the previous Done/exit save.
                             self.checkpoint_session();
                         }
+                        AgentEvent::Crashed(error) => {
+                            self.write_crash_log(&error);
+                        }
                         AgentEvent::Done => {
                             self.flush_streaming();
                             self.state = State::Idle;
@@ -2248,6 +2251,9 @@ impl Tui {
             "/sessions" => {
                 self.list_sessions();
             }
+            "/crashes" => {
+                self.list_crashes();
+            }
             "/delete" => {
                 if parts.len() > 1 {
                     let query = parts[1..].join(" ");
@@ -2884,6 +2890,71 @@ impl Tui {
 
     /// Save (or update) the current session. When `announce` is true, print a
     /// system line (manual `/save`). Autosave stays quiet unless it fails.
+    /// Writes the transcript and the error that ended the run to the crash-log
+    /// directory, then tells the user where it went.
+    ///
+    /// Reuses `session_snapshot` rather than reading the live mirror directly,
+    /// so a run that crashed before the mirror was populated still records what
+    /// is on screen. Reuses the session's own id so the crash log is traceable
+    /// to the conversation already being checkpointed rather than appearing as
+    /// an unrelated transcript.
+    fn write_crash_log(&mut self, error: &str) {
+        let (messages, tokens_in, tokens_out) = self.session_snapshot();
+        if messages.is_empty() {
+            // A crash before any exchange leaves nothing worth preserving, and
+            // an empty transcript is more confusing than no file.
+            return;
+        }
+        self.ensure_session_identity();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let id = self
+            .current_session_id
+            .clone()
+            .unwrap_or_else(session::new_id);
+        let created_at = if self.session_created_at > 0 {
+            self.session_created_at
+        } else {
+            now
+        };
+        let sess = session::Session {
+            id,
+            model: self.model.clone(),
+            provider: self.provider.clone(),
+            messages,
+            tokens_in,
+            tokens_out,
+            created_at,
+            updated_at: now,
+        };
+        let crash = session::CrashInfo {
+            error: error.to_string(),
+            // Only when the user asked for one: a backtrace here is a
+            // diagnostic aid, not something to collect by default.
+            backtrace: std::env::var("RUST_BACKTRACE")
+                .ok()
+                .filter(|v| v == "1" || v == "full")
+                .map(|_| format!("{}", std::backtrace::Backtrace::force_capture())),
+        };
+        let content =
+            match session::write_crash_log(&crate::config::crash_logs_dir(), &sess, &crash) {
+                Ok(path) => {
+                    format!("Crash log saved to {path} — /resume restores this conversation")
+                }
+                // Reported rather than swallowed: if the transcript could not be
+                // preserved, the user should know before they close the terminal.
+                Err(e) => format!("Could not write crash log: {e}"),
+            };
+        self.output_lines.push(OutputLine {
+            type_: "system".into(),
+            content,
+            tool_name: String::new(),
+            duration: String::new(),
+        });
+    }
+
     fn autosave_session(&mut self, announce: bool) {
         let (messages, tokens_in, tokens_out) = self.session_snapshot();
         if messages.is_empty() {
@@ -2955,6 +3026,44 @@ impl Tui {
 
     fn save_session(&mut self) {
         self.autosave_session(true);
+    }
+
+    /// Lists crash transcripts with the error that produced each one.
+    ///
+    /// Separate from `/sessions` so an ordinary session list is not diluted by
+    /// failures, and so the error is shown alongside — a crash transcript is
+    /// far less useful without knowing what ended it.
+    fn list_crashes(&mut self) {
+        let dir = crate::config::crash_logs_dir();
+        let crashes = session::list(&dir).unwrap_or_default();
+        if crashes.is_empty() {
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: "No crash logs.".into(),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        }
+        let mut msg = String::from("Crash logs (/resume <id> to restore):\n");
+        for c in &crashes {
+            msg.push_str(&format!(
+                "  {}  {}  {} msgs  {}\n",
+                c.id,
+                c.model,
+                c.msg_count,
+                format_timestamp(c.updated_at)
+            ));
+            if let Some(error) = session::read_crash_error(&dir, &c.id) {
+                msg.push_str(&format!("    {}\n", truncate_summary(&error, 70)));
+            }
+        }
+        self.output_lines.push(OutputLine {
+            type_: "system".into(),
+            content: msg.trim_end().to_string(),
+            tool_name: String::new(),
+            duration: String::new(),
+        });
     }
 
     fn list_sessions(&mut self) {
@@ -4652,6 +4761,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/compact", "Summarize the conversation to free context"),
     ("/copy", "Copy the last reply to the clipboard"),
     ("/cost", "Show token usage and estimated cost"),
+    ("/crashes", "List crash logs from failed runs"),
     ("/delete", "Delete a saved session"),
     ("/exit", "Exit Cairn"),
     ("/help", "List commands and keybindings"),
