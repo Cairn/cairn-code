@@ -2730,9 +2730,9 @@ impl Tui {
 
         let mut lines: Vec<Line> = Vec::new();
 
-        // Welcome box (Claude Code style: rounded frame in accent orange/red).
-        let w = area.width.saturating_sub(2) as usize;
-        let pw = w.min(58);
+        // Welcome box (Claude Code style): full terminal width rounded frame.
+        // Inner content width is terminal cols minus the two border glyphs.
+        let pw = (area.width as usize).saturating_sub(2).max(1);
         let pad = |s: &str| {
             let dw = display_width(s);
             if dw < pw {
@@ -2754,7 +2754,6 @@ impl Tui {
                 out
             }
         };
-        let sp = " ".repeat((area.width as usize).saturating_sub(pw + 4));
         let box_style = orange;
 
         lines.push(Line::from(Span::styled(
@@ -2764,12 +2763,12 @@ impl Tui {
         lines.push(Line::from(vec![
             Span::styled("│", box_style),
             Span::styled(pad(&format!("  ⚡ Cairn Code v{}", self.version)), bright),
-            Span::styled(format!("│{sp}"), box_style),
+            Span::styled("│", box_style),
         ]));
         lines.push(Line::from(vec![
             Span::styled("│", box_style),
             Span::styled(pad("  open terminal coding agent  ·  /help"), dim),
-            Span::styled(format!("│{sp}"), box_style),
+            Span::styled("│", box_style),
         ]));
         lines.push(Line::from(Span::styled(
             format!("├{}┤", "─".repeat(pw)),
@@ -2781,12 +2780,12 @@ impl Tui {
                 pad(&format!("  Model   {} / {}", self.provider, self.model)),
                 dim,
             ),
-            Span::styled(format!("│{sp}"), box_style),
+            Span::styled("│", box_style),
         ]));
         lines.push(Line::from(vec![
             Span::styled("│", box_style),
             Span::styled(pad(&format!("  Path    {}", self.work_dir)), dim),
-            Span::styled(format!("│{sp}"), box_style),
+            Span::styled("│", box_style),
         ]));
         lines.push(Line::from(Span::styled(
             format!("╰{}╯", "─".repeat(pw)),
