@@ -544,20 +544,14 @@ mod tests {
     #[test]
     fn light_and_solarized_light_are_dark_on_light() {
         let light = lookup("light");
-        assert!(matches!(
-            light.ink.fg,
-            Some(Color::Rgb(0x22, 0x20, 0x1a))
-        ));
+        assert!(matches!(light.ink.fg, Some(Color::Rgb(0x22, 0x20, 0x1a))));
         assert!(matches!(
             light.accent_fg.fg,
             Some(Color::Rgb(0x54, 0x70, 0x0a))
         ));
         let solar = lookup("Solarized Light");
         assert_eq!(solar.name, "solarized-light");
-        assert!(matches!(
-            solar.ink.fg,
-            Some(Color::Rgb(0x30, 0x40, 0x49))
-        ));
+        assert!(matches!(solar.ink.fg, Some(Color::Rgb(0x30, 0x40, 0x49))));
         assert!(matches!(
             solar.accent_fg.fg,
             Some(Color::Rgb(0x0c, 0x66, 0x5c))
