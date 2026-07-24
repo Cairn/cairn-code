@@ -1,10 +1,18 @@
 use super::registry::Tool;
 use super::workspace::Workspace;
-use cap_std::fs::{Dir, File};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, File, OpenOptions};
+use regex::Regex;
 #[cfg(test)]
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Component, Path};
+
+const MAX_DEPTH: usize = 64;
+const MAX_FILE_BYTES: u64 = 1_048_576;
+const MAX_RESULTS: usize = 1_000;
+const MAX_RESULT_BYTES: usize = 1_048_576;
+const MAX_VISITED_ENTRIES: usize = 100_000;
 
 pub struct GrepTool {
     workspace: Workspace,
@@ -41,16 +49,7 @@ impl Tool for GrepTool {
         let include = obj.get("include").and_then(|v| v.as_str());
         let search_path = obj.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
-        // Escape literals first, then expand wildcards (same order as glob_tool).
-        // Doing `*` before `.` would turn `.*` into `\.*` and break matches.
-        let re = SimpleRe::new(&format!(
-            ".*{}.*",
-            pattern
-                .replace('.', "\\.")
-                .replace('*', ".*")
-                .replace('?', ".")
-        ))
-        .map_err(|e| format!("invalid pattern: {e}"))?;
+        let re = Regex::new(pattern).map_err(|e| format!("invalid pattern: {e}"))?;
 
         let search_path = self.workspace.relative_path(search_path)?;
         let access_path = if search_path.as_os_str().is_empty() {
@@ -58,41 +57,102 @@ impl Tool for GrepTool {
         } else {
             &search_path
         };
-        let mut results = Vec::new();
+        let mut results = SearchResults::default();
         let relative = display_path(&search_path);
-        let metadata = match self.workspace.dir().metadata(access_path) {
-            Ok(metadata) => metadata,
+        let target = match open_search_target(self.workspace.dir(), access_path) {
+            Ok(target) => target,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok("No matches found.".into());
             }
             Err(error) => return Err(self.workspace.access_error(&search_path, error)),
         };
-        if metadata.is_file() {
-            let file = self
-                .workspace
-                .dir()
-                .open(access_path)
-                .map_err(|error| self.workspace.access_error(&search_path, error))?;
-            search_file(file, &search_path, &re, include, &relative, &mut results);
-        } else if metadata.is_dir() {
-            let dir = self
-                .workspace
-                .dir()
-                .open_dir(access_path)
-                .map_err(|error| self.workspace.access_error(&search_path, error))?;
-            search_dir(&dir, &re, include, &relative, &mut results)?;
+        match target {
+            Some(SearchTarget::File(file)) => {
+                search_file(file, &search_path, &re, include, &relative, &mut results);
+            }
+            Some(SearchTarget::Dir(dir)) => {
+                search_dir(&dir, &re, include, &relative, 0, &mut results)?;
+            }
+            None => {}
         }
 
-        if results.is_empty() {
-            return Ok("No matches found.".into());
+        if results.matches.is_empty() {
+            let mut output = String::from("No matches found.");
+            if results.truncated {
+                output.push_str("\nSearch truncated at safety limit.");
+            }
+            return Ok(output);
         }
 
         let mut output = String::new();
-        for (file, line_num, line) in &results {
+        for (file, line_num, line) in &results.matches {
             output.push_str(&format!("{file}:{line_num}:{line}\n"));
         }
-        output.push_str(&format!("{} result(s)", results.len()));
+        output.push_str(&format!("{} result(s)", results.matches.len()));
+        if results.truncated {
+            output.push_str("\nSearch truncated at safety limit.");
+        }
         Ok(output)
+    }
+}
+
+enum SearchTarget {
+    File(File),
+    Dir(Dir),
+}
+
+fn open_search_target(root: &Dir, path: &Path) -> std::io::Result<Option<SearchTarget>> {
+    let mut current = root.try_clone()?;
+    let components: Vec<_> = path.components().collect();
+    if components.is_empty() || path == Path::new(".") {
+        return Ok(Some(SearchTarget::Dir(current)));
+    }
+
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        let metadata = current.symlink_metadata(name)?;
+        if metadata.file_type().is_symlink() {
+            return Ok(None);
+        }
+        let is_last = index == components.len() - 1;
+        if metadata.is_dir() {
+            let directory = current.open_dir_nofollow(name)?;
+            if is_last {
+                return Ok(Some(SearchTarget::Dir(directory)));
+            }
+            current = directory;
+        } else if metadata.is_file() && is_last {
+            let mut options = OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            return current
+                .open_with(name, &options)
+                .map(|file| Some(SearchTarget::File(file)));
+        } else {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(SearchTarget::Dir(current)))
+}
+
+#[derive(Default)]
+struct SearchResults {
+    matches: Vec<(String, usize, String)>,
+    bytes: usize,
+    visited: usize,
+    truncated: bool,
+}
+
+impl SearchResults {
+    fn visit(&mut self) -> bool {
+        if self.visited >= MAX_VISITED_ENTRIES {
+            self.truncated = true;
+            return false;
+        }
+        self.visited += 1;
+        true
     }
 }
 
@@ -135,16 +195,29 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_star_matches() {
+    fn supports_documented_regex_semantics() {
         let dir = temp_dir();
-        fs::write(dir.join("x.txt"), "alpha-beta-gamma\n").unwrap();
+        fs::write(dir.join("x.txt"), "alpha-42\nalpha-nope\nprefix alpha-7\n").unwrap();
         let tool = GrepTool::new(Workspace::new(&dir).unwrap());
         let input = format!(
-            r#"{{"pattern":"alpha*gamma","path":"{}"}}"#,
+            r#"{{"pattern":"^alpha-[0-9]+$","path":"{}"}}"#,
             dir.to_string_lossy().replace('\\', "\\\\")
         );
         let out = tool.execute(&input).unwrap();
-        assert!(out.contains("alpha-beta-gamma"), "{out}");
+        assert!(out.contains("alpha-42"), "{out}");
+        assert!(!out.contains("alpha-nope"), "{out}");
+        assert!(!out.contains("prefix alpha-7"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_invalid_regex_patterns() {
+        let dir = temp_dir();
+        let tool = GrepTool::new(Workspace::new(&dir).unwrap());
+
+        let error = tool.execute(r#"{"pattern":"("}"#).unwrap_err();
+        assert!(error.contains("invalid pattern"), "{error}");
+
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -260,6 +333,31 @@ mod tests {
     }
 
     #[test]
+    fn explicit_search_path_does_not_follow_directory_links() {
+        let workspace = temp_dir();
+        fs::create_dir_all(workspace.join("real/sub")).unwrap();
+        fs::create_dir(workspace.join("parent")).unwrap();
+        fs::write(workspace.join("real/sub/token.txt"), "linked token").unwrap();
+        assert!(
+            create_dir_link(&workspace.join("real"), &workspace.join("final-link")),
+            "failed to create final-component test link"
+        );
+        assert!(
+            create_dir_link(&workspace.join("real"), &workspace.join("parent/link")),
+            "failed to create intermediate-component test link"
+        );
+        let tool = GrepTool::new(Workspace::new(&workspace).unwrap());
+
+        for path in ["final-link", "parent/link/sub"] {
+            let input = format!(r#"{{"pattern":"linked token","path":"{path}"}}"#);
+            let out = tool.execute(&input).unwrap();
+            assert_eq!(out, "No matches found.", "{path}: {out}");
+        }
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn subdirectory_search_reports_workspace_relative_paths() {
         let workspace = temp_dir();
         fs::create_dir(workspace.join("src")).unwrap();
@@ -290,6 +388,72 @@ mod tests {
         let _ = fs::remove_dir_all(workspace);
     }
 
+    #[test]
+    fn recursive_search_stops_at_depth_limit() {
+        let workspace = temp_dir();
+        let mut deepest = workspace.clone();
+        for index in 0..=MAX_DEPTH {
+            deepest.push(format!("d{index}"));
+            fs::create_dir(&deepest).unwrap();
+        }
+        fs::write(deepest.join("token.txt"), "too deep token").unwrap();
+        let tool = GrepTool::new(Workspace::new(&workspace).unwrap());
+
+        let out = tool.execute(r#"{"pattern":"too deep token"}"#).unwrap();
+        assert!(!out.contains("token.txt:"), "{out}");
+        assert!(out.contains("Search truncated"), "{out}");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn search_stops_at_result_count_limit() {
+        let workspace = temp_dir();
+        fs::write(
+            workspace.join("many.txt"),
+            "bounded-hit\n".repeat(MAX_RESULTS + 1),
+        )
+        .unwrap();
+        let tool = GrepTool::new(Workspace::new(&workspace).unwrap());
+
+        let out = tool.execute(r#"{"pattern":"bounded-hit"}"#).unwrap();
+        assert_eq!(out.matches(":bounded-hit").count(), MAX_RESULTS, "{out}");
+        assert!(out.contains("Search truncated"), "{out}");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn skips_files_over_size_limit() {
+        let workspace = temp_dir();
+        fs::write(
+            workspace.join("large.txt"),
+            vec![b'x'; MAX_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        let tool = GrepTool::new(Workspace::new(&workspace).unwrap());
+
+        let out = tool.execute(r#"{"pattern":"x"}"#).unwrap();
+        assert_eq!(out, "No matches found.");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn search_stops_at_result_byte_limit() {
+        let workspace = temp_dir();
+        let line = format!("match {}", "x".repeat(MAX_RESULT_BYTES / 2));
+        fs::write(workspace.join("a.txt"), format!("{line}\n")).unwrap();
+        fs::write(workspace.join("b.txt"), format!("{line}\n")).unwrap();
+        let tool = GrepTool::new(Workspace::new(&workspace).unwrap());
+
+        let out = tool.execute(r#"{"pattern":"^match"}"#).unwrap();
+        assert!(out.contains("1 result(s)"), "result count missing");
+        assert!(out.contains("Search truncated"), "truncation missing");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
     #[cfg(unix)]
     fn create_dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
         std::os::unix::fs::symlink(target, link).is_ok()
@@ -309,13 +473,22 @@ mod tests {
 
 fn search_dir(
     dir: &Dir,
-    re: &SimpleRe,
+    re: &Regex,
     include: Option<&str>,
     relative: &str,
-    results: &mut Vec<(String, usize, String)>,
+    depth: usize,
+    results: &mut SearchResults,
 ) -> Result<(), String> {
+    if depth >= MAX_DEPTH {
+        results.truncated = true;
+        return Ok(());
+    }
+
     if let Ok(entries) = dir.entries() {
         for entry in entries.flatten() {
+            if results.truncated || !results.visit() {
+                break;
+            }
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
@@ -334,7 +507,7 @@ fn search_dir(
 
             if file_type.is_dir() {
                 if let Ok(child) = entry.open_dir() {
-                    search_dir(&child, re, include, &rel, results)?;
+                    search_dir(&child, re, include, &rel, depth + 1, results)?;
                 }
             } else if file_type.is_file() {
                 if let Ok(file) = entry.open() {
@@ -349,10 +522,10 @@ fn search_dir(
 fn search_file(
     mut file: File,
     path: &Path,
-    re: &SimpleRe,
+    re: &Regex,
     include: Option<&str>,
     relative: &str,
-    results: &mut Vec<(String, usize, String)>,
+    results: &mut SearchResults,
 ) {
     if let Some(inc) = include {
         let extension_matches = path
@@ -364,11 +537,35 @@ fn search_file(
         }
     }
 
+    if file
+        .metadata()
+        .map(|metadata| metadata.len() > MAX_FILE_BYTES)
+        .unwrap_or(true)
+    {
+        return;
+    }
+
     let mut content = String::new();
-    if file.read_to_string(&mut content).is_ok() {
+    if file
+        .by_ref()
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_string(&mut content)
+        .is_ok()
+        && content.len() as u64 <= MAX_FILE_BYTES
+    {
         for (index, line) in content.lines().enumerate() {
             if re.is_match(line) {
-                results.push((relative.to_string(), index + 1, line.to_string()));
+                let result_bytes = relative.len() + line.len() + 32;
+                if results.matches.len() >= MAX_RESULTS
+                    || results.bytes.saturating_add(result_bytes) > MAX_RESULT_BYTES
+                {
+                    results.truncated = true;
+                    break;
+                }
+                results.bytes += result_bytes;
+                results
+                    .matches
+                    .push((relative.to_string(), index + 1, line.to_string()));
             }
         }
     }
@@ -379,97 +576,4 @@ fn display_path(path: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
-}
-
-struct SimpleRe {
-    pattern: Vec<Segment>,
-}
-
-enum Segment {
-    Literal(String),
-    AnySeq,
-    AnyChar,
-}
-
-impl SimpleRe {
-    fn new(pattern: &str) -> Result<Self, String> {
-        let mut segments = Vec::new();
-        let mut literal = String::new();
-        let chars: Vec<char> = pattern.chars().collect();
-        let mut i = 0;
-
-        while i < chars.len() {
-            match chars[i] {
-                '\\' if i + 1 < chars.len() => {
-                    literal.push(chars[i + 1]);
-                    i += 2;
-                }
-                '.' if i + 1 < chars.len() && chars[i + 1] == '*' => {
-                    if !literal.is_empty() {
-                        segments.push(Segment::Literal(literal.clone()));
-                        literal.clear();
-                    }
-                    segments.push(Segment::AnySeq);
-                    i += 2;
-                }
-                '.' => {
-                    if !literal.is_empty() {
-                        segments.push(Segment::Literal(literal.clone()));
-                        literal.clear();
-                    }
-                    segments.push(Segment::AnyChar);
-                    i += 1;
-                }
-                c => {
-                    literal.push(c);
-                    i += 1;
-                }
-            }
-        }
-        if !literal.is_empty() {
-            segments.push(Segment::Literal(literal));
-        }
-
-        Ok(SimpleRe { pattern: segments })
-    }
-
-    fn is_match(&self, text: &str) -> bool {
-        for start in 0..=text.len() {
-            if self.match_from(text, start, 0) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn match_from(&self, text: &str, ti: usize, pi: usize) -> bool {
-        if pi >= self.pattern.len() {
-            return true;
-        }
-
-        match &self.pattern[pi] {
-            Segment::Literal(lit) => {
-                if ti + lit.len() <= text.len() && &text[ti..ti + lit.len()] == lit {
-                    self.match_from(text, ti + lit.len(), pi + 1)
-                } else {
-                    false
-                }
-            }
-            Segment::AnyChar => {
-                if ti < text.len() {
-                    self.match_from(text, ti + 1, pi + 1)
-                } else {
-                    false
-                }
-            }
-            Segment::AnySeq => {
-                for i in ti..=text.len() {
-                    if self.match_from(text, i, pi + 1) {
-                        return true;
-                    }
-                }
-                false
-            }
-        }
-    }
 }
