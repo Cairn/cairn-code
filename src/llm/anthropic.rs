@@ -533,10 +533,18 @@ fn parse_anthropic_response_value(val: &json::JsonValue) -> Result<AnthropicResp
                     .ok_or_else(|| {
                         "Invalid Anthropic response: tool_use input must be an object".to_string()
                     })?;
-                content.push(AnthropicContentBlock::ToolUse {
+                let tool_use = ToolUse {
                     id: id.to_string(),
                     name: name.to_string(),
                     input: json::serialize(input),
+                };
+                tool_use
+                    .validate()
+                    .map_err(|e| format!("Invalid Anthropic response: {e}"))?;
+                content.push(AnthropicContentBlock::ToolUse {
+                    id: tool_use.id,
+                    name: tool_use.name,
+                    input: tool_use.input,
                 });
             }
             "thinking" => {
@@ -580,102 +588,180 @@ fn parse_anthropic_response_value(val: &json::JsonValue) -> Result<AnthropicResp
 fn parse_anthropic_streaming_response(raw: &str) -> Result<(Vec<Message>, Usage), String> {
     let mut messages: Vec<Message> = Vec::new();
     let mut usage = Usage::default();
-    let mut current_tool_use: Option<ToolUse> = None;
+    let mut current_tool_use: Option<(u64, ToolUse)> = None;
     let mut tool_input_accum = String::new();
     let mut text_accum = String::new();
-    for line in raw.lines() {
+    let mut saw_message_stop = false;
+    for (line_index, line) in raw.lines().enumerate() {
         if let Some(data) = line.strip_prefix("data: ") {
             if data == "[DONE]" {
                 continue;
             }
-            if let Ok(val) = json::parse(data) {
-                if let Some(obj) = val.as_object() {
-                    match obj.get("type").and_then(|v| v.as_str()) {
-                        Some("content_block_start") => {
-                            if let Some(block) = obj.get("content_block") {
-                                match block.get("type").and_then(|v| v.as_str()) {
-                                    Some("text") => {
-                                        if let Some(t) = block.get("text").and_then(|v| v.as_str())
-                                        {
-                                            text_accum = t.to_string();
-                                        }
-                                    }
-                                    Some("tool_use") => {
-                                        if !text_accum.is_empty() {
-                                            messages.push(Message {
-                                                role: "assistant".into(),
-                                                content: Content::Text(text_accum.clone()),
-                                            });
-                                            text_accum.clear();
-                                        }
-                                        tool_input_accum.clear();
-                                        current_tool_use = Some(ToolUse {
-                                            name: block
-                                                .get("name")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("")
-                                                .to_string(),
-                                            id: block
-                                                .get("id")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("")
-                                                .to_string(),
-                                            // In real streaming responses content_block_start's `input` is
-                                            // always `{}` — the actual arguments arrive as input_json_delta
-                                            // fragments below and get assembled at content_block_stop.
-                                            input: block
-                                                .get("input")
-                                                .map(|v| json::serialize(v))
-                                                .unwrap_or_default(),
-                                        });
-                                    }
-                                    _ => {}
+            let val = json::parse(data).map_err(|e| {
+                format!(
+                    "Malformed Anthropic stream event on line {}: {e}",
+                    line_index + 1
+                )
+            })?;
+            let obj = val.as_object().ok_or_else(|| {
+                format!(
+                    "Malformed Anthropic stream event on line {}: expected a JSON object",
+                    line_index + 1
+                )
+            })?;
+            match obj.get("type").and_then(|v| v.as_str()) {
+                Some("content_block_start") => {
+                    if current_tool_use.is_some() {
+                        return Err(
+                            "Invalid Anthropic stream: new content block started before the tool call completed"
+                                .into(),
+                        );
+                    }
+                    if let Some(block) = obj.get("content_block") {
+                        match block.get("type").and_then(|v| v.as_str()) {
+                            Some("text") => {
+                                if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                                    text_accum = t.to_string();
                                 }
                             }
-                        }
-                        Some("content_block_delta") => {
-                            if let Some(delta) = obj.get("delta") {
-                                if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
-                                    text_accum.push_str(t);
-                                }
-                                if delta.get("type").and_then(|v| v.as_str())
-                                    == Some("input_json_delta")
-                                {
-                                    if let Some(partial) =
-                                        delta.get("partial_json").and_then(|v| v.as_str())
-                                    {
-                                        tool_input_accum.push_str(partial);
-                                    }
-                                }
-                            }
-                        }
-                        Some("content_block_stop") => {
-                            if let Some(mut tu) = current_tool_use.take() {
-                                if !tool_input_accum.is_empty() {
-                                    tu.input = tool_input_accum.clone();
-                                } else if tu.input.is_empty() {
-                                    tu.input = "{}".to_string();
+                            Some("tool_use") => {
+                                let index = obj
+                                    .get("index")
+                                    .and_then(|v| v.as_u64())
+                                    .ok_or_else(|| {
+                                        "Invalid Anthropic stream: tool call start missing block index"
+                                            .to_string()
+                                    })?;
+                                if !text_accum.is_empty() {
+                                    messages.push(Message {
+                                        role: "assistant".into(),
+                                        content: Content::Text(text_accum.clone()),
+                                    });
+                                    text_accum.clear();
                                 }
                                 tool_input_accum.clear();
-                                messages.push(Message {
-                                    role: "assistant".into(),
-                                    content: Content::ToolUse(tu),
-                                });
+                                current_tool_use = Some((
+                                    index,
+                                    ToolUse {
+                                        name: block
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        id: block
+                                            .get("id")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        // In real streaming responses content_block_start's `input` is
+                                        // always `{}` — the actual arguments arrive as input_json_delta
+                                        // fragments below and get assembled at content_block_stop.
+                                        input: block
+                                            .get("input")
+                                            .map(|v| json::serialize(v))
+                                            .unwrap_or_default(),
+                                    },
+                                ));
                             }
+                            _ => {}
                         }
-                        Some("message_start") | Some("message_delta") => {
-                            if let Some(u) = obj.get("usage") {
-                                usage.input_tokens +=
-                                    u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                                usage.output_tokens +=
-                                    u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                            }
-                        }
-                        _ => {}
                     }
                 }
+                Some("content_block_delta") => {
+                    if let Some(delta) = obj.get("delta") {
+                        if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
+                            text_accum.push_str(t);
+                        }
+                        if delta.get("type").and_then(|v| v.as_str()) == Some("input_json_delta") {
+                            let index =
+                                obj.get("index").and_then(|v| v.as_u64()).ok_or_else(|| {
+                                    "Invalid Anthropic stream: tool call delta missing block index"
+                                        .to_string()
+                                })?;
+                            match current_tool_use.as_ref() {
+                                Some((tool_index, _)) if *tool_index == index => {}
+                                Some(_) => {
+                                    return Err(
+                                        "Invalid Anthropic stream: tool call delta block index does not match the open tool call"
+                                            .into(),
+                                    );
+                                }
+                                None => {
+                                    return Err(
+                                        "Invalid Anthropic stream: tool call delta has no open tool call"
+                                            .into(),
+                                    );
+                                }
+                            }
+                            let partial = delta
+                                .get("partial_json")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| {
+                                    "Invalid Anthropic stream: tool call delta missing partial_json"
+                                        .to_string()
+                                })?;
+                            tool_input_accum.push_str(partial);
+                        }
+                    }
+                }
+                Some("content_block_stop") => {
+                    if let Some((tool_index, _)) = current_tool_use.as_ref() {
+                        let index = obj.get("index").and_then(|v| v.as_u64()).ok_or_else(|| {
+                            "Invalid Anthropic stream: tool call stop missing block index"
+                                .to_string()
+                        })?;
+                        if *tool_index != index {
+                            return Err(
+                                "Invalid Anthropic stream: tool call stop block index does not match the open tool call"
+                                    .into(),
+                            );
+                        }
+                        let (_, mut tu) = current_tool_use.take().unwrap();
+                        if !tool_input_accum.is_empty() {
+                            tu.input = tool_input_accum.clone();
+                        }
+                        tool_input_accum.clear();
+                        tu.validate()
+                            .map_err(|e| format!("Invalid Anthropic stream: {e}"))?;
+                        messages.push(Message {
+                            role: "assistant".into(),
+                            content: Content::ToolUse(tu),
+                        });
+                    }
+                }
+                Some("message_start") | Some("message_delta") => {
+                    if let Some(u) = obj.get("usage") {
+                        usage.input_tokens +=
+                            u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        usage.output_tokens +=
+                            u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    }
+                }
+                Some("message_stop") => {
+                    saw_message_stop = true;
+                    break;
+                }
+                Some("error") => {
+                    let error = obj.get("error");
+                    let kind = error
+                        .and_then(|e| e.get("type"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("api_error");
+                    let message = error
+                        .and_then(|e| e.get("message"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Anthropic returned an error event");
+                    return Err(format!("Anthropic API stream error ({kind}): {message}"));
+                }
+                _ => {}
             }
         }
+    }
+    if !saw_message_stop {
+        return Err("Incomplete Anthropic stream: missing message_stop completion marker".into());
+    }
+    if current_tool_use.is_some() {
+        return Err("Invalid Anthropic stream: tool call did not complete".into());
     }
     if !text_accum.is_empty() {
         messages.push(Message {
@@ -831,6 +917,128 @@ mod tests {
     }
 
     #[test]
+    fn test_streaming_rejects_malformed_event() {
+        let raw = "data: not-json\ndata: {\"type\":\"message_stop\"}\n";
+        let error = parse_anthropic_streaming_response(raw).unwrap_err();
+
+        assert!(error.contains("Malformed Anthropic stream event"));
+    }
+
+    #[test]
+    fn test_streaming_surfaces_provider_error_event() {
+        let raw = "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n";
+        let error = parse_anthropic_streaming_response(raw).unwrap_err();
+
+        assert!(error.contains("overloaded_error"), "{error}");
+        assert!(error.contains("Overloaded"), "{error}");
+    }
+
+    #[test]
+    fn test_streaming_rejects_truncated_event_at_eof() {
+        let raw = r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}
+"#;
+        let error = parse_anthropic_streaming_response(raw).unwrap_err();
+
+        assert!(error.contains("Malformed Anthropic stream event"));
+    }
+
+    #[test]
+    fn test_streaming_requires_message_stop_marker() {
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"part\"}}\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ial\"}}\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+        );
+        let error = parse_anthropic_streaming_response(raw).unwrap_err();
+
+        assert!(error.contains("missing message_stop completion marker"));
+    }
+
+    #[test]
+    fn test_streaming_rejects_tool_call_without_block_stop() {
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"glob\",\"input\":{}}}\n",
+            "data: {\"type\":\"message_stop\"}\n",
+        );
+        let error = parse_anthropic_streaming_response(raw).unwrap_err();
+
+        assert!(error.contains("tool call did not complete"), "{error}");
+    }
+
+    #[test]
+    fn test_streaming_rejects_tool_calls_missing_id_or_name() {
+        let missing_id = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"name\":\"glob\",\"input\":{}}}\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "data: {\"type\":\"message_stop\"}\n",
+        );
+        let missing_name = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"input\":{}}}\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "data: {\"type\":\"message_stop\"}\n",
+        );
+
+        let id_error = parse_anthropic_streaming_response(missing_id).unwrap_err();
+        assert!(id_error.contains("missing an id"), "{id_error}");
+        let name_error = parse_anthropic_streaming_response(missing_name).unwrap_err();
+        assert!(name_error.contains("missing a name"), "{name_error}");
+    }
+
+    #[test]
+    fn test_streaming_rejects_tool_call_missing_input() {
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"glob\"}}\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "data: {\"type\":\"message_stop\"}\n",
+        );
+        let error = parse_anthropic_streaming_response(raw).unwrap_err();
+
+        assert!(error.contains("invalid JSON arguments"), "{error}");
+    }
+
+    #[test]
+    fn test_streaming_rejects_mismatched_tool_block_stop() {
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"glob\",\"input\":{}}}\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n",
+            "data: {\"type\":\"message_stop\"}\n",
+        );
+        let error = parse_anthropic_streaming_response(raw).unwrap_err();
+
+        assert!(error.contains("block index does not match"), "{error}");
+    }
+
+    #[test]
+    fn test_streaming_rejects_invalid_tool_arguments() {
+        let raw = r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"glob","input":{}}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":"}}
+data: {"type":"content_block_stop","index":0}
+data: {"type":"message_stop"}
+"#;
+        let error = parse_anthropic_streaming_response(raw).unwrap_err();
+
+        assert!(error.contains("invalid JSON arguments"), "{error}");
+    }
+
+    #[test]
+    fn test_streaming_valid_incremental_text_requires_message_stop() {
+        let raw = concat!(
+            "data: {\"type\":\"message_start\",\"usage\":{\"input_tokens\":3}}\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"hel\"}}\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}\n",
+            "data: {\"type\":\"message_stop\"}\n",
+        );
+        let (messages, usage) = parse_anthropic_streaming_response(raw).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(&messages[0].content, Content::Text(text) if text == "hello"));
+        assert_eq!(usage.input_tokens, 3);
+        assert_eq!(usage.output_tokens, 2);
+    }
+
+    #[test]
     fn test_streaming_tool_use_reconstructs_args_from_input_json_delta() {
         // Mirrors what Anthropic actually sends: content_block_start's `input`
         // is `{}`, then the real arguments arrive as input_json_delta fragments.
@@ -839,6 +1047,7 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pattern\\\":\"}}\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"*.rs\\\"}\"}}\n",
             "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "data: {\"type\":\"message_stop\"}\n",
         );
         let (msgs, _usage) = parse_anthropic_streaming_response(raw).unwrap();
         assert_eq!(msgs.len(), 1);
@@ -861,6 +1070,7 @@ mod tests {
             "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"grep\",\"input\":{}}}\n",
             "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pattern\\\":\\\"foo\\\"}\"}}\n",
             "data: {\"type\":\"content_block_stop\",\"index\":1}\n",
+            "data: {\"type\":\"message_stop\"}\n",
         );
         let (msgs, _usage) = parse_anthropic_streaming_response(raw).unwrap();
         assert_eq!(msgs.len(), 2);
@@ -876,7 +1086,7 @@ mod tests {
 
     #[test]
     fn test_streaming_tool_use_uses_content_block_input_without_deltas() {
-        let raw = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"glob\",\"input\":{\"pattern\":\"*.rs\"}}}\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n";
+        let raw = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"glob\",\"input\":{\"pattern\":\"*.rs\"}}}\ndata: {\"type\":\"content_block_stop\",\"index\":0}\ndata: {\"type\":\"message_stop\"}\n";
         let (msgs, _usage) = parse_anthropic_streaming_response(raw).unwrap();
         assert_eq!(msgs.len(), 1);
         match &msgs[0].content {
