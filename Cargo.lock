@@ -337,9 +337,11 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "keyring",
+ "keyring-core",
  "ratatui",
  "serde_json",
  "syntect",
+ "tempfile",
 ]
 
 [[package]]

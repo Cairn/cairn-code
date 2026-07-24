@@ -87,10 +87,12 @@ pub fn default_registry() -> Registry {
     r.register(Box::new(crate::tools::glob_tool::GlobTool::new(
         workspace.clone(),
     )));
-    r.register(Box::new(crate::tools::grep_tool::GrepTool::new(workspace)));
+    r.register(Box::new(crate::tools::grep_tool::GrepTool::new(
+        workspace.clone(),
+    )));
     r.register(Box::new(crate::tools::web_search::WebSearchTool));
     r.register(Box::new(crate::tools::web_fetch::WebFetchTool));
-    r.register(Box::new(crate::tools::todo::TodoTool));
+    r.register(Box::new(crate::tools::todo::TodoTool::new(workspace)));
     r.register(Box::new(crate::tools::memory::MemoryTool));
     r
 }
