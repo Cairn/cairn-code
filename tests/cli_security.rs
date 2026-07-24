@@ -41,6 +41,7 @@ impl CliFixture {
 
     fn run(&self, prompt: &str, response: &str) -> Output {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let response = response.as_bytes().to_vec();
         let capture = self.capture.clone();
@@ -89,13 +90,24 @@ impl CliFixture {
 }
 
 fn serve_once(listener: TcpListener, response: &[u8], capture: &PathBuf) {
-    let _ = listener.set_nonblocking(false);
     let mut first = true;
     for _ in 0..3 {
-        let (mut stream, _) = match listener.accept() {
-            Ok(pair) => pair,
-            Err(_) => break,
+        let idle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(pair) => break pair,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= idle_deadline {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
         };
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
         let mut request = Vec::new();
         let mut buffer = [0; 4096];
         let body_end = loop {

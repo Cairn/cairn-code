@@ -154,11 +154,6 @@ pub struct Target {
 
 /// Acquires the workspace capability once, then resolves every component from
 /// that exact handle without following directory or final-component symlinks.
-pub fn acquire(path: &str, create_parents: bool, require_existing: bool) -> Result<Target, String> {
-    let workspace = Workspace::current()?;
-    acquire_in(&workspace, path, create_parents, require_existing)
-}
-
 pub fn acquire_in(
     workspace: &Workspace,
     path: &str,
@@ -255,30 +250,13 @@ pub fn atomic_replace(target: &Target, content: &str) -> Result<(), String> {
     result
 }
 
-pub fn restore(relative: &Path, previous: Option<&str>) -> Result<(), String> {
-    let path = relative.to_str().ok_or("history path is not valid UTF-8")?;
-    if let Some(content) = previous {
-        let target = acquire(path, true, false)?;
-        atomic_replace(&target, content)
-    } else {
-        let target = acquire(path, false, false)?;
-        if target.previous.is_none() {
-            return Ok(());
-        }
-        target
-            .parent
-            .remove_file(&target.name)
-            .map_err(|e| format!("undo remove failed: {e}"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn workspace_rejects_escape_and_accepts_dot() {
-        let workspace = Workspace::current().unwrap();
+        let workspace = Workspace::new(".").unwrap();
         let err = workspace.relative_path("../../outside.txt").unwrap_err();
         assert!(
             err.contains("outside the workspace"),
@@ -292,7 +270,7 @@ mod tests {
 
     #[test]
     fn workspace_rejects_traversal_after_nonexistent_prefix() {
-        let workspace = Workspace::current().unwrap();
+        let workspace = Workspace::new(".").unwrap();
         let err = workspace
             .relative_path("target/cairn_workspace_missing_prefix/../../../outside.txt")
             .unwrap_err();

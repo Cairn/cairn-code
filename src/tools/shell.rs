@@ -537,7 +537,7 @@ mod tests {
         // Let the shell exit immediately. The descendant keeps the inherited
         // pipes open, so timeout handling must still kill its process group.
         let command = format!("(sleep 1; printf survived > '{}') &", marker.display());
-        let input = format!(r#"{{"command":"{command}","timeout":200}}"#);
+        let input = serde_json::json!({ "command": command, "timeout": 200 }).to_string();
 
         let err = ShellTool.execute(&input).unwrap_err();
         assert!(err.contains("timed out"), "unexpected error: {err}");
@@ -564,7 +564,7 @@ mod tests {
         let command = format!(
             "Start-Process powershell -ArgumentList @('-NoProfile','-Command','Start-Sleep -Milliseconds 1000; Set-Content -LiteralPath ''{marker}'' -Value survived'); Start-Sleep -Seconds 5"
         );
-        let input = format!(r#"{{"command":"{command}","timeout":200}}"#);
+        let input = serde_json::json!({ "command": command, "timeout": 200 }).to_string();
 
         let err = ShellTool.execute(&input).unwrap_err();
         assert!(err.contains("timed out"), "unexpected error: {err}");
