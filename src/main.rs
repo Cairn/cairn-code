@@ -19,13 +19,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
+use std::{io::Read, process::ExitCode};
 
 use agent::Agent;
 use agent::AgentEvent;
 use config::Config;
 use llm::provider;
 
-fn main() {
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let version = env!("CARGO_PKG_VERSION");
     let mut is_print_mode = false;
@@ -37,11 +38,11 @@ fn main() {
             "-p" | "--print" => is_print_mode = true,
             "-h" | "--help" => {
                 print_help(version);
-                return;
+                return ExitCode::SUCCESS;
             }
             "-v" | "--version" => {
                 println!("cairn-code {version}");
-                return;
+                return ExitCode::SUCCESS;
             }
             arg if !arg.starts_with('-') => {
                 initial_prompt = Some(arg.to_string());
@@ -102,33 +103,31 @@ fn main() {
             Some(p) => p,
             None => {
                 let mut input = String::new();
-                if std::io::stdin().read_line(&mut input).is_ok() {
-                    input.trim().to_string()
-                } else {
-                    String::new()
+                if let Err(error) = std::io::stdin().read_to_string(&mut input) {
+                    eprintln!("Error: failed to read prompt from stdin: {error}");
+                    return ExitCode::FAILURE;
                 }
+                input.trim().to_string()
             }
         };
-        if !prompt.is_empty() {
-            let (tx, rx) = mpsc::channel();
-            thread::spawn(move || {
-                let mut agent = Agent::new_with_skills(
-                    chosen_provider,
-                    p_model.clone(),
-                    tool_registry,
-                    cfg,
-                    skills_for_agent,
-                );
-                let _ = tx.send(agent.run_simple(&prompt));
-            });
-            if let Ok(result) = rx.recv() {
-                match result {
-                    Ok(output) => println!("{output}"),
-                    Err(e) => eprintln!("Error: {e}"),
-                }
+
+        let mut agent = Agent::new_with_skills(
+            chosen_provider,
+            p_model.clone(),
+            tool_registry,
+            cfg,
+            skills_for_agent,
+        );
+        return match agent.run_simple(&prompt) {
+            Ok(output) => {
+                println!("{output}");
+                ExitCode::SUCCESS
             }
-        }
-        return;
+            Err(error) => {
+                eprintln!("Error: {error}");
+                ExitCode::FAILURE
+            }
+        };
     }
     let theme_name = cfg.theme.clone();
     let show_thinking = cfg.show_thinking;
@@ -307,6 +306,7 @@ fn main() {
     }
 
     let _ = tui.run(event_rx);
+    ExitCode::SUCCESS
 }
 
 fn print_help(version: &str) {
