@@ -59,6 +59,8 @@ jobs:
 
   msrv:
     name: MSRV (Rust 1.96)
+    # Cheap compile check; still skip it when format/lint already failed.
+    needs: [quality]
     runs-on: ubuntu-latest
 
     steps:
@@ -99,6 +101,10 @@ jobs:
 
   test:
     name: test (${{ matrix.os }})
+    # Wait for quality so a rustfmt/clippy failure does not burn three OS runners.
+    # Keep fail-fast false so Ubuntu/Windows/macOS all report; this repo has
+    # platform-specific paths and canceling siblings hides cross-OS signal.
+    needs: [quality]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
