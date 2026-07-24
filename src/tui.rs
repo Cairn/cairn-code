@@ -114,6 +114,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "session management",
     ),
     ("/skills · /mcp", "list skills and MCP servers"),
+    (
+        "/reset · /reset apply",
+        "ChatGPT banked rate-limit resets (OpenAI OAuth)",
+    ),
     ("/exit · /quit · /q", "exit Cairn"),
     ("", ""),
     ("Keys", ""),
@@ -133,11 +137,37 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Skills", "packs as <dir>/<name>/SKILL.md"),
     ("MCP", "stdio servers in config · tools need permission"),
 ];
+/// Rows for the `?` shortcuts panel (keys must match real bindings in handle_key).
+const SHORTCUT_ROWS: &[(&str, &str)] = &[
+    ("Ctrl+C", "interrupt turn · press again to exit when idle"),
+    ("Enter", "send message"),
+    ("Tab / →", "accept slash ghost or idle suggestion"),
+    (
+        "Up / Down",
+        "scroll chat when it overflows · else prompt history",
+    ),
+    ("Ctrl+P / Ctrl+N", "previous / next prompt history"),
+    ("PgUp / PgDn", "page scroll"),
+    ("Ctrl+U / Ctrl+D", "half-page scroll"),
+    ("Ctrl+Home / End", "jump to top / bottom of chat"),
+    ("Wheel", "scroll transcript"),
+    ("Ctrl+Y", "copy last assistant message"),
+    ("Ctrl+O", "plain-text select mode"),
+    ("/", "slash commands (Tab completes)"),
+];
 // MiniDot FPS is time.Second/12 (~83ms). Faster ticks look like flicker; slower feels sticky.
 const SPINNER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 12);
 // Cap full-frame redraws while the agent runs. Zero coalesces stream text to ~16ms
 // (60fps); without this, token-rate dirty redraws thrash the terminal around the spinner.
 const MIN_FRAME: Duration = Duration::from_millis(16);
+
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
+}
 
 pub struct Tui {
     output_lines: Vec<OutputLine>,
@@ -247,6 +277,8 @@ pub struct Tui {
     running_started: Option<Instant>,
     /// Bottom chrome shows `/help` overlay (like the model picker; Esc closes).
     show_help: bool,
+    /// Bottom chrome shows keyboard shortcuts (`?` when the composer is empty).
+    show_shortcuts: bool,
 }
 
 impl Tui {
@@ -298,6 +330,7 @@ impl Tui {
                 "/quit".into(),
                 "/copy".into(),
                 "/q".into(),
+                "/reset".into(),
                 "/resume".into(),
                 "/save".into(),
                 "/select".into(),
@@ -347,6 +380,7 @@ impl Tui {
             thinking_started: None,
             running_started: None,
             show_help: false,
+            show_shortcuts: false,
         }
     }
 
@@ -534,6 +568,7 @@ impl Tui {
 
     pub fn run(&mut self, rx: mpsc::Receiver<AgentEvent>) -> Result<(), String> {
         let mut terminal = ratatui::init();
+        let _terminal_guard = TerminalGuard;
         terminal.clear().map_err(|e| e.to_string())?;
         // Wheel scroll for transcript history. Shift+drag where supported is
         // handled by the terminal host (selects text without sending events
@@ -786,7 +821,6 @@ impl Tui {
         if self.mouse_capture {
             let _ = execute!(stdout(), DisableMouseCapture);
         }
-        ratatui::restore();
         result
     }
 
@@ -909,6 +943,7 @@ impl Tui {
             || self.show_session_picker
             || self.show_permission_prompt
             || self.show_help
+            || self.show_shortcuts
             || self.confirm_remove_provider.is_some()
             || self.confirm_history_provider.is_some();
         if self.show_help {
@@ -998,6 +1033,37 @@ impl Tui {
                 }
                 _ => {}
             }
+        }
+
+        if self.show_shortcuts {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => {
+                    self.show_shortcuts = false;
+                }
+                // Keep scroll available while the help panel is open.
+                KeyCode::PageUp => self.scroll_page(false),
+                KeyCode::PageDown => self.scroll_page(true),
+                KeyCode::Char('u') | KeyCode::Char('U')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.scroll_half_page(false);
+                }
+                KeyCode::Char('d') | KeyCode::Char('D')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.scroll_half_page(true);
+                }
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_transcript(-1);
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_transcript(1);
+                }
+                KeyCode::Up => self.scroll_transcript(-3),
+                KeyCode::Down => self.scroll_transcript(3),
+                _ => {}
+            }
+            return true;
         }
 
         if self.show_permission_prompt {
@@ -1308,6 +1374,8 @@ impl Tui {
                     });
                 } else if self.show_help {
                     self.show_help = false;
+                } else if self.show_shortcuts {
+                    self.show_shortcuts = false;
                 } else if self.show_command_picker || !self.cmd_picker_filtered.is_empty() {
                     self.show_command_picker = false;
                     self.cmd_picker_filtered.clear();
@@ -1561,6 +1629,24 @@ impl Tui {
                 true
             }
             KeyCode::Char(ch) => {
+                // Footer advertises "? for shortcuts" when the composer is empty.
+                // Toggle the panel instead of inserting `?` into the prompt.
+                if ch == '?'
+                    && !self.awaiting_api_key
+                    && self.input_buf.is_empty()
+                    && matches!(self.state, State::Idle)
+                    && !self.show_model_picker
+                    && !self.show_provider_picker
+                    && !self.show_theme_picker
+                    && !self.show_session_picker
+                    && !self.show_permission_prompt
+                    && !self.show_recovery_prompt
+                    && self.confirm_remove_provider.is_none()
+                    && self.confirm_history_provider.is_none()
+                {
+                    self.show_shortcuts = !self.show_shortcuts;
+                    return true;
+                }
                 // Allow typing into the API-key prompt and the normal input
                 // (but not while a list picker is focused).
                 if self.awaiting_api_key
@@ -1568,7 +1654,8 @@ impl Tui {
                         && !self.show_provider_picker
                         && !self.show_theme_picker
                         && !self.show_session_picker
-                        && !self.show_help)
+                        && !self.show_help
+                        && !self.show_shortcuts)
                 {
                     self.input_buf.insert(self.cursor, ch);
                     self.cursor += ch.len_utf8();
@@ -1772,6 +1859,7 @@ impl Tui {
             "/help" => {
                 // Model-picker style overlay in bottom chrome; Esc / Enter dismisses.
                 // Do not dump into the transcript (stays until /clear).
+                self.show_shortcuts = false;
                 self.show_help = true;
             }
             "/skills" => {
@@ -1932,6 +2020,30 @@ impl Tui {
                     );
                 } else {
                     self.open_theme_picker();
+                }
+            }
+            "/reset" => {
+                // ChatGPT subscription banked rate-limit resets (Codex-compatible API).
+                // Only works with OpenAI ChatGPT OAuth (Codex auth.json or oauth:openai),
+                // not with plain API keys.
+                let args: Vec<&str> = parts.iter().skip(1).copied().collect();
+                match crate::openai_reset::run_reset_command(&args) {
+                    Ok(msg) => {
+                        self.output_lines.push(OutputLine {
+                            type_: "system".into(),
+                            content: msg,
+                            tool_name: String::new(),
+                            duration: String::new(),
+                        });
+                    }
+                    Err(e) => {
+                        self.output_lines.push(OutputLine {
+                            type_: "error".into(),
+                            content: e,
+                            tool_name: String::new(),
+                            duration: String::new(),
+                        });
+                    }
                 }
             }
             "/compact" => {
@@ -2161,6 +2273,11 @@ impl Tui {
         }
         if self.show_help {
             self.show_help = false;
+            self.ctrl_c_exit_armed = false;
+            return true;
+        }
+        if self.show_shortcuts {
+            self.show_shortcuts = false;
             self.ctrl_c_exit_armed = false;
             return true;
         }
@@ -3004,6 +3121,23 @@ impl Tui {
                     Span::styled(*desc, dim),
                 ]));
             }
+        } else if self.show_shortcuts {
+            // Matches the footer hint "? for shortcuts" on an empty idle prompt.
+            chrome.push(Line::from(vec![
+                Span::styled("── Shortcuts ", orange),
+                Span::styled("(? or Esc close) ──", bold_dim),
+            ]));
+            for (keys, desc) in SHORTCUT_ROWS {
+                chrome.push(Line::from(vec![
+                    Span::styled(format!("  {keys:<22}"), orange_fg),
+                    Span::styled(*desc, dim),
+                ]));
+            }
+            chrome.push(Line::from(""));
+            chrome.push(Line::from(vec![
+                Span::styled("  /help", orange_fg),
+                Span::styled("                  slash commands and more", dim),
+            ]));
         } else if self.show_provider_picker {
             chrome.push(Line::from(vec![
                 Span::styled("── Provider ", orange),
@@ -3736,6 +3870,7 @@ fn completion_wants_trailing_space(completion: &str) -> bool {
             | "/auth login"
             | "/auth logout"
             | "/auth key"
+            | "/reset"
             | "/theme"
             | "/model"
             | "/provider"
@@ -4089,6 +4224,21 @@ pub(crate) fn slash_completions(
                     .iter()
                     .filter(|s| s.starts_with(&p))
                     .map(|s| format!("{root} {s}"))
+                    .collect();
+            }
+            Vec::new()
+        }
+        "/reset" => {
+            let opts = ["list", "apply", "status"];
+            if parts.len() == 1 && ends_with_space {
+                return opts.iter().map(|s| format!("/reset {s}")).collect();
+            }
+            if parts.len() == 2 && !ends_with_space {
+                let p = parts[1].to_ascii_lowercase();
+                return opts
+                    .iter()
+                    .filter(|s| s.starts_with(&p))
+                    .map(|s| format!("/reset {s}"))
                     .collect();
             }
             Vec::new()
@@ -4465,6 +4615,47 @@ mod exit_tests {
 }
 
 #[cfg(test)]
+mod shortcuts_panel_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn question_mark_toggles_shortcuts_when_composer_empty() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        assert!(!tui.show_shortcuts);
+
+        tui.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(tui.show_shortcuts);
+        assert!(tui.input_buf.is_empty(), "must not type ? into the prompt");
+
+        tui.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(!tui.show_shortcuts);
+    }
+
+    #[test]
+    fn question_mark_types_when_composer_has_text() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.input_buf = "what".into();
+        tui.cursor = tui.input_buf.len();
+
+        tui.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+
+        assert!(!tui.show_shortcuts);
+        assert_eq!(tui.input_buf, "what?");
+    }
+
+    #[test]
+    fn esc_closes_shortcuts_panel() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.show_shortcuts = true;
+
+        tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(!tui.show_shortcuts);
+    }
+}
+
+#[cfg(test)]
 mod scroll_history_tests {
     use super::*;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -4642,6 +4833,7 @@ mod completion_tests {
             "/help".into(),
             "/model".into(),
             "/provider".into(),
+            "/reset".into(),
             "/resume".into(),
             "/delete".into(),
             "/suggestions".into(),
@@ -4740,6 +4932,17 @@ mod completion_tests {
         assert!(c.iter().any(|x| x == "/auth login xai"));
         let c = slash_completions("/auth login x", &base(), &[], &providers, &[], &[]);
         assert_eq!(c, vec!["/auth login xai".to_string()]);
+    }
+
+    #[test]
+    fn completes_reset_subcommands() {
+        let c = slash_completions("/re", &base(), &[], &[], &[], &[]);
+        assert!(c.contains(&"/reset".to_string()), "{c:?}");
+        let c = slash_completions("/reset ", &base(), &[], &[], &[], &[]);
+        assert!(c.iter().any(|x| x == "/reset list"));
+        assert!(c.iter().any(|x| x == "/reset apply"));
+        let c = slash_completions("/reset a", &base(), &[], &[], &[], &[]);
+        assert_eq!(c, vec!["/reset apply".to_string()]);
     }
 
     #[test]

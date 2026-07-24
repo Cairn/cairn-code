@@ -187,6 +187,7 @@ User Prompt -> Build System Prompt (CAIRN.md + Todos + Tools)
 | `/provider` | Show or change the current provider (prompts for API key when missing; input is masked) |
 | `/theme` | Pick a dark TUI theme (live preview); `/theme list` or `/theme <name>` |
 | `/auth` | OAuth: `/auth login xai` (browser), `/auth logout xai`, `/auth status`; `/auth key xai` to paste an API key instead |
+| `/reset` | List or redeem ChatGPT Plus/Pro banked Codex rate-limit resets (`/reset apply`). Requires OpenAI ChatGPT OAuth (Codex `auth.json` or cairn `oauth:openai`); not API keys |
 | `Ctrl+C` | Interrupt a run; clear prompt when idle with text; press again on empty prompt to exit |
 | *(after LLM error)* | Prompt: switch model (`m`), switch provider (`p`), or dismiss (`d`/Esc) |
 | `/save` | Save the current session |

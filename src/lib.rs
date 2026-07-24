@@ -8,6 +8,7 @@ pub mod markdown;
 pub mod mcp;
 pub mod notify;
 pub mod oauth;
+pub mod openai_reset;
 pub mod redact;
 pub mod session;
 pub mod skills;
