@@ -102,6 +102,9 @@ pub fn save(sessions_dir: &str, session: &Session) -> Result<(), String> {
             .map_err(|e| format!("sync temporary session: {e}"))?;
         drop(file);
         fs::rename(&temp_path, &path).map_err(|e| format!("replace session: {e}"))?;
+        // Best-effort directory fsync so the rename itself is durable across a
+        // hard crash / power loss (POSIX; ignored on platforms that lack it).
+        sync_dir(&dir);
         Ok(())
     })();
     if write_result.is_err() {
@@ -109,6 +112,27 @@ pub fn save(sessions_dir: &str, session: &Session) -> Result<(), String> {
     }
     write_result?;
     Ok(())
+}
+
+/// fsync the parent directory after rename so the new dirent is on stable storage.
+fn sync_dir(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(file) = OpenOptions::new().read(true).open(dir) {
+            let _ = file.sync_all();
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Opening a directory with CreateFile and flushing is possible but
+        // awkward without extra crates; file.sync_all on the temp file already
+        // covers content durability. Rename metadata is typically journaled.
+        let _ = dir;
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+    }
 }
 
 pub fn load(sessions_dir: &str, id: &str) -> Result<Session, String> {
@@ -989,6 +1013,50 @@ mod tests {
         }
         let listed = list(&dir_str).unwrap();
         assert!(listed[0].summary.contains("image"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_repeated_saves_keep_latest_history() {
+        // Simulates crash-recovery checkpoints: many atomic overwrites of one id.
+        let test_id = format!("test-{}", new_id());
+        let dir = std::env::temp_dir().join(format!("cairn-test-session-ckpt-{}", new_id()));
+        let dir_str = dir.to_string_lossy().to_string();
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut session = Session {
+            id: test_id.clone(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: crate::llm::Content::Text("start".into()),
+            }],
+            model: "mock".into(),
+            provider: "mock".into(),
+            tokens_in: 1,
+            tokens_out: 0,
+            created_at: 10,
+            updated_at: 10,
+        };
+        save(&dir_str, &session).unwrap();
+
+        for i in 0..5 {
+            session.messages.push(Message {
+                role: "assistant".into(),
+                content: crate::llm::Content::Text(format!("step-{i}")),
+            });
+            session.updated_at = 11 + i;
+            save(&dir_str, &session).unwrap();
+            let loaded = load(&dir_str, &test_id).unwrap();
+            assert_eq!(loaded.messages.len(), 2 + i as usize);
+            assert_eq!(loaded.created_at, 10);
+        }
+        // No leftover .tmp files from the atomic writer.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp files left: {leftovers:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

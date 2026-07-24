@@ -23,7 +23,8 @@ impl Tool for PowerShellTool {
     fn description(&self) -> &str {
         "Run a PowerShell command natively (pwsh if available, else Windows PowerShell). \
          Use PowerShell syntax (Select-Object, Get-ChildItem, Select-String, etc.) — not bash. \
-         Prefer this over shell for Windows-native work. Check the exit code footer."
+         Prefer this over shell for Windows-native work. Check the exit code footer. \
+         Bare `git commit` invocations automatically get a Co-Authored-By: cairn-code trailer."
     }
 
     fn needs_permission(&self) -> bool {
@@ -46,13 +47,17 @@ impl Tool for PowerShellTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_TIMEOUT_MS);
 
+        // Same co-author guarantee as the git tool when agents commit via pwsh.
+        let command =
+            crate::tools::commit_attribution::ensure_powershell_command_co_author(command);
+
         let (bin, flag) = resolve_powershell()?;
         let mut cmd = Command::new(&bin);
         // -NoProfile keeps startup fast and avoids user-profile side effects.
         cmd.arg("-NoProfile")
             .arg("-NonInteractive")
             .arg(flag)
-            .arg(command)
+            .arg(&command)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 

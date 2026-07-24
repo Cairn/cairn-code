@@ -5,9 +5,12 @@
 //! - Linux: Ctrl+V (when clipboard holds an image)
 //! - macOS: Cmd+V (SUPER+V)
 
+#[cfg(any(windows, target_os = "macos"))]
 use std::fs;
+#[cfg(any(windows, target_os = "macos"))]
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(any(windows, target_os = "macos"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::llm::ImageBlock;
@@ -82,6 +85,7 @@ pub fn read_clipboard_image() -> Result<ClipboardImage, String> {
     }
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn temp_clip_path(ext: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -95,6 +99,7 @@ fn temp_clip_path(ext: &str) -> PathBuf {
     ))
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn load_image_file(path: &Path) -> Result<ClipboardImage, String> {
     let meta = fs::metadata(path).map_err(|e| format!("clipboard image stat: {e}"))?;
     if meta.len() == 0 {

@@ -260,6 +260,8 @@ pub struct Tui {
     current_session_id: Option<String>,
     /// created_at for the active session (preserved across autosaves).
     session_created_at: u64,
+    /// Throttle mid-turn checkpoint disk writes (wall clock).
+    last_checkpoint_save: Option<Instant>,
     /// Full agent transcript (tools included) for session files.
     live_mirror: Option<session::LiveMirror>,
     /// Clipboard images attached to the next user send (cleared on send/clear).
@@ -357,6 +359,7 @@ impl Tui {
             last_body_wrapped: 0,
             current_session_id: None,
             session_created_at: 0,
+            last_checkpoint_save: None,
             live_mirror: None,
             pending_images: Vec::new(),
             expect_turn_notify: false,
@@ -389,6 +392,9 @@ impl Tui {
     fn begin_running(&mut self) {
         self.state = State::Running;
         self.running_started = Some(Instant::now());
+        // Allow the first mid-turn Checkpoint of this run to hit disk even if
+        // we just saved at the previous Done (throttle would otherwise skip it).
+        self.last_checkpoint_save = None;
         // New verb each turn (Claude Code / OpenClaude spinner style).
         let seed = self
             .spinner_idx
@@ -649,11 +655,16 @@ impl Tui {
                                 duration: String::new(),
                             });
                         }
+                        AgentEvent::Checkpoint => {
+                            // Mid-turn durable flush (throttled) so crashes do not
+                            // drop everything since the previous Done/exit save.
+                            self.checkpoint_session();
+                        }
                         AgentEvent::Done => {
                             self.flush_streaming();
                             self.state = State::Idle;
                             self.running_started = None;
-                            // Autosave after each finished turn (not only manual /save).
+                            // Always flush on turn end (bypass throttle).
                             self.autosave_session(false);
                             if self.expect_turn_notify {
                                 self.expect_turn_notify = false;
@@ -669,7 +680,7 @@ impl Tui {
                                     .clone()
                                     .unwrap_or_else(|| self.provider.clone());
                                 if crate::config::has_usable_credential(&target) {
-                                    // Signed in — now pick a model (live catalog available).
+                                    // Signed in - now pick a model (live catalog available).
                                     self.pending_model_after_auth = false;
                                     self.output_lines.push(OutputLine {
                                         type_: "system".into(),
@@ -1723,6 +1734,9 @@ impl Tui {
                 self.transcript_follow = true;
                 self.expect_turn_notify = true;
                 self.idle_suggestion = None;
+                // Stable id for the whole conversation so mid-turn checkpoints
+                // and the final save share one file from the first prompt.
+                self.ensure_session_identity();
                 let images = std::mem::take(&mut self.pending_images);
                 let label = if images.is_empty() {
                     input.clone()
@@ -1854,6 +1868,7 @@ impl Tui {
                 self.current_session_id = None;
                 self.session_created_at = 0;
                 self.pending_images.clear();
+                self.last_checkpoint_save = None;
                 self.total_usage = llm::Usage::default();
                 if let Some(tx) = &self.agent_tx {
                     let _ = tx.send("__clear__".to_string());
@@ -2058,7 +2073,7 @@ impl Tui {
                 } else {
                     let mut body = format!("Skills ({}) from {}:\n", list.len(), dir.display());
                     for s in &list {
-                        body.push_str(&format!("  {} — {}\n", s.name, s.description));
+                        body.push_str(&format!("  {} - {}\n", s.name, s.description));
                     }
                     body.push_str("Load in-chat with the skill tool: {\"name\":\"...\"}");
                     self.output_lines.push(OutputLine {
@@ -2106,7 +2121,7 @@ impl Tui {
                         } else {
                             format!(" {}", crate::redact::redact_secrets(&s.args.join(" ")))
                         };
-                        body.push_str(&format!("  {n} [{state}] — {}{args_str}\n", s.command));
+                        body.push_str(&format!("  {n} [{state}] - {}{args_str}\n", s.command));
                     }
                     body.push_str(
                         "Tools register at startup as mcp_<server>_<tool> (permission required).",
@@ -2819,7 +2834,7 @@ impl Tui {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
                     content: format!(
-                        "Attached clipboard image ({media}, {bytes} bytes). Add a caption in the composer and press Enter — or paste more images."
+                        "Attached clipboard image ({media}, {bytes} bytes). Add a caption in the composer and press Enter - or paste more images."
                     ),
                     tool_name: String::new(),
                     duration: String::new(),
@@ -2836,6 +2851,32 @@ impl Tui {
         }
     }
 
+    /// Mid-turn durable checkpoint. Throttled so rapid tool loops do not hammer
+    /// the disk, but always writes at least every few seconds while history grows.
+    fn checkpoint_session(&mut self) {
+        const MIN_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
+        if let Some(last) = self.last_checkpoint_save {
+            if last.elapsed() < MIN_CHECKPOINT_INTERVAL {
+                return;
+            }
+        }
+        self.autosave_session(false);
+    }
+
+    /// Ensure we have a stable session id before the first disk write so mid-turn
+    /// checkpoints and the final Done save land on the same file.
+    fn ensure_session_identity(&mut self) {
+        if self.current_session_id.is_none() {
+            self.current_session_id = Some(session::new_id());
+        }
+        if self.session_created_at == 0 {
+            self.session_created_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+        }
+    }
+
     /// Save (or update) the current session. When `announce` is true, print a
     /// system line (manual `/save`). Autosave stays quiet unless it fails.
     fn autosave_session(&mut self, announce: bool) {
@@ -2844,7 +2885,7 @@ impl Tui {
             if announce {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Nothing to save — no conversation yet.".into(),
+                    content: "Nothing to save - no conversation yet.".into(),
                     tool_name: String::new(),
                     duration: String::new(),
                 });
@@ -2852,6 +2893,7 @@ impl Tui {
             return;
         }
 
+        self.ensure_session_identity();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2880,6 +2922,7 @@ impl Tui {
             Ok(()) => {
                 self.current_session_id = Some(id.clone());
                 self.session_created_at = created_at;
+                self.last_checkpoint_save = Some(Instant::now());
                 if announce {
                     let short = if id.len() >= 8 { &id[..8] } else { id.as_str() };
                     self.output_lines.push(OutputLine {
@@ -4344,7 +4387,7 @@ fn enter_plain_select_mode(terminal: &mut DefaultTerminal, text: &str) -> Result
     );
     let text = sanitize_terminal_output(text);
     let _ = writeln!(out, "{text}");
-    let _ = writeln!(out, "\n======== end — press Enter to return ========\n");
+    let _ = writeln!(out, "\n======== end - press Enter to return ========\n");
     let _ = out.flush();
 
     // stdin is cooked again after disable_raw_mode; block until Enter.
@@ -4691,7 +4734,7 @@ pub(crate) fn fuzzy_score(candidate: &str, query: &str) -> Option<i32> {
     if cand.starts_with(&q) {
         score += 40;
     }
-    // Between two matches the tighter one is the better guess — but only once
+    // Between two matches the tighter one is the better guess - but only once
     // the query says something. A bare `/` matches everything equally well, and
     // length is then the only differing term, which would silently re-sort the
     // whole command list by name length.

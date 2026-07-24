@@ -1,3 +1,4 @@
+pub mod commit_attribution;
 pub mod file_edit;
 pub mod file_history;
 pub mod file_read;
