@@ -228,7 +228,12 @@ pub struct Tui {
     show_permission_prompt: bool,
     perm_tool_name: String,
     perm_tool_input: String,
+    /// 0=Yes, 1=Yes always, 2=No, 3=Discuss (Claude Code numbered options).
     perm_selection: usize,
+    /// Free-text feedback for option 4 (Discuss) only. Cleared when leaving Discuss.
+    perm_discuss_buf: String,
+    /// Byte cursor into `perm_discuss_buf` (Discuss only).
+    perm_discuss_cursor: usize,
     /// After an LLM/provider failure: offer Switch model / Switch provider / Dismiss.
     show_recovery_prompt: bool,
     recovery_selection: usize,
@@ -332,6 +337,8 @@ impl Tui {
             perm_tool_name: String::new(),
             perm_tool_input: String::new(),
             perm_selection: 0,
+            perm_discuss_buf: String::new(),
+            perm_discuss_cursor: 0,
             show_recovery_prompt: false,
             recovery_selection: 0,
             theme: theme::default_theme(),
@@ -619,6 +626,8 @@ impl Tui {
                             self.perm_tool_name = name;
                             self.perm_tool_input = input;
                             self.perm_selection = 0;
+                            self.perm_discuss_buf.clear();
+                            self.perm_discuss_cursor = 0;
                             crate::notify::play(crate::notify::Kind::Attention);
                             self.refresh_idle_suggestion();
                         }
@@ -819,6 +828,20 @@ impl Tui {
     /// Insert clipboard / bracketed-paste text into the composer at the cursor.
     /// Returns true if the buffer changed (needs redraw).
     fn handle_paste(&mut self, data: &str) -> bool {
+        // Strip CSI/OSC noise if someone pastes styled terminal output; keep
+        // Unicode (emoji), newlines, and tabs for normal prompts.
+        let cleaned = sanitize_paste_for_composer(data);
+        if cleaned.is_empty() {
+            return false;
+        }
+        // Only Discuss (option 4) accepts inline paste/feedback.
+        if self.permission_discuss_active() {
+            self.ctrl_c_exit_armed = false;
+            self.perm_discuss_buf
+                .insert_str(self.perm_discuss_cursor, &cleaned);
+            self.perm_discuss_cursor += cleaned.len();
+            return true;
+        }
         // Same gates as KeyCode::Char: don't hijack list pickers or overlays.
         let allow = self.awaiting_api_key
             || (!self.show_model_picker
@@ -826,14 +849,9 @@ impl Tui {
                 && !self.show_theme_picker
                 && !self.show_session_picker
                 && !self.show_help
-                && !self.show_shortcuts);
+                && !self.show_shortcuts
+                && !self.show_permission_prompt);
         if !allow {
-            return false;
-        }
-        // Strip CSI/OSC noise if someone pastes styled terminal output; keep
-        // Unicode (emoji), newlines, and tabs for normal prompts.
-        let cleaned = sanitize_paste_for_composer(data);
-        if cleaned.is_empty() {
             return false;
         }
         self.ctrl_c_exit_armed = false;
@@ -844,6 +862,52 @@ impl Tui {
             self.update_cmd_picker();
         }
         true
+    }
+
+    /// Send a permission decision and clear the prompt.
+    fn submit_permission(&mut self, decision: &str) {
+        self.show_permission_prompt = false;
+        self.perm_discuss_buf.clear();
+        self.perm_discuss_cursor = 0;
+        if let Some(tx) = &self.perm_tx {
+            let _ = tx.send(decision.to_string());
+        }
+        self.refresh_idle_suggestion();
+    }
+
+    /// True when the Discuss option (key 4) owns the permission chrome.
+    fn permission_discuss_active(&self) -> bool {
+        self.show_permission_prompt && self.perm_selection == 3
+    }
+
+    /// Move the permission highlight. Inline feedback exists only on Discuss;
+    /// leaving it drops any draft text so Yes/Always/No never carry a field.
+    fn set_perm_selection(&mut self, sel: usize) {
+        let sel = sel.min(3);
+        if sel != 3 {
+            self.perm_discuss_buf.clear();
+            self.perm_discuss_cursor = 0;
+        }
+        self.perm_selection = sel;
+    }
+
+    /// Confirm the currently highlighted permission option (Enter path).
+    fn confirm_permission_selection(&mut self) {
+        match self.perm_selection {
+            0 => self.submit_permission("allow"),
+            1 => self.submit_permission("always_allow"),
+            2 => self.submit_permission("deny"),
+            3 => {
+                // Only Discuss accepts optional inline feedback.
+                let feedback = self.perm_discuss_buf.trim();
+                if feedback.is_empty() {
+                    self.submit_permission("discuss");
+                } else {
+                    self.submit_permission(&format!("discuss:{feedback}"));
+                }
+            }
+            _ => self.submit_permission("deny"),
+        }
     }
 
     /// Returns true if the event was actually acted on (a scroll), so callers
@@ -1090,32 +1154,78 @@ impl Tui {
 
         if self.show_permission_prompt {
             match key.code {
+                // Claude Code / OpenClaude: 1/2/3 confirm immediately (no text field).
+                // 4 focuses Discuss, the only option with optional inline feedback.
+                KeyCode::Char('1') => self.submit_permission("allow"),
+                KeyCode::Char('2') => self.submit_permission("always_allow"),
+                KeyCode::Char('3') => self.submit_permission("deny"),
+                KeyCode::Char('4') => self.set_perm_selection(3),
+                KeyCode::Up => {
+                    self.set_perm_selection(self.perm_selection.saturating_sub(1));
+                }
+                KeyCode::Down => {
+                    if self.perm_selection < 3 {
+                        self.set_perm_selection(self.perm_selection + 1);
+                    }
+                }
+                // Discuss-only: Left/Right move the feedback cursor.
+                KeyCode::Left
+                    if self.permission_discuss_active() && self.perm_discuss_cursor > 0 =>
+                {
+                    let previous = self.perm_discuss_buf[..self.perm_discuss_cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                    self.perm_discuss_cursor = previous;
+                }
                 KeyCode::Left => {
-                    self.perm_selection = self.perm_selection.saturating_sub(1);
+                    self.set_perm_selection(self.perm_selection.saturating_sub(1));
+                }
+                KeyCode::Right if self.permission_discuss_active() => {
+                    if self.perm_discuss_cursor < self.perm_discuss_buf.len() {
+                        let next = self.perm_discuss_buf[self.perm_discuss_cursor..]
+                            .chars()
+                            .next()
+                            .map(|c| c.len_utf8())
+                            .unwrap_or(0);
+                        self.perm_discuss_cursor += next;
+                    }
                 }
                 KeyCode::Right => {
-                    if self.perm_selection < 2 {
-                        self.perm_selection += 1;
+                    if self.perm_selection < 3 {
+                        self.set_perm_selection(self.perm_selection + 1);
                     }
                 }
-                KeyCode::Enter => {
-                    let selected = match self.perm_selection {
-                        0 => "allow",
-                        1 => "always_allow",
-                        _ => "deny",
-                    };
-                    self.show_permission_prompt = false;
-                    if let Some(tx) = &self.perm_tx {
-                        let _ = tx.send(selected.to_string());
-                    }
-                    self.refresh_idle_suggestion();
+                KeyCode::Home if self.permission_discuss_active() => {
+                    self.perm_discuss_cursor = 0;
                 }
-                KeyCode::Esc => {
-                    self.show_permission_prompt = false;
-                    if let Some(tx) = &self.perm_tx {
-                        let _ = tx.send("deny".to_string());
+                KeyCode::End if self.permission_discuss_active() => {
+                    self.perm_discuss_cursor = self.perm_discuss_buf.len();
+                }
+                KeyCode::Enter => self.confirm_permission_selection(),
+                KeyCode::Esc => self.submit_permission("deny"),
+                KeyCode::Backspace if self.permission_discuss_active() => {
+                    if self.perm_discuss_cursor > 0 {
+                        let previous = self.perm_discuss_buf[..self.perm_discuss_cursor]
+                            .char_indices()
+                            .next_back()
+                            .map(|(index, _)| index)
+                            .unwrap_or(0);
+                        self.perm_discuss_buf.remove(previous);
+                        self.perm_discuss_cursor = previous;
                     }
-                    self.refresh_idle_suggestion();
+                }
+                KeyCode::Delete if self.permission_discuss_active() => {
+                    if self.perm_discuss_cursor < self.perm_discuss_buf.len() {
+                        self.perm_discuss_buf.remove(self.perm_discuss_cursor);
+                    }
+                }
+                // Printable text only while Discuss is selected (not Yes/Always/No).
+                KeyCode::Char(ch) if self.permission_discuss_active() && !ch.is_control() => {
+                    // Digits 1-4 already matched above as global shortcuts.
+                    self.perm_discuss_buf.insert(self.perm_discuss_cursor, ch);
+                    self.perm_discuss_cursor += ch.len_utf8();
                 }
                 _ => {}
             }
@@ -2323,10 +2433,7 @@ impl Tui {
             return true;
         }
         if self.show_permission_prompt {
-            self.show_permission_prompt = false;
-            if let Some(tx) = &self.perm_tx {
-                let _ = tx.send("deny".to_string());
-            }
+            self.submit_permission("deny");
             self.ctrl_c_exit_armed = false;
             return true;
         }
@@ -3279,16 +3386,6 @@ impl Tui {
                 }
             }
         } else if self.show_permission_prompt {
-            let cursor = self.cursor.min(self.input_buf.len());
-            let (before, after) = self.input_buf.split_at(cursor);
-            let prompt_line_idx = chrome.len();
-            chrome.push(Line::from(vec![
-                Span::styled("❯ ", orange_fg),
-                Span::raw(before),
-                Span::styled("▋", orange_fg),
-                Span::raw(after),
-            ]));
-            chrome.push(Line::from(""));
             chrome.push(Line::from(vec![Span::styled(
                 format!("Tool '{}' wants to run:", self.perm_tool_name),
                 white,
@@ -3303,33 +3400,49 @@ impl Tui {
                 chrome.push(Line::from(vec![Span::styled(format!("  {preview}"), dim)]));
             }
             chrome.push(Line::from(""));
-            let options = ["Allow", "Always Allow", "Deny"];
-            let mut option_spans = Vec::new();
+            // Claude Code / OpenClaude style: numbered vertical options.
+            // Only option 4 (Discuss) has an inline feedback field.
+            let options = ["1. Yes", "2. Yes, always allow", "3. No", "4. Discuss"];
+            let mut discuss_cursor_pos: Option<(u16, usize)> = None;
             for (i, opt) in options.iter().enumerate() {
-                if i > 0 {
-                    option_spans.push(Span::raw("  "));
-                }
                 let is_sel = i == self.perm_selection;
-                let open = if is_sel { "[" } else { " " };
-                let close = if is_sel { "]" } else { " " };
-                option_spans.push(Span::styled(
-                    format!("{open}{opt}{close}"),
+                let prefix = if is_sel { "❯ " } else { "  " };
+                chrome.push(Line::from(vec![Span::styled(
+                    format!("{prefix}{opt}"),
                     if is_sel {
                         orange_fg.add_modifier(Modifier::BOLD)
                     } else {
                         dim
                     },
-                ));
+                )]));
+                // Inline field appears only while Discuss is selected.
+                if i == 3 && is_sel {
+                    let cursor = self.perm_discuss_cursor.min(self.perm_discuss_buf.len());
+                    let (before, after) = self.perm_discuss_buf.split_at(cursor);
+                    let label = "     ";
+                    let prompt_line_idx = chrome.len();
+                    let mut spans = vec![Span::styled(label, dim)];
+                    if before.is_empty() && after.is_empty() {
+                        spans.push(Span::styled("▋", orange_fg));
+                        spans.push(Span::styled(" optional feedback · Enter to send", bold_dim));
+                    } else {
+                        spans.push(Span::styled(before, white));
+                        spans.push(Span::styled("▋", orange_fg));
+                        spans.push(Span::styled(after, white));
+                    }
+                    chrome.push(Line::from(spans));
+                    discuss_cursor_pos = Some((
+                        display_width(label) as u16 + display_width(before) as u16,
+                        prompt_line_idx,
+                    ));
+                }
             }
-            chrome.push(Line::from(option_spans));
+            chrome.push(Line::from(""));
             chrome.push(Line::from(vec![Span::styled(
-                "(← → navigate  Enter confirm  Esc deny)",
+                "(1 yes  ·  2 always  ·  3 no  ·  4 discuss  ·  Esc cancel)",
                 dim,
             )]));
-            cursor_pos = Some((
-                display_width("❯ ") as u16 + display_width(before) as u16,
-                prompt_line_idx,
-            ));
+            cursor_pos = discuss_cursor_pos.or(Some((0, 0)));
         } else if self.show_recovery_prompt {
             chrome.push(Line::from(vec![Span::styled(
                 format!(
@@ -4988,6 +5101,95 @@ mod claude_chrome_tests {
                 .any(|l| l.content.contains("Ctrl+C")),
             "exit hint belongs in the footer, not the transcript"
         );
+    }
+}
+
+#[cfg(test)]
+mod permission_prompt_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::mpsc;
+
+    fn prompt_tui() -> (Tui, mpsc::Receiver<String>) {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        let (tx, rx) = mpsc::channel();
+        tui.set_perm_tx(tx);
+        tui.show_permission_prompt = true;
+        tui.perm_tool_name = "shell".into();
+        tui.perm_tool_input = r#"{"command":"echo hi"}"#.into();
+        tui.perm_selection = 0;
+        (tui, rx)
+    }
+
+    #[test]
+    fn number_keys_one_two_three_confirm_without_text_field() {
+        for (key, expected) in [
+            (KeyCode::Char('1'), "allow"),
+            (KeyCode::Char('2'), "always_allow"),
+            (KeyCode::Char('3'), "deny"),
+        ] {
+            let (mut tui, rx) = prompt_tui();
+            // Typing on Yes/Always/No must not populate discuss feedback.
+            tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+            assert!(
+                tui.perm_discuss_buf.is_empty(),
+                "options 1-3 must not accept inline text"
+            );
+            tui.handle_key(KeyEvent::new(key, KeyModifiers::NONE));
+            assert!(!tui.show_permission_prompt);
+            assert_eq!(rx.try_recv().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn key_four_selects_discuss_and_allows_inline_feedback() {
+        let (mut tui, rx) = prompt_tui();
+        tui.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        assert!(tui.show_permission_prompt);
+        assert_eq!(tui.perm_selection, 3);
+        assert!(tui.permission_discuss_active());
+
+        for ch in ['u', 's', 'e', ' ', 'g', 'i', 't'] {
+            tui.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(tui.perm_discuss_buf, "use git");
+
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!tui.show_permission_prompt);
+        assert_eq!(rx.try_recv().unwrap(), "discuss:use git");
+    }
+
+    #[test]
+    fn discuss_enter_without_text_sends_bare_discuss() {
+        let (mut tui, rx) = prompt_tui();
+        tui.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(rx.try_recv().unwrap(), "discuss");
+    }
+
+    #[test]
+    fn leaving_discuss_clears_draft_feedback() {
+        let (mut tui, _rx) = prompt_tui();
+        tui.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        tui.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(tui.perm_discuss_buf, "x");
+        tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(tui.perm_selection, 2);
+        assert!(
+            tui.perm_discuss_buf.is_empty(),
+            "draft must not linger on No/Yes options"
+        );
+        assert!(!tui.permission_discuss_active());
+    }
+
+    #[test]
+    fn paste_only_into_discuss_not_other_options() {
+        let (mut tui, _rx) = prompt_tui();
+        assert!(!tui.handle_paste("nope"));
+        assert!(tui.perm_discuss_buf.is_empty());
+        tui.set_perm_selection(3);
+        assert!(tui.handle_paste("hello"));
+        assert_eq!(tui.perm_discuss_buf, "hello");
     }
 }
 

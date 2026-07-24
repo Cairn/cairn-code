@@ -463,16 +463,30 @@ impl Agent {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break "deny".to_string(),
             }
         };
-        match response.as_str() {
-            "always_allow" => {
+        match permission_decision(&response) {
+            PermissionDecision::AlwaysAllow => {
                 if !always_allowed {
                     self.config.auto_allow.push(permission_key);
                 }
                 let _ = crate::config::save_permissions(&self.config);
                 self.dispatch_tool(tu, cancel_flag)
             }
-            "allow" => self.dispatch_tool(tu, cancel_flag),
-            _ => Err(format!("Permission denied by user for tool '{}'", tu.name)),
+            PermissionDecision::Allow => self.dispatch_tool(tu, cancel_flag),
+            PermissionDecision::Discuss(feedback) => {
+                let detail = match feedback {
+                    Some(msg) if !msg.is_empty() => {
+                        format!("User declined and said: {msg}")
+                    }
+                    _ => "User wants to discuss this action before it runs.".into(),
+                };
+                Err(format!(
+                    "Permission denied by user for tool '{}'. {detail}",
+                    tu.name
+                ))
+            }
+            PermissionDecision::Deny => {
+                Err(format!("Permission denied by user for tool '{}'", tu.name))
+            }
         }
     }
 
@@ -563,6 +577,35 @@ impl Agent {
         self.sync_live_mirror();
         result
     }
+}
+
+/// How the interactive permission prompt resolved a tool approval request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PermissionDecision {
+    Allow,
+    AlwaysAllow,
+    Deny,
+    /// Do not run the tool; feed optional free-text feedback to the model.
+    Discuss(Option<String>),
+}
+
+/// Parse the TUI/permission-channel response string.
+///
+/// Wire values: `allow`, `always_allow`, `deny`, `discuss`, or `discuss:<msg>`.
+fn permission_decision(response: &str) -> PermissionDecision {
+    if response == "allow" {
+        return PermissionDecision::Allow;
+    }
+    if response == "always_allow" {
+        return PermissionDecision::AlwaysAllow;
+    }
+    if response == "discuss" {
+        return PermissionDecision::Discuss(None);
+    }
+    if let Some(msg) = response.strip_prefix("discuss:") {
+        return PermissionDecision::Discuss(Some(msg.to_string()));
+    }
+    PermissionDecision::Deny
 }
 
 fn load_system_prompt(path: &str, skills: &[crate::skills::Skill]) -> String {
@@ -1340,6 +1383,53 @@ mod tests {
             event_rx.recv().unwrap(),
             AgentEvent::PermissionRequest(_, _)
         ));
+    }
+
+    #[test]
+    fn interactive_policy_discuss_includes_feedback_without_running() {
+        let mut config = Config::default();
+        config.ask.clear();
+        config.auto_allow.clear();
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (perm_tx, perm_rx) = mpsc::channel();
+        perm_tx
+            .send("discuss:use a safer alternative".into())
+            .unwrap();
+
+        let err = agent
+            .execute_tool_with_policy(
+                &test_tool_use("dangerous"),
+                Some((&event_tx, &AtomicBool::new(false), &perm_rx)),
+            )
+            .unwrap_err();
+
+        assert!(err.contains("Permission denied"), "{err}");
+        assert!(err.contains("use a safer alternative"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn permission_decision_parses_wire_values() {
+        assert_eq!(permission_decision("allow"), PermissionDecision::Allow);
+        assert_eq!(
+            permission_decision("always_allow"),
+            PermissionDecision::AlwaysAllow
+        );
+        assert_eq!(permission_decision("deny"), PermissionDecision::Deny);
+        assert_eq!(
+            permission_decision("discuss"),
+            PermissionDecision::Discuss(None)
+        );
+        assert_eq!(
+            permission_decision("discuss:do it another way"),
+            PermissionDecision::Discuss(Some("do it another way".into()))
+        );
+        assert_eq!(
+            permission_decision("discuss:note: colon ok"),
+            PermissionDecision::Discuss(Some("note: colon ok".into()))
+        );
+        assert_eq!(permission_decision("nope"), PermissionDecision::Deny);
     }
 
     #[test]
