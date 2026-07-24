@@ -1,6 +1,7 @@
-//! Dark TUI palettes ported from zero (`internal/tui/theme_palettes.go`).
-//! Light themes are intentionally omitted. Dune uses the dark Claude Code
-//! colorblind (daltonized) palette from the upstream `fix/dune-claude-dark-theme` PR.
+//! TUI palettes ported from zero / Grok Build (`internal/tui/theme_palettes.go`).
+//! Includes the full dark registry plus light and solarized-light. Dune uses the
+//! dark Claude Code colorblind (daltonized) palette from the upstream
+//! `fix/dune-claude-dark-theme` PR (zero main still ships light sand Dune).
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -356,7 +357,7 @@ const NEON: Palette = Palette {
 };
 
 /// Dune: dark Claude Code colorblind (daltonized) palette from zero branch
-/// `fix/dune-claude-dark-theme` (not the old light sand palette).
+/// `fix/dune-claude-dark-theme` (not the old light sand palette on zero main).
 const DUNE: Palette = Palette {
     panel: "#0e0e10",
     prompt_bg: "#262626",
@@ -375,8 +376,47 @@ const DUNE: Palette = Palette {
     on_accent: "#000000",
 };
 
-/// All selectable themes. Dark first, then Catppuccin Latte (the only light
-/// flavor we ship, since the user asked for the full Catppuccin set of 4).
+/// light: warm cream surface with olive-lime accent (zero lightPalette).
+const LIGHT: Palette = Palette {
+    panel: "#efebd4",
+    prompt_bg: "#e3ddc2",
+    line: "#d8d2bd",
+    line2: "#b7b199",
+    ink: "#22201a",
+    muted: "#4b5149",
+    faint: "#575e55",
+    faintest: "#636a61",
+    accent: "#54700a",
+    green: "#1e725c",
+    red: "#c02434",
+    amber: "#8a5f00",
+    blue: "#1f66c0",
+    sel_bg: "#d4e08f",
+    on_accent: "#ffffff",
+};
+
+/// Solarized Light: base3/base2 cream with dark-on-light accent wheel.
+const SOLARIZED_LIGHT: Palette = Palette {
+    panel: "#eee8d5",
+    prompt_bg: "#e1d9be",
+    line: "#d8d1bc",
+    line2: "#c0b89e",
+    ink: "#304049",
+    muted: "#495b61",
+    faint: "#506469",
+    faintest: "#576b72",
+    accent: "#0c665c",
+    green: "#859900",
+    red: "#dc322f",
+    amber: "#7a5c00",
+    blue: "#268bd2",
+    sel_bg: "#a6d6c4",
+    on_accent: "#ffffff",
+};
+
+/// All selectable themes. Dark group first (matching zero registry order), then
+/// light themes. Catppuccin ships all four official flavors (Mocha is the zero
+/// `catppuccin` entry; Latte is light).
 pub fn all_themes() -> Vec<Theme> {
     // Touch surface tokens so palette fields stay intentional parity with zero.
     let _ = _surface_tokens(&DARK);
@@ -393,13 +433,16 @@ pub fn all_themes() -> Vec<Theme> {
             &CATPPUCCIN_MACCHIATO,
         ),
         build("catppuccin-frappe", "Catppuccin Frappé", &CATPPUCCIN_FRAPPE),
-        build("catppuccin-latte", "Catppuccin Latte", &CATPPUCCIN_LATTE),
         build("one-dark", "One Dark", &ONE_DARK),
         build("solarized-dark", "Solarized Dark", &SOLARIZED_DARK),
         build("rose-pine", "Rosé Pine", &ROSE_PINE),
         build("everforest", "Everforest", &EVERFOREST),
         build("neon", "Neon", &NEON),
         build("dune", "Dune", &DUNE),
+        // Light themes (zero registry order after the dark group).
+        build("light", "light", &LIGHT),
+        build("solarized-light", "Solarized Light", &SOLARIZED_LIGHT),
+        build("catppuccin-latte", "Catppuccin Latte", &CATPPUCCIN_LATTE),
     ]
 }
 
@@ -433,25 +476,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dark_registry_has_expected_names() {
+    fn registry_has_expected_names() {
         let names = theme_names();
-        assert!(names.contains(&"dark"));
-        assert!(names.contains(&"dracula"));
-        assert!(names.contains(&"nord"));
-        assert!(names.contains(&"gruvbox"));
-        assert!(names.contains(&"tokyo-night"));
-        assert!(names.contains(&"catppuccin-mocha"));
+        // Every Grok Build / zero themeRegistry name is present (catppuccin via mocha alias).
+        for required in [
+            "dark",
+            "dracula",
+            "nord",
+            "gruvbox",
+            "tokyo-night",
+            "catppuccin-mocha",
+            "one-dark",
+            "solarized-dark",
+            "rose-pine",
+            "everforest",
+            "neon",
+            "light",
+            "solarized-light",
+            "dune",
+        ] {
+            assert!(names.contains(&required), "missing theme {required}");
+        }
+        // Extra Catppuccin flavors beyond zero's single mocha entry.
         assert!(names.contains(&"catppuccin-macchiato"));
         assert!(names.contains(&"catppuccin-frappe"));
         assert!(names.contains(&"catppuccin-latte"));
-        assert!(names.contains(&"one-dark"));
-        assert!(names.contains(&"solarized-dark"));
-        assert!(names.contains(&"rose-pine"));
-        assert!(names.contains(&"everforest"));
-        assert!(names.contains(&"neon"));
-        assert!(names.contains(&"dune"));
-        assert!(!names.iter().any(|n| *n == "light"));
-        assert!(!names.iter().any(|n| *n == "solarized-light"));
+        // Light group after dark group: light before solarized-light before latte.
+        let light_i = names.iter().position(|n| *n == "light").unwrap();
+        let solar_i = names.iter().position(|n| *n == "solarized-light").unwrap();
+        let latte_i = names.iter().position(|n| *n == "catppuccin-latte").unwrap();
+        assert!(light_i < solar_i && solar_i < latte_i);
     }
 
     #[test]
@@ -485,6 +539,29 @@ mod tests {
         let t = lookup("dune");
         // Accent is brand orange from the dark daltonized palette
         assert!(matches!(t.accent_fg.fg, Some(Color::Rgb(0xff, 0x96, 0x28))));
+    }
+
+    #[test]
+    fn light_and_solarized_light_are_dark_on_light() {
+        let light = lookup("light");
+        assert!(matches!(
+            light.ink.fg,
+            Some(Color::Rgb(0x22, 0x20, 0x1a))
+        ));
+        assert!(matches!(
+            light.accent_fg.fg,
+            Some(Color::Rgb(0x54, 0x70, 0x0a))
+        ));
+        let solar = lookup("Solarized Light");
+        assert_eq!(solar.name, "solarized-light");
+        assert!(matches!(
+            solar.ink.fg,
+            Some(Color::Rgb(0x30, 0x40, 0x49))
+        ));
+        assert!(matches!(
+            solar.accent_fg.fg,
+            Some(Color::Rgb(0x0c, 0x66, 0x5c))
+        ));
     }
 
     #[test]
