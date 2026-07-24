@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Mutex;
@@ -18,6 +18,8 @@ pub struct HttpResponse {
 
 const MAX_RETRIES: u32 = 3;
 const BASE_BACKOFF_MS: u64 = 500;
+const CONNECT_TIMEOUT_SECS: &str = "10";
+const POST_TIMEOUT_SECS: &str = "600";
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const WATCHDOG_POLL: Duration = Duration::from_millis(200);
 
@@ -27,13 +29,18 @@ enum RequestError {
     /// curl couldn't be spawned, the connection failed, or a similar
     /// transport-level problem occurred before/without a usable response.
     Transport(String),
+    /// A transport failure known to have happened before the POST reached
+    /// the provider, so retrying cannot duplicate the request.
+    RetryableTransport(String),
 }
 
 impl RequestError {
     fn into_string(self) -> String {
         match self {
             RequestError::Status(status, body) => format_status_error(status, &body),
-            RequestError::Transport(msg) => format_transport_error(&msg),
+            RequestError::Transport(msg) | RequestError::RetryableTransport(msg) => {
+                format_transport_error(&msg)
+            }
         }
     }
 }
@@ -191,11 +198,22 @@ fn debug_log_request(req: &HttpRequest) {
     let _ = std::fs::write(&path, dump);
 }
 
-fn spawn_curl(req: &HttpRequest) -> Result<Child, String> {
-    debug_log_request(req);
-
+fn curl_command(req: &HttpRequest) -> Command {
     let mut cmd = Command::new("curl");
-    cmd.args(["-sS", "-i", "-X", "POST", &req.url]);
+    // Must be the first argument so curl does not load settings (including
+    // unsafe retry policies) from the user's curlrc.
+    cmd.arg("-q");
+    cmd.args([
+        "-sS",
+        "-i",
+        "-X",
+        "POST",
+        "--connect-timeout",
+        CONNECT_TIMEOUT_SECS,
+        "--max-time",
+        POST_TIMEOUT_SECS,
+        &req.url,
+    ]);
     for (k, v) in &req.headers {
         cmd.arg("-H").arg(format!("{k}: {v}"));
     }
@@ -206,8 +224,13 @@ fn spawn_curl(req: &HttpRequest) -> Result<Child, String> {
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    cmd
+}
 
-    let mut child = cmd.spawn().map_err(|e| format!("curl: {e}"))?;
+fn spawn_curl(req: &HttpRequest) -> Result<Child, String> {
+    debug_log_request(req);
+
+    let mut child = curl_command(req).spawn().map_err(|e| format!("curl: {e}"))?;
 
     let body = req.body.clone().unwrap_or_default();
     let mut stdin = child.stdin.take().ok_or("curl: no stdin")?;
@@ -218,6 +241,21 @@ fn spawn_curl(req: &HttpRequest) -> Result<Child, String> {
     Ok(child)
 }
 
+fn curl_exit_error(status: ExitStatus, stderr: &[u8]) -> RequestError {
+    let message = String::from_utf8_lossy(stderr).trim().to_string();
+    if is_retryable_curl_exit_code(status.code()) {
+        RequestError::RetryableTransport(message)
+    } else {
+        RequestError::Transport(message)
+    }
+}
+
+fn is_retryable_curl_exit_code(code: Option<i32>) -> bool {
+    // curl 5/6/7 are proxy resolution, host resolution, and connection
+    // establishment failures. No HTTP request reached the provider.
+    matches!(code, Some(5..=7))
+}
+
 fn parse_status_line(line: &str) -> u16 {
     line.split_whitespace()
         .nth(1)
@@ -226,12 +264,11 @@ fn parse_status_line(line: &str) -> u16 {
 }
 
 fn request_once(req: &HttpRequest) -> Result<HttpResponse, RequestError> {
-    let child = spawn_curl(req).map_err(RequestError::Transport)?;
+    let child = spawn_curl(req).map_err(RequestError::RetryableTransport)?;
     let output = child.wait_with_output().map_err(|e| RequestError::Transport(format!("{e}")))?;
 
-    if !output.status.success() && output.stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(RequestError::Transport(stderr.trim().to_string()));
+    if !output.status.success() {
+        return Err(curl_exit_error(output.status, &output.stderr));
     }
 
     let raw = String::from_utf8_lossy(&output.stdout);
@@ -254,18 +291,14 @@ fn request_once(req: &HttpRequest) -> Result<HttpResponse, RequestError> {
     Ok(HttpResponse { body })
 }
 
-/// Sends a non-streaming request, retrying transient failures (429/503/529
-/// responses and transport-level errors) with exponential backoff.
+/// Sends a non-streaming request, retrying only transport errors known to
+/// precede the POST. Completed HTTP responses are never safe to retry here.
 pub fn request(req: &HttpRequest) -> Result<HttpResponse, String> {
     let mut attempt = 0;
     loop {
         match request_once(req) {
             Ok(resp) => return Ok(resp),
-            Err(RequestError::Status(status, _)) if is_retriable_status(status) && attempt < MAX_RETRIES => {
-                attempt += 1;
-                std::thread::sleep(backoff_delay(attempt));
-            }
-            Err(RequestError::Transport(_)) if attempt < MAX_RETRIES => {
+            Err(RequestError::RetryableTransport(_)) if attempt < MAX_RETRIES => {
                 attempt += 1;
                 std::thread::sleep(backoff_delay(attempt));
             }
@@ -285,7 +318,9 @@ pub fn request_get(url: &str, headers: &[(String, String)]) -> Result<HttpRespon
                 attempt += 1;
                 std::thread::sleep(backoff_delay(attempt));
             }
-            Err(RequestError::Transport(_)) if attempt < MAX_RETRIES => {
+            Err(RequestError::Transport(_) | RequestError::RetryableTransport(_))
+                if attempt < MAX_RETRIES =>
+            {
                 attempt += 1;
                 std::thread::sleep(backoff_delay(attempt));
             }
@@ -296,7 +331,7 @@ pub fn request_get(url: &str, headers: &[(String, String)]) -> Result<HttpRespon
 
 fn request_get_once(url: &str, headers: &[(String, String)]) -> Result<HttpResponse, RequestError> {
     let mut cmd = Command::new("curl");
-    cmd.args(["-sS", "-i", "-X", "GET", "--max-time", "12", url]);
+    cmd.args(["-q", "-sS", "-i", "-X", "GET", "--max-time", "12", url]);
     for (k, v) in headers {
         cmd.arg("-H").arg(format!("{k}: {v}"));
     }
@@ -307,9 +342,8 @@ fn request_get_once(url: &str, headers: &[(String, String)]) -> Result<HttpRespo
     let output = child
         .wait_with_output()
         .map_err(|e| RequestError::Transport(format!("{e}")))?;
-    if !output.status.success() && output.stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(RequestError::Transport(stderr.trim().to_string()));
+    if !output.status.success() {
+        return Err(curl_exit_error(output.status, &output.stderr));
     }
     let raw = String::from_utf8_lossy(&output.stdout);
     let split_at = raw
@@ -350,7 +384,7 @@ where
 {
     let mut child = match spawn_curl(req) {
         Ok(c) => c,
-        Err(e) => return Err((StreamOutcome::Other(RequestError::Transport(e)), false)),
+        Err(e) => return Err((StreamOutcome::Other(RequestError::RetryableTransport(e)), false)),
     };
     let stdout = match child.stdout.take() {
         Some(s) => s,
@@ -436,11 +470,11 @@ where
     });
 
     let cancelled = cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false);
-    if cancelled && !emitted_any {
+    if cancelled {
         let _ = child.lock().map(|mut c| c.wait());
         return Err((StreamOutcome::Cancelled, emitted_any));
     }
-    if timed_out.load(Ordering::Relaxed) && !emitted_any {
+    if timed_out.load(Ordering::Relaxed) {
         let _ = child.lock().map(|mut c| c.wait());
         return Err((StreamOutcome::IdleTimeout, emitted_any));
     }
@@ -454,16 +488,17 @@ where
         return Err((StreamOutcome::Other(RequestError::Transport(format!("read error: {e}"))), emitted_any));
     }
 
-    if status == 0 {
-        let mut stderr = String::new();
+    if !exit.success() {
+        let mut stderr = Vec::new();
         if let Ok(mut c) = child.lock() {
             if let Some(mut e) = c.stderr.take() {
-                let _ = e.read_to_string(&mut stderr);
+                let _ = e.read_to_end(&mut stderr);
             }
         }
-        if !exit.success() {
-            return Err((StreamOutcome::Other(RequestError::Transport(stderr.trim().to_string())), emitted_any));
-        }
+        return Err((StreamOutcome::Other(curl_exit_error(exit, &stderr)), emitted_any));
+    }
+
+    if status == 0 {
         return Err((StreamOutcome::Other(RequestError::Transport("no response".into())), emitted_any));
     }
 
@@ -476,8 +511,8 @@ where
 
 /// Streams a request, calling `on_line` for each non-empty line of a 2xx
 /// response body. A watchdog kills the underlying curl process if no data
-/// arrives for 60s or if `cancel` is set, and transient failures that occur
-/// before any line has been emitted are retried with backoff.
+/// arrives for 60s or if `cancel` is set. Only connection failures known to
+/// precede the POST are retried, and only before any line has been emitted.
 pub fn request_streaming_with_cancel<F>(
     req: &HttpRequest,
     mut on_line: F,
@@ -499,13 +534,9 @@ where
                         .into(),
                 );
             }
-            Err((StreamOutcome::Other(RequestError::Status(status, _)), false))
-                if is_retriable_status(status) && attempt < MAX_RETRIES =>
+            Err((StreamOutcome::Other(RequestError::RetryableTransport(_)), false))
+                if attempt < MAX_RETRIES =>
             {
-                attempt += 1;
-                std::thread::sleep(backoff_delay(attempt));
-            }
-            Err((StreamOutcome::Other(RequestError::Transport(_)), false)) if attempt < MAX_RETRIES => {
                 attempt += 1;
                 std::thread::sleep(backoff_delay(attempt));
             }
@@ -555,14 +586,14 @@ mod tests {
     }
 
     #[test]
-    fn test_request_retries_on_503_then_succeeds() {
+    fn test_post_does_not_retry_503() {
         let url = start_mock_server(vec![
             "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
         ]);
         let req = HttpRequest { url, headers: vec![], body: Some("{}".into()) };
-        let resp = request(&req).unwrap();
-        assert_eq!(resp.body, "ok");
+        let err = request(&req).unwrap_err();
+        assert!(err.contains("503"), "expected the original 503, got: {err}");
     }
 
     #[test]
@@ -573,6 +604,67 @@ mod tests {
         let req = HttpRequest { url, headers: vec![], body: Some("{}".into()) };
         let err = request(&req).unwrap_err();
         assert!(err.contains("400"), "expected error to mention status 400, got: {err}");
+    }
+
+    #[test]
+    fn test_curl_retry_classification_is_conservative() {
+        assert!(is_retryable_curl_exit_code(Some(5)));
+        assert!(is_retryable_curl_exit_code(Some(6)));
+        assert!(is_retryable_curl_exit_code(Some(7)));
+        assert!(!is_retryable_curl_exit_code(Some(18)));
+        assert!(!is_retryable_curl_exit_code(Some(28)));
+        assert!(!is_retryable_curl_exit_code(None));
+    }
+
+    #[test]
+    fn test_post_curl_configures_timeouts_and_ignores_curlrc() {
+        let req = HttpRequest {
+            url: "https://example.com/v1/messages".into(),
+            headers: vec![],
+            body: Some("{}".into()),
+        };
+        let args: Vec<_> = curl_command(&req)
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(args.first().map(String::as_str), Some("-q"));
+        assert!(args.windows(2).any(|args| args == ["--connect-timeout", CONNECT_TIMEOUT_SECS]));
+        assert!(args.windows(2).any(|args| args == ["--max-time", POST_TIMEOUT_SECS]));
+    }
+
+    #[test]
+    fn test_request_rejects_truncated_response() {
+        let url = start_mock_server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\npartial",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        ]);
+        let req = HttpRequest { url, headers: vec![], body: Some("{}".into()) };
+
+        let result = request(&req);
+
+        assert!(result.is_err(), "a truncated POST must not be accepted or retried");
+    }
+
+    #[test]
+    fn test_streaming_rejects_truncated_response_after_emitting_data() {
+        let url = start_mock_server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\ndata: partial\n",
+        ]);
+        let req = HttpRequest { url, headers: vec![], body: Some("{}".into()) };
+        let mut lines = Vec::new();
+
+        let result = request_streaming_attempt(
+            &req,
+            &mut |line| lines.push(line.to_string()),
+            None,
+        );
+
+        assert_eq!(lines, ["data: partial"]);
+        assert!(matches!(
+            result,
+            Err((StreamOutcome::Other(RequestError::Transport(_)), true))
+        ));
     }
 
     #[test]
