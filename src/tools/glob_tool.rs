@@ -85,7 +85,8 @@ pub(crate) fn format_glob_results(results: &[String], max_listed: usize) -> Stri
     out
 }
 
-pub(crate) fn glob_match(pattern: &str, workspace: &Workspace) -> Result<Vec<String>, String> {
+#[cfg(test)]
+fn glob_match(pattern: &str, workspace: &Workspace) -> Result<Vec<String>, String> {
     Ok(collect_matches(pattern, workspace)?.paths)
 }
 

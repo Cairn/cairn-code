@@ -1,7 +1,7 @@
 //! `skill` tool: load a skill body by name into the conversation.
 
-use crate::skills::{self, Skill};
 use super::registry::Tool;
+use crate::skills::{self, Skill};
 
 pub struct SkillTool {
     skills: Vec<Skill>,

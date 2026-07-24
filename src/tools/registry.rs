@@ -107,7 +107,9 @@ pub fn build_registry(
         r.register(Box::new(crate::tools::skill_tool::SkillTool::new(skills)));
     } else {
         // Still register skill tool so the model can discover "no skills" errors cleanly.
-        r.register(Box::new(crate::tools::skill_tool::SkillTool::new(Vec::new())));
+        r.register(Box::new(crate::tools::skill_tool::SkillTool::new(
+            Vec::new(),
+        )));
     }
     let runtime = crate::mcp::register_mcp_tools(&mut r, mcp);
     (r, runtime)
