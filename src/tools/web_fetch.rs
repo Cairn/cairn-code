@@ -612,7 +612,9 @@ mod tests {
 
     #[test]
     fn truncates_unicode_at_a_character_boundary() {
-        let text = html_to_text(&"é".repeat(6_000));
+        let text = html_to_text(&format!("{}界🙂", "é".repeat(4_999)));
         assert!(text.contains("truncated"), "{text}");
+        assert!(text.starts_with(&"é".repeat(4_999)), "{text}");
+        assert!(!text.contains('界'), "{text}");
     }
 }
