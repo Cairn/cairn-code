@@ -133,29 +133,71 @@ fn strip_html(s: &str) -> String {
 }
 
 fn urlencode(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            ' ' => '+'.to_string(),
-            c => format!("%{:02X}", c as u8),
-        })
-        .collect()
-}
-
-fn url_decode(s: &str) -> String {
     let mut result = String::new();
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let hex: String = chars.by_ref().take(2).collect();
-            if let Ok(code) = u8::from_str_radix(&hex, 16) {
-                result.push(code as char);
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                result.push(byte as char);
             }
-        } else if c == '+' {
-            result.push(' ');
-        } else {
-            result.push(c);
+            b' ' => result.push('+'),
+            byte => result.push_str(&format!("%{byte:02X}")),
         }
     }
     result
+}
+
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                result.push(high * 16 + low);
+                index += 3;
+                continue;
+            }
+        }
+        if bytes[index] == b'+' {
+            result.push(b' ');
+        } else {
+            result.push(bytes[index]);
+        }
+        index += 1;
+    }
+    String::from_utf8_lossy(&result).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_codec_preserves_accented_cjk_and_emoji_text() {
+        let text = "café 世界 🙂";
+        let encoded = "caf%C3%A9+%E4%B8%96%E7%95%8C+%F0%9F%99%82";
+
+        assert_eq!(urlencode(text), encoded);
+        assert_eq!(url_decode(encoded), text);
+        assert_eq!(url_decode("100% 🙂"), "100% 🙂");
+    }
+
+    #[test]
+    fn result_parser_decodes_unicode_redirect_urls() {
+        let html = r#"<a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fcaf%C3%A9%2F%E4%B8%96%E7%95%8C%2F%F0%9F%99%82">Unicode</a>"#;
+
+        let results = parse_ddg_results(html);
+        assert_eq!(results[0].1, "https://example.com/café/世界/🙂");
+    }
 }

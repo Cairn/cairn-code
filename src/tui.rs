@@ -1065,7 +1065,11 @@ impl Tui {
             }
             KeyCode::Left => {
                 if self.cursor > 0 {
-                    self.cursor -= 1;
+                    self.cursor = self.input_buf[..self.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
                 }
                 true
             }
@@ -1089,7 +1093,11 @@ impl Tui {
                     }
                 }
                 if self.cursor < self.input_buf.len() {
-                    self.cursor += 1;
+                    self.cursor += self.input_buf[self.cursor..]
+                        .chars()
+                        .next()
+                        .map(char::len_utf8)
+                        .unwrap_or(0);
                 }
                 true
             }
@@ -1344,8 +1352,13 @@ impl Tui {
             }
             KeyCode::Backspace => {
                 if self.cursor > 0 && !self.show_model_picker && !self.show_provider_picker {
-                    self.input_buf.remove(self.cursor - 1);
-                    self.cursor -= 1;
+                    let previous = self.input_buf[..self.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                    self.input_buf.remove(previous);
+                    self.cursor = previous;
                     self.update_cmd_picker();
                     if self.input_buf.is_empty() {
                         self.refresh_idle_suggestion();
@@ -2877,13 +2890,15 @@ impl Tui {
                 Span::raw(after),
             ]));
             chrome.push(Line::from(""));
-            chrome.push(Line::from(vec![
-                Span::styled(format!("Tool '{}' wants to run:", self.perm_tool_name), white),
-            ]));
+            chrome.push(Line::from(vec![Span::styled(
+                format!("Tool '{}' wants to run:", self.perm_tool_name),
+                white,
+            )]));
             if let Some(warning) = permission_risk_warning(&self.perm_tool_name) {
-                chrome.push(Line::from(vec![
-                    Span::styled(format!("  {warning}"), orange_fg),
-                ]));
+                chrome.push(Line::from(vec![Span::styled(
+                    format!("  {warning}"),
+                    orange_fg,
+                )]));
             }
             if !self.perm_tool_input.is_empty() {
                 chrome.push(Line::from(vec![Span::styled(
@@ -3876,6 +3891,41 @@ mod exit_tests {
                 "{command} should request normal event-loop termination"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod unicode_input_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn press(tui: &mut Tui, code: KeyCode) {
+        tui.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn cursor_and_edits_follow_unicode_character_boundaries() {
+        let mut tui = Tui::new("test", "test-model", "test-provider", ".");
+        tui.input_buf = "é界🙂".into();
+        tui.cursor = tui.input_buf.len();
+
+        press(&mut tui, KeyCode::Left);
+        assert_eq!(tui.cursor, "é界".len());
+        press(&mut tui, KeyCode::Left);
+        assert_eq!(tui.cursor, "é".len());
+        press(&mut tui, KeyCode::Right);
+        assert_eq!(tui.cursor, "é界".len());
+
+        press(&mut tui, KeyCode::Backspace);
+        assert_eq!(tui.input_buf, "é🙂");
+        assert_eq!(tui.cursor, "é".len());
+        press(&mut tui, KeyCode::Delete);
+        assert_eq!(tui.input_buf, "é");
+
+        press(&mut tui, KeyCode::Char('界'));
+        press(&mut tui, KeyCode::Char('🙂'));
+        assert_eq!(tui.input_buf, "é界🙂");
+        assert_eq!(tui.cursor, tui.input_buf.len());
     }
 }
 
