@@ -109,7 +109,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("/mouse", "on|off wheel capture"),
     ("/copy", "copy last assistant message (Ctrl+Y)"),
     ("/select", "plain-text select mode (Ctrl+O)"),
-    ("/save · /sessions · /resume · /delete", "session management"),
+    (
+        "/save · /sessions · /resume · /delete",
+        "session management",
+    ),
     ("/skills · /mcp", "list skills and MCP servers"),
     ("/exit · /quit · /q", "exit Cairn"),
     ("", ""),
@@ -3299,8 +3302,7 @@ impl Tui {
                         }
                     }
                 }
-                cursor_x_in_prompt =
-                    display_width("❯ ") as u16 + display_width(before) as u16;
+                cursor_x_in_prompt = display_width("❯ ") as u16 + display_width(before) as u16;
             }
 
             chrome.push(Line::from(Span::styled(
@@ -3341,10 +3343,7 @@ impl Tui {
                 status.push(Span::styled("esc to interrupt", bold_dim));
                 if let Some(started) = self.running_started {
                     status.push(Span::styled(" · ", bold_dim));
-                    status.push(Span::styled(
-                        format_elapsed_compact(started.elapsed()),
-                        dim,
-                    ));
+                    status.push(Span::styled(format_elapsed_compact(started.elapsed()), dim));
                 }
                 status.push(Span::styled(" · ", bold_dim));
                 status.push(Span::styled(
@@ -4607,10 +4606,7 @@ mod claude_chrome_tests {
     fn ctrl_c_arms_exit_without_transcript_noise() {
         let mut tui = Tui::new("test", "model", "provider", ".");
         assert!(tui.input_buf.is_empty());
-        assert!(tui.handle_key(KeyEvent::new(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL
-        )));
+        assert!(tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
         assert!(tui.ctrl_c_exit_armed);
         assert!(
             !tui.output_lines
