@@ -1,3 +1,5 @@
-# Default reviewer for all paths. CODEOWNERS does not grant permissions;
-# GitHub only auto-requests people who already have write access.
-* @euxaristia
+# Default reviewers for all paths. CODEOWNERS does not grant permissions;
+# GitHub only auto-requests people who already have write access for code-owner
+# enforcement. Listing a triage collaborator is safe (no write elevation) and
+# may still surface them depending on GitHub's request behavior.
+* @euxaristia @PierrunoYT
