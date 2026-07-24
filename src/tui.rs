@@ -2382,11 +2382,7 @@ impl Tui {
         let mut msg = String::from("Saved sessions:\n");
         for s in &sessions {
             let time_str = format_timestamp(s.updated_at);
-            let summary = if s.summary.len() > 60 {
-                format!("{}…", &s.summary[..60])
-            } else {
-                s.summary.clone()
-            };
+            let summary = truncate_summary(&s.summary, 60);
             msg.push_str(&format!(
                 "  {}  {}  {} msgs  {}\n",
                 &s.id[..8],
@@ -2935,11 +2931,7 @@ impl Tui {
                 let s = &self.picker_sessions[i];
                 let is_sel = i == self.picker_session_sel;
                 let prefix = if is_sel { "▸ " } else { "  " };
-                let summary = if s.summary.len() > 50 {
-                    format!("{}…", &s.summary[..50])
-                } else {
-                    s.summary.clone()
-                };
+                let summary = truncate_summary(&s.summary, 50);
                 let time_str = format_timestamp(s.updated_at);
                 chrome.push(Line::from(vec![Span::styled(
                     format!(
@@ -4285,6 +4277,40 @@ fn char_width(c: char) -> usize {
 
 fn display_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
+}
+
+fn truncate_summary(summary: &str, max_chars: usize) -> String {
+    if summary.chars().count() > max_chars {
+        format!("{}…", summary.chars().take(max_chars).collect::<String>())
+    } else {
+        summary.to_string()
+    }
+}
+
+#[cfg(test)]
+mod summary_truncation_tests {
+    use super::*;
+
+    fn assert_unicode_boundaries(max_chars: usize) {
+        for boundary_char in ['🙂', '界', 'é'] {
+            let prefix = "a".repeat(max_chars - 1);
+            let summary = format!("{prefix}{boundary_char}tail");
+            assert_eq!(
+                truncate_summary(&summary, max_chars),
+                format!("{prefix}{boundary_char}…")
+            );
+        }
+    }
+
+    #[test]
+    fn list_summary_truncates_unicode_at_60_characters() {
+        assert_unicode_boundaries(60);
+    }
+
+    #[test]
+    fn picker_summary_truncates_unicode_at_50_characters() {
+        assert_unicode_boundaries(50);
+    }
 }
 
 fn terminal_height() -> Option<usize> {
