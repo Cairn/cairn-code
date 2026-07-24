@@ -62,6 +62,7 @@ impl Tool for ShellTool {
             timeout: timeout_ms.map(Duration::from_millis),
             head_chars: HEAD_CHARS,
             tail_chars: TAIL_CHARS,
+            stdin: None,
         };
         let result = match process_runner::run(command, &options, Some(cancel)) {
             Ok(result) => result,

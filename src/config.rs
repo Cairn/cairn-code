@@ -33,6 +33,157 @@ pub struct Config {
     /// `~/.config/cairn-code/debug_request.json` for troubleshooting.
     /// Off by default (H-03); can also be enabled with `CAIRN_DEBUG_HTTP=1`.
     pub debug_log_requests: bool,
+    /// External harness subagents (`claude`, `agy`, `grok`, `zero`, or custom).
+    pub subagents: SubagentConfig,
+}
+
+/// How to pass the task prompt into a child harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HarnessPromptMode {
+    /// Append the prompt as a single argv element (default).
+    #[default]
+    Arg,
+    /// Write the prompt to the child's stdin.
+    Stdin,
+}
+
+/// Whether a subagent run gets its own git worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubagentIsolation {
+    /// Child runs in the parent workspace (or explicit `cwd`).
+    None,
+    /// Create a git worktree + branch under `.cairn/worktrees/` (default).
+    #[default]
+    Worktree,
+}
+
+impl SubagentIsolation {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "false" | "0" => Some(Self::None),
+            "worktree" | "wt" | "on" | "true" | "1" => Some(Self::Worktree),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Worktree => "worktree",
+        }
+    }
+}
+
+/// One external harness definition (builtin template or config override).
+#[derive(Debug, Clone)]
+pub struct HarnessConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub prompt: HarnessPromptMode,
+    /// Optional per-harness timeout override (ms).
+    pub timeout_ms: Option<u64>,
+}
+
+/// Config for the `subagent` tool and `/subagent` slash command.
+#[derive(Debug, Clone)]
+pub struct SubagentConfig {
+    pub enabled: bool,
+    pub default_timeout_ms: u64,
+    /// Default isolation when the tool/slash omits `isolation` (default: worktree).
+    pub default_isolation: SubagentIsolation,
+    /// Named harnesses from config (override builtins or add custom names).
+    pub harnesses: HashMap<String, HarnessConfig>,
+}
+
+impl Default for SubagentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_timeout_ms: 600_000,
+            default_isolation: SubagentIsolation::Worktree,
+            harnesses: HashMap::new(),
+        }
+    }
+}
+
+impl SubagentConfig {
+    /// Effective enabled flag: config plus `CAIRN_SUBAGENTS=0` kill switch.
+    pub fn is_enabled(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match std::env::var("CAIRN_SUBAGENTS") {
+            Ok(v) => {
+                let t = v.trim();
+                !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+            }
+            Err(_) => true,
+        }
+    }
+
+    pub fn from_json_obj(obj: &HashMap<String, crate::json::JsonValue>) -> Self {
+        let mut cfg = SubagentConfig::default();
+        if let Some(v) = obj.get("enabled").and_then(|v| v.as_bool()) {
+            cfg.enabled = v;
+        }
+        if let Some(v) = obj.get("default_timeout_ms").and_then(|v| v.as_u64()) {
+            if v > 0 {
+                cfg.default_timeout_ms = v;
+            }
+        }
+        if let Some(v) = obj.get("default_isolation").and_then(|v| v.as_str()) {
+            if let Some(iso) = SubagentIsolation::parse(v) {
+                cfg.default_isolation = iso;
+            }
+        }
+        if let Some(map) = obj.get("harnesses").and_then(|v| v.as_object()) {
+            for (name, val) in map {
+                let Some(hobj) = val.as_object() else {
+                    continue;
+                };
+                let command = hobj
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if command.is_empty() {
+                    continue;
+                }
+                let args = hobj
+                    .get("args")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let prompt = match hobj
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("arg")
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "stdin" => HarnessPromptMode::Stdin,
+                    _ => HarnessPromptMode::Arg,
+                };
+                let timeout_ms = hobj.get("timeout_ms").and_then(|v| v.as_u64());
+                cfg.harnesses.insert(
+                    name.clone(),
+                    HarnessConfig {
+                        command,
+                        args,
+                        prompt,
+                        timeout_ms,
+                    },
+                );
+            }
+        }
+        cfg
+    }
 }
 
 impl Default for Config {
@@ -53,6 +204,7 @@ impl Default for Config {
             skills_dir: None,
             mcp: crate::mcp::McpConfig::default(),
             debug_log_requests: false,
+            subagents: SubagentConfig::default(),
         }
     }
 }
@@ -713,6 +865,9 @@ fn parse_config(content: &str) -> Result<Config, String> {
     if let Some(v) = obj.get("debug_log_requests").and_then(|v| v.as_bool()) {
         cfg.debug_log_requests = v;
     }
+    if let Some(sub) = obj.get("subagents").and_then(|v| v.as_object()) {
+        cfg.subagents = SubagentConfig::from_json_obj(sub);
+    }
 
     if let Some(perms) = obj.get("permissions").and_then(|v| v.as_object()) {
         if let Some(arr) = perms.get("auto_allow").and_then(|v| v.as_array()) {
@@ -791,6 +946,34 @@ mod tests {
             !cfg.debug_log_requests,
             "request debug logging off by default (H-03)"
         );
+        assert!(cfg.subagents.enabled, "subagents on by default");
+        assert_eq!(cfg.subagents.default_timeout_ms, 600_000);
+        assert_eq!(cfg.subagents.default_isolation, SubagentIsolation::Worktree);
+    }
+
+    #[test]
+    fn test_parse_subagents() {
+        let cfg = parse_config(
+            r#"{
+            "subagents": {
+                "enabled": false,
+                "default_timeout_ms": 120000,
+                "default_isolation": "none",
+                "harnesses": {
+                    "reviewer": {
+                        "command": "claude",
+                        "args": ["-p"],
+                        "prompt": "arg"
+                    }
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+        assert!(!cfg.subagents.enabled);
+        assert_eq!(cfg.subagents.default_timeout_ms, 120_000);
+        assert_eq!(cfg.subagents.default_isolation, SubagentIsolation::None);
+        assert!(cfg.subagents.harnesses.contains_key("reviewer"));
     }
 
     #[test]

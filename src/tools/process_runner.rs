@@ -26,6 +26,8 @@ pub struct RunOptions {
     pub head_chars: usize,
     /// Characters kept from the end of each stream.
     pub tail_chars: usize,
+    /// Optional bytes written to the child's stdin before waiting.
+    pub stdin: Option<Vec<u8>>,
 }
 
 /// A completed process, with each stream already bounded to head+tail.
@@ -102,6 +104,9 @@ pub fn run(
     options: &RunOptions,
     cancel: Option<&AtomicBool>,
 ) -> Result<RunResult, RunError> {
+    if options.stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     // Overflow (timeout near the end of the monotonic clock) degrades to
@@ -109,6 +114,14 @@ pub fn run(
     let deadline = options.timeout.and_then(|d| Instant::now().checked_add(d));
 
     let mut child = ManagedChild::spawn(command).map_err(RunError::Spawn)?;
+
+    if let Some(input) = options.stdin.as_ref() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = std::io::Write::write_all(&mut stdin, input);
+            // Drop closes the pipe so readers see EOF.
+            drop(stdin);
+        }
+    }
 
     let stdout_rx = drain_bounded(
         child.stdout.take().expect("stdout is piped"),
@@ -677,6 +690,7 @@ mod tests {
                 timeout: Some(Duration::from_secs(30)),
                 head_chars: 6_000,
                 tail_chars: 4_000,
+                stdin: None,
             },
             None,
         )
@@ -694,6 +708,7 @@ mod tests {
                 timeout: Some(Duration::from_millis(200)),
                 head_chars: 100,
                 tail_chars: 100,
+                stdin: None,
             },
             None,
         )
@@ -719,6 +734,7 @@ mod tests {
                     timeout: None,
                     head_chars: 100,
                     tail_chars: 100,
+                    stdin: None,
                 },
                 Some(&cancel),
             )

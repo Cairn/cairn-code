@@ -32,3 +32,6 @@ cairn-code.json
 .env
 
 /target/
+
+# Subagent git worktrees
+.cairn/

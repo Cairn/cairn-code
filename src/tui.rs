@@ -115,6 +115,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ),
     ("/skills · /mcp", "list skills and MCP servers"),
     (
+        "/subagent",
+        "list or run external harnesses (claude, agy, …)",
+    ),
+    (
         "/reset · /reset apply",
         "ChatGPT banked rate-limit resets (OpenAI OAuth)",
     ),
@@ -137,6 +141,10 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Sounds", "CAIRN_SOUND=0 to mute"),
     ("Skills", "packs as <dir>/<name>/SKILL.md"),
     ("MCP", "stdio servers in config · tools need permission"),
+    (
+        "Subagent",
+        "headless external harnesses; see /subagent list",
+    ),
 ];
 /// Rows for the `?` shortcuts panel (keys must match real bindings in handle_key).
 const SHORTCUT_ROWS: &[(&str, &str)] = &[
@@ -2089,6 +2097,9 @@ impl Tui {
                     });
                 }
             }
+            "/subagent" => {
+                self.handle_subagent_command(&parts[1..]);
+            }
             "/mcp" => {
                 let cfg = match crate::config::Config::load() {
                     Ok(cfg) => cfg,
@@ -2521,6 +2532,154 @@ impl Tui {
         }
         self.ctrl_c_exit_armed = true;
         true
+    }
+
+    /// `/subagent` [list|help|[worktree|none] <harness> <prompt…>]
+    ///
+    /// Long runs are handed to the agent worker thread (like OAuth) so the TUI
+    /// event loop keeps painting and Ctrl+C can set the cancel flag.
+    fn handle_subagent_command(&mut self, args: &[&str]) {
+        let cfg = match crate::config::Config::load() {
+            Ok(cfg) => cfg,
+            Err(error) => {
+                self.output_lines.push(OutputLine {
+                    type_: "error".into(),
+                    content: format!("Error loading configuration: {error}"),
+                    tool_name: String::new(),
+                    duration: String::new(),
+                });
+                return;
+            }
+        };
+        let sub = &cfg.subagents;
+
+        // Kill switch applies to list and run (same message as the tool).
+        if !sub.is_enabled() {
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content:
+                    "Subagents are disabled (config subagents.enabled=false or CAIRN_SUBAGENTS=0)."
+                        .into(),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        }
+
+        if args.is_empty()
+            || matches!(
+                args[0].to_ascii_lowercase().as_str(),
+                "list" | "ls" | "help" | "?"
+            )
+        {
+            let mut body = crate::tools::subagent::format_list(sub);
+            if matches!(
+                args.first().map(|s| s.to_ascii_lowercase()).as_deref(),
+                Some("help" | "?")
+            ) {
+                body.push_str(
+                    "\n\nExamples:\n  /subagent list\n  /subagent claude summarize this repo\n  /subagent none agy quick question with no worktree\n  /subagent worktree claude implement the fix on an isolated branch",
+                );
+            }
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: body,
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        }
+
+        if !matches!(self.state, State::Idle) {
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: "Wait for the current turn to finish before running /subagent.".into(),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        }
+
+        let mut rest = args;
+        let isolation = if let Some(iso) =
+            crate::config::SubagentIsolation::parse(rest.first().copied().unwrap_or(""))
+        {
+            // Only treat as isolation if a harness name follows.
+            if rest.len() >= 2 {
+                rest = &rest[1..];
+                iso
+            } else {
+                sub.default_isolation
+            }
+        } else {
+            sub.default_isolation
+        };
+
+        let harness_name = rest.first().copied().unwrap_or("");
+        let prompt = rest.get(1..).unwrap_or(&[]).join(" ");
+        if harness_name.is_empty() || prompt.trim().is_empty() {
+            self.output_lines.push(OutputLine {
+                type_: "system".into(),
+                content: "Usage: /subagent [worktree|none] <harness> <prompt…>\nOr: /subagent list"
+                    .into(),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        }
+
+        let harness = match crate::tools::subagent::resolve_harness(sub, harness_name) {
+            Ok(h) => h,
+            Err(e) => {
+                self.output_lines.push(OutputLine {
+                    type_: "error".into(),
+                    content: e,
+                    tool_name: String::new(),
+                    duration: String::new(),
+                });
+                return;
+            }
+        };
+
+        if self.agent_tx.is_none() {
+            self.output_lines.push(OutputLine {
+                type_: "error".into(),
+                content: "Agent channel not ready; cannot run /subagent.".into(),
+                tool_name: String::new(),
+                duration: String::new(),
+            });
+            return;
+        }
+
+        let timeout = harness.timeout_ms.unwrap_or(sub.default_timeout_ms);
+        // Escape prompt for a minimal JSON payload the agent worker understands.
+        let payload = format!(
+            r#"{{"harness":"{}","prompt":"{}","isolation":"{}","timeout_ms":{}}}"#,
+            escape_json_simple(harness_name),
+            escape_json_simple(&prompt),
+            escape_json_simple(isolation.as_str()),
+            timeout
+        );
+
+        self.output_lines.push(OutputLine {
+            type_: "system".into(),
+            content: format!(
+                "Running subagent harness={harness_name} isolation={} (binary={})… Ctrl+C to cancel.",
+                isolation.as_str(),
+                harness.command
+            ),
+            tool_name: String::new(),
+            duration: String::new(),
+        });
+
+        if let Some(flag) = &self.cancel_flag {
+            flag.store(false, Ordering::Relaxed);
+        }
+        self.expect_turn_notify = true;
+        self.begin_running();
+        if let Some(tx) = &self.agent_tx {
+            let _ = tx.send(format!("__subagent__:{payload}"));
+        }
     }
 
     fn open_theme_picker(&mut self) {
@@ -4256,6 +4415,7 @@ fn completion_wants_trailing_space(completion: &str) -> bool {
             | "/thinking"
             | "/suggestions"
             | "/mouse"
+            | "/subagent"
     )
 }
 
@@ -4667,6 +4827,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/select", "Plain-text view for terminal selection"),
     ("/sessions", "List saved sessions"),
     ("/skills", "List available skills"),
+    ("/subagent", "List or run an external harness subagent"),
     ("/suggestions", "Toggle idle prompt suggestions"),
     ("/theme", "Change the color theme"),
     ("/thinking", "Toggle thinking output"),
@@ -4686,6 +4847,10 @@ pub(crate) fn slash_completion_help(completion: &str) -> Option<&'static str> {
         ["/auth", "status"] => Some("Show credential status"),
         ["/auth", "key"] => Some("Paste an API key"),
         ["/theme", "list"] => Some("List theme names"),
+        ["/subagent", "list"] => Some("List harnesses"),
+        ["/subagent", "help"] => Some("Usage"),
+        ["/subagent", _, _, ..] => Some("prompt"),
+        ["/subagent", _] => Some("harness"),
         ["/reset", "list"] => Some("List banked rate-limit resets"),
         ["/reset", "apply"] => Some("Apply a banked rate-limit reset"),
         ["/reset", "status"] => Some("Show rate-limit reset status"),
