@@ -258,6 +258,8 @@ pub struct Tui {
     current_session_id: Option<String>,
     /// created_at for the active session (preserved across autosaves).
     session_created_at: u64,
+    /// Throttle mid-turn checkpoint disk writes (wall clock).
+    last_checkpoint_save: Option<Instant>,
     /// Full agent transcript (tools included) for session files.
     live_mirror: Option<session::LiveMirror>,
     /// When true, the next `Done` event is a finished agent turn (play sound + refresh hint).
@@ -353,6 +355,7 @@ impl Tui {
             last_body_wrapped: 0,
             current_session_id: None,
             session_created_at: 0,
+            last_checkpoint_save: None,
             live_mirror: None,
             expect_turn_notify: false,
             idle_suggestion: None,
@@ -384,6 +387,9 @@ impl Tui {
     fn begin_running(&mut self) {
         self.state = State::Running;
         self.running_started = Some(Instant::now());
+        // Allow the first mid-turn Checkpoint of this run to hit disk even if
+        // we just saved at the previous Done (throttle would otherwise skip it).
+        self.last_checkpoint_save = None;
         // New verb each turn (Claude Code / OpenClaude spinner style).
         let seed = self
             .spinner_idx
@@ -644,11 +650,16 @@ impl Tui {
                                 duration: String::new(),
                             });
                         }
+                        AgentEvent::Checkpoint => {
+                            // Mid-turn durable flush (throttled) so crashes do not
+                            // drop everything since the previous Done/exit save.
+                            self.checkpoint_session();
+                        }
                         AgentEvent::Done => {
                             self.flush_streaming();
                             self.state = State::Idle;
                             self.running_started = None;
-                            // Autosave after each finished turn (not only manual /save).
+                            // Always flush on turn end (bypass throttle).
                             self.autosave_session(false);
                             if self.expect_turn_notify {
                                 self.expect_turn_notify = false;
@@ -1709,6 +1720,9 @@ impl Tui {
                 self.transcript_follow = true;
                 self.expect_turn_notify = true;
                 self.idle_suggestion = None;
+                // Stable id for the whole conversation so mid-turn checkpoints
+                // and the final save share one file from the first prompt.
+                self.ensure_session_identity();
                 self.output_lines.push(OutputLine {
                     type_: "user".into(),
                     content: input.clone(),
@@ -1825,6 +1839,7 @@ impl Tui {
                 self.thinking_started = None;
                 self.current_session_id = None;
                 self.session_created_at = 0;
+                self.last_checkpoint_save = None;
                 self.total_usage = llm::Usage::default();
                 if let Some(tx) = &self.agent_tx {
                     let _ = tx.send("__clear__".to_string());
@@ -2717,6 +2732,32 @@ impl Tui {
         )
     }
 
+    /// Mid-turn durable checkpoint. Throttled so rapid tool loops do not hammer
+    /// the disk, but always writes at least every few seconds while history grows.
+    fn checkpoint_session(&mut self) {
+        const MIN_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
+        if let Some(last) = self.last_checkpoint_save {
+            if last.elapsed() < MIN_CHECKPOINT_INTERVAL {
+                return;
+            }
+        }
+        self.autosave_session(false);
+    }
+
+    /// Ensure we have a stable session id before the first disk write so mid-turn
+    /// checkpoints and the final Done save land on the same file.
+    fn ensure_session_identity(&mut self) {
+        if self.current_session_id.is_none() {
+            self.current_session_id = Some(session::new_id());
+        }
+        if self.session_created_at == 0 {
+            self.session_created_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+        }
+    }
+
     /// Save (or update) the current session. When `announce` is true, print a
     /// system line (manual `/save`). Autosave stays quiet unless it fails.
     fn autosave_session(&mut self, announce: bool) {
@@ -2733,6 +2774,7 @@ impl Tui {
             return;
         }
 
+        self.ensure_session_identity();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2761,6 +2803,7 @@ impl Tui {
             Ok(()) => {
                 self.current_session_id = Some(id.clone());
                 self.session_created_at = created_at;
+                self.last_checkpoint_save = Some(Instant::now());
                 if announce {
                     let short = if id.len() >= 8 { &id[..8] } else { id.as_str() };
                     self.output_lines.push(OutputLine {
