@@ -257,6 +257,37 @@ fn keyring_user(provider: &str) -> String {
     format!("oauth:{}", provider.trim().to_ascii_lowercase())
 }
 
+/// Single entry point for OAuth credential access.
+///
+/// The test build deliberately does **not** go through `keyring::Entry`. That
+/// type is `keyring::v1::Entry`, and its `new` installs the platform
+/// credential store process-wide on first call:
+///
+/// ```ignore
+/// if SET_CREDENTIAL_STORE.compare_exchange(false, true, ..) == Ok(false) {
+///     set_credential_store()?   // keyring_core::set_default_store(<platform store>)
+/// }
+/// ```
+///
+/// `keyring_core` keeps one default store per process, so that call replaces
+/// the mock store the config tests install — and it can land *after* the mock
+/// is in place, because it is driven by whichever test first reaches
+/// `XaiProvider::get_key` (which checks `has_token` before anything else).
+/// The config keyring tests then read and write through the real OS credential
+/// store and see none of their own writes. Opening `keyring_core::Entry`
+/// directly under `cfg(test)` keeps the platform store from ever being
+/// installed. Mirrors the split already used by `config::keyring_entry`.
+#[cfg(not(test))]
+pub(crate) fn oauth_entry(provider: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new("cairn-code", &keyring_user(provider)).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn oauth_entry(provider: &str) -> Result<keyring_core::Entry, String> {
+    crate::config::init_test_keyring();
+    keyring_core::Entry::new("cairn-code", &keyring_user(provider)).map_err(|e| e.to_string())
+}
+
 pub fn save_token(provider: &str, token: &Token) -> Result<(), String> {
     let json = format!(
         "{{\"access_token\":\"{}\",\"refresh_token\":\"{}\",\"token_type\":\"{}\",\"expires_at\":{}}}",
@@ -265,17 +296,13 @@ pub fn save_token(provider: &str, token: &Token) -> Result<(), String> {
         json_escape(&token.token_type),
         token.expires_at
     );
-    keyring::Entry::new("cairn-code", &keyring_user(provider))
-        .map_err(|e| e.to_string())?
+    oauth_entry(provider)?
         .set_password(&json)
         .map_err(|e| e.to_string())
 }
 
 pub fn load_token(provider: &str) -> Option<Token> {
-    let raw = keyring::Entry::new("cairn-code", &keyring_user(provider))
-        .ok()?
-        .get_password()
-        .ok()?;
+    let raw = oauth_entry(provider).ok()?.get_password().ok()?;
     let val = json::parse(&raw).ok()?;
     let obj = val.as_object()?;
     let access = obj.get("access_token")?.as_str()?.to_string();
@@ -307,8 +334,7 @@ pub fn delete_token(provider: &str) -> Result<bool, String> {
         .lock()
         .map_err(|_| "oauth: credential lock poisoned".to_string())?;
     let token = load_token(provider);
-    let entry =
-        keyring::Entry::new("cairn-code", &keyring_user(provider)).map_err(|e| e.to_string())?;
+    let entry = oauth_entry(provider)?;
     let result = match entry.delete_credential() {
         Ok(()) => Ok(true),
         Err(keyring::Error::NoEntry) => Ok(false),
@@ -514,6 +540,27 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Guards the `cfg` split on [`oauth_entry`].
+    ///
+    /// Opening a `keyring::Entry` anywhere in a test build installs the
+    /// platform credential store for the whole process, replacing the mock and
+    /// making the config keyring tests read the real OS store — which fails
+    /// intermittently, only under the full suite, and only depending on which
+    /// test reached the keyring first. Asserting the credential is a mock here
+    /// catches a regression at its source rather than as a flake elsewhere.
+    #[test]
+    fn oauth_entry_opens_mock_credentials_in_test_builds() {
+        let entry = oauth_entry("mock-store-regression-probe").unwrap();
+        assert!(
+            entry
+                .as_any()
+                .downcast_ref::<keyring_core::mock::Cred>()
+                .is_some(),
+            "oauth_entry must not open keyring::Entry in test builds: doing so \
+             installs the platform store process-wide and clobbers the mock"
+        );
+    }
 
     #[test]
     fn form_encode_basic() {

@@ -281,8 +281,14 @@ fn keyring_entry(provider: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new("cairn-code", provider).map_err(|e| e.to_string())
 }
 
+/// Installs the process-wide mock keyring used by tests.
+///
+/// `keyring_core` holds one default store per process. Every module that opens
+/// a credential in a test build must route through here, and must open it with
+/// `keyring_core::Entry` rather than `keyring::Entry` — see
+/// [`crate::oauth::oauth_entry`] for why.
 #[cfg(test)]
-fn keyring_entry(provider: &str) -> Result<keyring_core::Entry, String> {
+pub(crate) fn init_test_keyring() {
     use std::sync::OnceLock;
 
     static MOCK_KEYRING: OnceLock<()> = OnceLock::new();
@@ -290,6 +296,11 @@ fn keyring_entry(provider: &str) -> Result<keyring_core::Entry, String> {
         let store = keyring_core::mock::Store::new().expect("create mock keyring store");
         keyring_core::set_default_store(store);
     });
+}
+
+#[cfg(test)]
+fn keyring_entry(provider: &str) -> Result<keyring_core::Entry, String> {
+    init_test_keyring();
     keyring_core::Entry::new("cairn-code", provider).map_err(|e| e.to_string())
 }
 
