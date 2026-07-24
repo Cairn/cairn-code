@@ -403,7 +403,24 @@ fn write_atomic_private(path: &std::path::Path, contents: &str) -> std::io::Resu
     result
 }
 
-fn curl_command(req: &HttpRequest) -> Command {
+/// Rejects header names/values containing control characters.
+///
+/// curl passes `-H` through verbatim, so an embedded CR or LF would splice
+/// extra headers into the request. Values reach here from config and provider
+/// code rather than from the model or the network, so this is defence in depth
+/// — but it is the kind of check that is cheap now and expensive to add after
+/// a new caller starts forwarding a value from somewhere less trusted.
+fn check_header(name: &str, value: &str) -> Result<(), RequestError> {
+    let bad = |s: &str| s.chars().any(|c| c.is_control());
+    if bad(name) || bad(value) {
+        return Err(RequestError::Transport(format!(
+            "header {name:?} contains a control character"
+        )));
+    }
+    Ok(())
+}
+
+fn curl_command(req: &HttpRequest) -> Result<Command, RequestError> {
     let mut cmd = Command::new("curl");
     // Must be the first argument so curl does not load settings (including
     // unsafe retry policies) from the user's curlrc.
@@ -413,30 +430,38 @@ fn curl_command(req: &HttpRequest) -> Command {
         "-i",
         "-X",
         "POST",
+        // Confine the transport to HTTP(S) so a malformed base URL cannot
+        // reach file:, scp:, or similar. `web_fetch` already does this; the
+        // provider path had no equivalent.
+        "--proto",
+        "=http,https",
         "--connect-timeout",
         CONNECT_TIMEOUT_SECS,
         "--max-time",
         POST_TIMEOUT_SECS,
-        &req.url,
     ]);
     for (k, v) in &req.headers {
+        check_header(k, v)?;
         cmd.arg("-H").arg(format!("{k}: {v}"));
     }
     // Disable "Expect: 100-continue" so the response is a single header block,
     // which keeps status-line parsing simple for large request bodies.
     cmd.arg("-H").arg("Expect:");
     cmd.arg("--data-binary").arg("@-");
+    // The URL goes last, behind `--`: everything after that separator is a
+    // URL, so it must follow every option rather than precede them.
+    cmd.arg("--").arg(&req.url);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    cmd
+    Ok(cmd)
 }
 
 fn spawn_curl(req: &HttpRequest) -> Result<ManagedChild, String> {
     debug_log_request(req);
 
-    let mut child =
-        ManagedChild::spawn(curl_command(req)).map_err(|error| format!("curl: {error}"))?;
+    let mut child = ManagedChild::spawn(curl_command(req).map_err(RequestError::into_string)?)
+        .map_err(|error| format!("curl: {error}"))?;
 
     let body = req.body.clone().unwrap_or_default();
     let mut stdin = child.stdin.take().ok_or("curl: no stdin")?;
@@ -514,7 +539,7 @@ fn parse_status_line(line: &str) -> u16 {
 fn request_once(req: &HttpRequest) -> Result<HttpResponse, RequestError> {
     debug_log_request(req);
     let output = run_curl_with_cap(
-        curl_command(req),
+        curl_command(req)?,
         Some(req.body.clone().unwrap_or_default().into_bytes()),
         RESPONSE_CAP_BYTES,
     )?;
@@ -599,7 +624,7 @@ pub fn form_post(url: &str, form_body: &str) -> Result<(u16, String), String> {
 /// never written to the debug request log.
 fn request_raw_once(req: &HttpRequest) -> Result<(u16, String), RequestError> {
     let output = run_curl_with_cap(
-        curl_command(req),
+        curl_command(req)?,
         Some(req.body.clone().unwrap_or_default().into_bytes()),
         RAW_RESPONSE_CAP_BYTES,
     )?;
@@ -648,11 +673,23 @@ pub fn request_get(url: &str, headers: &[(String, String)]) -> Result<HttpRespon
 
 fn request_get_once(url: &str, headers: &[(String, String)]) -> Result<HttpResponse, RequestError> {
     let mut cmd = Command::new("curl");
-    cmd.args(["-q", "-sS", "-i", "-X", "GET", "--max-time", "12", url]);
+    cmd.args([
+        "-q",
+        "-sS",
+        "-i",
+        "-X",
+        "GET",
+        "--proto",
+        "=http,https",
+        "--max-time",
+        "12",
+    ]);
     for (k, v) in headers {
+        check_header(k, v)?;
         cmd.arg("-H").arg(format!("{k}: {v}"));
     }
     cmd.arg("-H").arg("Expect:");
+    cmd.arg("--").arg(url);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     let output = run_curl_with_cap(cmd, None, RESPONSE_CAP_BYTES)?;
@@ -1167,6 +1204,7 @@ mod tests {
             body: Some("{}".into()),
         };
         let args: Vec<_> = curl_command(&req)
+            .expect("plain headers are accepted")
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
@@ -1178,6 +1216,65 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|args| args == ["--max-time", POST_TIMEOUT_SECS]));
+    }
+
+    #[test]
+    fn test_post_curl_restricts_protocols_and_terminates_options() {
+        let req = HttpRequest {
+            url: "https://example.com/v1/messages".into(),
+            headers: vec![("x-api-key".into(), "k".into())],
+            body: Some("{}".into()),
+        };
+        let args: Vec<_> = curl_command(&req)
+            .expect("plain headers are accepted")
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(args.windows(2).any(|a| a == ["--proto", "=http,https"]));
+        // `--` must be the final option: everything after it is read as a URL,
+        // so any option placed later would be sent as one instead.
+        assert_eq!(
+            args.iter().rev().take(2).cloned().collect::<Vec<_>>(),
+            vec![
+                "https://example.com/v1/messages".to_string(),
+                "--".to_string()
+            ],
+            "URL must be last, immediately behind `--`: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_curl_rejects_headers_containing_control_characters() {
+        for (name, value) in [
+            ("x-api-key", "abc\r\nX-Injected: 1"),
+            ("x-api-key", "abc\ndef"),
+            ("x-bad\rname", "v"),
+        ] {
+            let req = HttpRequest {
+                url: "https://example.com/".into(),
+                headers: vec![(name.into(), value.into())],
+                body: None,
+            };
+            let error = curl_command(&req)
+                .err()
+                .unwrap_or_else(|| panic!("{name}: {value:?} should be rejected"))
+                .into_string();
+            assert!(error.contains("control character"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_curl_accepts_ordinary_header_values() {
+        let req = HttpRequest {
+            url: "https://example.com/".into(),
+            headers: vec![
+                ("content-type".into(), "application/json".into()),
+                ("authorization".into(), "Bearer sk-abc.123-_~+/=".into()),
+            ],
+            body: None,
+        };
+        assert!(curl_command(&req).is_ok());
     }
 
     #[test]
