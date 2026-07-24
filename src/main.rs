@@ -70,7 +70,9 @@ fn main() -> ExitCode {
                 arg if !arg.starts_with('-') => {
                     if initial_prompt.is_some() {
                         eprintln!("Error: unexpected positional argument '{arg}'");
-                        eprintln!("Pass the prompt as one quoted argument. See '--help' for usage.");
+                        eprintln!(
+                            "Pass the prompt as one quoted argument. See '--help' for usage."
+                        );
                         return ExitCode::FAILURE;
                     }
                     initial_prompt = Some(arg.to_string());

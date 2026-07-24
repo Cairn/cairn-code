@@ -40,7 +40,16 @@ fn exec_mode_emits_stream_json_events() {
     let output = child.wait_with_output().expect("wait for cairn-code exec");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(stdout.contains("\"type\":\"run_start\""), "stdout missing run_start: {stdout}");
-    assert!(stdout.contains("test-exec-session-123"), "stdout missing session ID: {stdout}");
-    assert!(stdout.contains("\"type\":\"run_end\""), "stdout missing run_end: {stdout}");
+    assert!(
+        stdout.contains("\"type\":\"run_start\""),
+        "stdout missing run_start: {stdout}"
+    );
+    assert!(
+        stdout.contains("test-exec-session-123"),
+        "stdout missing session ID: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"type\":\"run_end\""),
+        "stdout missing run_end: {stdout}"
+    );
 }
