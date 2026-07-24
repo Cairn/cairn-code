@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
+#[allow(dead_code)]
 fn write_string(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
     f.write_str("\"")?;
     for character in value.chars() {

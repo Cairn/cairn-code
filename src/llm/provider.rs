@@ -109,26 +109,19 @@ pub fn default_providers() -> HashMap<String, Box<dyn Provider>> {
         "anthropic".into(),
         Box::new(crate::llm::anthropic::AnthropicProvider::new()),
     );
-    let openai = match crate::config::config_get_api_key("openai") {
-        Some(key) => crate::llm::openai::OpenAIProvider::new().with_api_key(&key),
-        None => crate::llm::openai::OpenAIProvider::new(),
-    };
-    map.insert("openai".into(), Box::new(openai));
-    let openrouter = match crate::config::config_get_api_key("openrouter") {
-        Some(key) => crate::llm::openrouter::OpenRouterProvider::new().with_api_key(&key),
-        None => crate::llm::openrouter::OpenRouterProvider::new(),
-    };
-    map.insert("openrouter".into(), Box::new(openrouter));
-    let opengateway = match crate::config::config_get_api_key("opengateway") {
-        Some(key) => crate::llm::opengateway::OpenGatewayProvider::new().with_api_key(&key),
-        None => crate::llm::opengateway::OpenGatewayProvider::new(),
-    };
-    map.insert("opengateway".into(), Box::new(opengateway));
-    let xai = match crate::config::config_get_api_key("xai") {
-        Some(key) => crate::llm::xai::XaiProvider::new().with_api_key(&key),
-        None => crate::llm::xai::XaiProvider::new(),
-    };
-    map.insert("xai".into(), Box::new(xai));
+    map.insert(
+        "openai".into(),
+        Box::new(crate::llm::openai::OpenAIProvider::new()),
+    );
+    map.insert(
+        "openrouter".into(),
+        Box::new(crate::llm::openrouter::OpenRouterProvider::new()),
+    );
+    map.insert(
+        "opengateway".into(),
+        Box::new(crate::llm::opengateway::OpenGatewayProvider::new()),
+    );
+    map.insert("xai".into(), Box::new(crate::llm::xai::XaiProvider::new()));
     map.insert(
         "ollama".into(),
         Box::new(crate::llm::ollama::OllamaProvider::new()),

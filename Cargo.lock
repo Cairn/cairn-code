@@ -338,11 +338,13 @@ dependencies = [
  "cap-std",
  "glob",
  "keyring",
+ "keyring-core",
  "libc",
  "ratatui",
  "regex",
  "serde_json",
  "syntect",
+ "tempfile",
  "windows-sys 0.61.2",
 ]
 

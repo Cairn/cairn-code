@@ -1,30 +1,13 @@
-mod agent;
-mod config;
-mod cost;
-mod http_client;
-mod json;
-mod llm;
-mod markdown;
-mod mcp;
-mod notify;
-mod oauth;
-mod redact;
-mod session;
-mod skills;
-mod theme;
-mod tools;
-mod tui;
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::{io::Read, process::ExitCode};
 
-use agent::Agent;
-use agent::AgentEvent;
-use config::Config;
-use llm::provider;
+use cairn_code::agent::{Agent, AgentEvent};
+use cairn_code::config::{self, Config};
+use cairn_code::llm::provider;
+use cairn_code::{http_client, llm, oauth, session, skills, tools, tui};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -52,7 +35,13 @@ fn main() -> ExitCode {
         i += 1;
     }
 
-    let cfg = Config::load();
+    let cfg = match Config::load() {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            eprintln!("Error loading configuration: {error}");
+            std::process::exit(1);
+        }
+    };
     // Off by default (H-03): only write request metadata to disk when the
     // user has explicitly opted in via config or CAIRN_DEBUG_HTTP=1.
     http_client::set_debug_logging_enabled(cfg.debug_log_requests);
@@ -165,7 +154,7 @@ fn main() -> ExitCode {
                     let id = cmd.trim_start_matches("__load_session__:");
                     if !id.is_empty() {
                         let sessions_dir = config::sessions_dir();
-                        if let Ok(session) = crate::session::load(&sessions_dir, id) {
+                        if let Ok(session) = session::load(&sessions_dir, id) {
                             let usage = llm::Usage {
                                 input_tokens: session.tokens_in,
                                 output_tokens: session.tokens_out,
@@ -195,7 +184,7 @@ fn main() -> ExitCode {
                     let msg = if provider == "xai" {
                         // Surface the user code before the blocking poll via a system-style error-free path:
                         // request device code first, emit as text event, then poll.
-                        match crate::oauth::request_xai_device_code() {
+                        match oauth::request_xai_device_code() {
                             Ok(auth) => {
                                 let uri = if !auth.verification_uri_complete.is_empty() {
                                     auth.verification_uri_complete.clone()
@@ -207,9 +196,9 @@ fn main() -> ExitCode {
                                     auth.user_code
                                 );
                                 let _ = event_tx.send(AgentEvent::Text(notice));
-                                crate::oauth::open_url(&uri);
-                                match crate::oauth::poll_xai_device_token(&auth, &cancel2) {
-                                    Ok(token) => match crate::oauth::save_token("xai", &token) {
+                                oauth::open_url(&uri);
+                                match oauth::poll_xai_device_token(&auth, &cancel2) {
+                                    Ok(token) => match oauth::save_token("xai", &token) {
                                         Ok(()) => {
                                             "xAI OAuth login saved to the OS keyring. You can select provider xai now.".to_string()
                                         }
@@ -232,7 +221,7 @@ fn main() -> ExitCode {
                     let provider = cmd
                         .trim_start_matches("__auth_logout__:")
                         .to_ascii_lowercase();
-                    let msg = match crate::oauth::delete_token(&provider) {
+                    let msg = match oauth::delete_token(&provider) {
                         Ok(true) => format!("Removed OAuth login for {provider}."),
                         Ok(false) => format!("No OAuth login stored for {provider}."),
                         Err(e) => format!("Logout failed: {e}"),
@@ -241,7 +230,7 @@ fn main() -> ExitCode {
                     let _ = event_tx.send(AgentEvent::Done);
                 }
                 Ok(cmd) if cmd == "__auth_status__" => {
-                    let lines = [crate::oauth::status_line("xai")];
+                    let lines = [oauth::status_line("xai")];
                     let _ = event_tx.send(AgentEvent::Text(format!("\n{}\n", lines.join("\n"))));
                     let _ = event_tx.send(AgentEvent::Done);
                 }

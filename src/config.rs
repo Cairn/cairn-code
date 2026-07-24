@@ -55,12 +55,12 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn load() -> Self {
+    pub fn load() -> Result<Self, String> {
         let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let Some(user_path) = config_path() else {
             let mut cfg = Config::default();
             cfg.system_prompt_file.clear();
-            return cfg;
+            return Ok(cfg);
         };
         load_for_workspace(&user_path, &workspace)
     }
@@ -128,14 +128,15 @@ pub fn env_key_for(provider: &str) -> Option<String> {
     None
 }
 
-fn load_for_workspace(user_path: &Path, workspace: &Path) -> Config {
+fn load_for_workspace(user_path: &Path, workspace: &Path) -> Result<Config, String> {
     migrate_plaintext_keys_in_file(user_path);
 
-    let user_content = fs::read_to_string(user_path).ok();
-    let mut cfg = user_content
-        .as_deref()
-        .and_then(|content| parse_config(content).ok())
-        .unwrap_or_default();
+    let user_content = read_optional_config(user_path)?;
+    let mut cfg = match user_content.as_deref() {
+        Some(content) => parse_config(content)
+            .map_err(|error| format!("failed to parse config {}: {error}", user_path.display()))?,
+        None => Config::default(),
+    };
     let user_selected_prompt = user_content
         .as_deref()
         .and_then(|content| crate::json::parse(content).ok())
@@ -158,25 +159,27 @@ fn load_for_workspace(user_path: &Path, workspace: &Path) -> Config {
         .as_deref()
         .is_some_and(|content| workspace_is_trusted(content, workspace));
     if !trusted {
-        return cfg;
+        return Ok(cfg);
     }
 
     let project_path = workspace.join(".cairn/config.json");
-    let Some(project_content) = fs::read_to_string(project_path).ok() else {
+    let Some(project_content) = read_optional_config(&project_path)? else {
         if user_selected_prompt.is_none() {
             if let Some(path) = resolve_workspace_prompt(workspace, "CAIRN.md") {
                 cfg.system_prompt_file = path.to_string_lossy().into_owned();
             }
         }
-        return cfg;
+        return Ok(cfg);
     };
 
-    let Ok(project_value) = crate::json::parse(&project_content) else {
-        return cfg;
-    };
-    let Some(project) = project_value.as_object() else {
-        return cfg;
-    };
+    let project_value = crate::json::parse(&project_content)
+        .map_err(|error| format!("failed to parse config {}: {error}", project_path.display()))?;
+    let project = project_value.as_object().ok_or_else(|| {
+        format!(
+            "failed to parse config {}: config must be an object",
+            project_path.display()
+        )
+    })?;
 
     apply_project_preferences(&mut cfg, project);
 
@@ -190,7 +193,15 @@ fn load_for_workspace(user_path: &Path, workspace: &Path) -> Config {
         }
     }
 
-    cfg
+    Ok(cfg)
+}
+
+fn read_optional_config(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("failed to read config {}: {error}", path.display())),
+    }
 }
 
 fn resolve_user_prompt(user_path: &Path, prompt: &str) -> Option<PathBuf> {
@@ -262,8 +273,21 @@ fn resolve_workspace_prompt(workspace: &Path, prompt: &str) -> Option<PathBuf> {
     (candidate.is_file() && candidate.starts_with(&workspace)).then_some(candidate)
 }
 
+#[cfg(not(test))]
 fn keyring_entry(provider: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new("cairn-code", provider).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+fn keyring_entry(provider: &str) -> Result<keyring_core::Entry, String> {
+    use std::sync::OnceLock;
+
+    static MOCK_KEYRING: OnceLock<()> = OnceLock::new();
+    MOCK_KEYRING.get_or_init(|| {
+        let store = keyring_core::mock::Store::new().expect("create mock keyring store");
+        keyring_core::set_default_store(store);
+    });
+    keyring_core::Entry::new("cairn-code", provider).map_err(|e| e.to_string())
 }
 
 fn keyring_set(provider: &str, key: &str) -> Result<(), String> {
@@ -341,16 +365,7 @@ pub fn sessions_dir() -> String {
 pub fn save_config(provider: &str, model: &str, api_key: Option<&str>) -> Result<(), String> {
     use crate::json::JsonValue;
     let path = config_path_or_err()?;
-    let mut obj: std::collections::HashMap<String, JsonValue> = if path.exists() {
-        let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        crate::json::parse(&content)
-            .map_err(|e| e.to_string())?
-            .as_object()
-            .cloned()
-            .unwrap_or_default()
-    } else {
-        std::collections::HashMap::new()
-    };
+    let mut obj = load_config_object(&path)?;
 
     obj.insert(
         "default_provider".into(),
@@ -364,11 +379,7 @@ pub fn save_config(provider: &str, model: &str, api_key: Option<&str>) -> Result
         keyring_set(provider, key)?;
     }
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let output = crate::json::serialize(&JsonValue::Object(obj));
-    std::fs::write(&path, &output).map_err(|e| e.to_string())
+    write_config_object(&path, obj)
 }
 
 /// Persist a provider credential without changing the selected provider or model.
@@ -380,23 +391,10 @@ pub fn save_api_key(provider: &str, api_key: &str) -> Result<(), String> {
 pub fn save_theme(theme: &str) -> Result<(), String> {
     use crate::json::JsonValue;
     let path = config_path_or_err()?;
-    let mut obj: std::collections::HashMap<String, JsonValue> = if path.exists() {
-        let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        crate::json::parse(&content)
-            .map_err(|e| e.to_string())?
-            .as_object()
-            .cloned()
-            .unwrap_or_default()
-    } else {
-        std::collections::HashMap::new()
-    };
+    let mut obj = load_config_object(&path)?;
     obj.insert("theme".into(), JsonValue::String(theme.into()));
     obj.remove("api_keys");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let output = crate::json::serialize(&JsonValue::Object(obj));
-    std::fs::write(&path, &output).map_err(|e| e.to_string())
+    write_config_object(&path, obj)
 }
 
 /// Persist the show-thinking preference without rewriting other keys.
@@ -412,23 +410,10 @@ pub fn save_show_suggestions(show: bool) -> Result<(), String> {
 fn save_bool_pref(key: &str, value: bool) -> Result<(), String> {
     use crate::json::JsonValue;
     let path = config_path_or_err()?;
-    let mut obj: std::collections::HashMap<String, JsonValue> = if path.exists() {
-        let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        crate::json::parse(&content)
-            .map_err(|e| e.to_string())?
-            .as_object()
-            .cloned()
-            .unwrap_or_default()
-    } else {
-        std::collections::HashMap::new()
-    };
+    let mut obj = load_config_object(&path)?;
     obj.insert(key.into(), JsonValue::Bool(value));
     obj.remove("api_keys");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let output = crate::json::serialize(&JsonValue::Object(obj));
-    std::fs::write(&path, &output).map_err(|e| e.to_string())
+    write_config_object(&path, obj)
 }
 
 pub fn save_permissions(cfg: &Config) -> Result<(), String> {
@@ -438,16 +423,7 @@ pub fn save_permissions(cfg: &Config) -> Result<(), String> {
 
 fn save_permissions_to_path(path: &Path, cfg: &Config) -> Result<(), String> {
     use crate::json::JsonValue;
-    let mut obj: HashMap<String, JsonValue> = if path.exists() {
-        let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
-        crate::json::parse(&content)
-            .map_err(|e| e.to_string())?
-            .as_object()
-            .cloned()
-            .unwrap_or_default()
-    } else {
-        HashMap::new()
-    };
+    let mut obj = load_config_object(path)?;
 
     let perms = JsonValue::Object(HashMap::from([
         (
@@ -482,11 +458,40 @@ fn save_permissions_to_path(path: &Path, cfg: &Config) -> Result<(), String> {
     obj.remove("api_keys");
     obj.remove("api_keys");
 
+    write_config_object(path, obj)
+}
+
+fn load_config_object(path: &Path) -> Result<HashMap<String, crate::json::JsonValue>, String> {
+    let Some(content) = read_optional_config(path)? else {
+        return Ok(HashMap::new());
+    };
+    crate::json::parse(&content)
+        .map_err(|error| format!("failed to parse config {}: {error}", path.display()))?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "failed to parse config {}: config must be an object",
+                path.display()
+            )
+        })
+}
+
+fn write_config_object(
+    path: &Path,
+    obj: HashMap<String, crate::json::JsonValue>,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create config directory {}: {error}",
+                parent.display()
+            )
+        })?;
     }
-    let output = crate::json::serialize(&JsonValue::Object(obj));
-    fs::write(path, output).map_err(|e| e.to_string())
+    let output = crate::json::serialize(&crate::json::JsonValue::Object(obj));
+    fs::write(path, output)
+        .map_err(|error| format!("failed to write config {}: {error}", path.display()))
 }
 
 pub fn config_get_api_key(provider: &str) -> Option<String> {
@@ -823,7 +828,7 @@ mod tests {
         fs::write(root.join("outside.md"), "untrusted prompt").unwrap();
         fs::write(workspace.join("user-prompt.md"), "repository prompt").unwrap();
 
-        let cfg = load_for_workspace(&user_path, &workspace);
+        let cfg = load_for_workspace(&user_path, &workspace).unwrap();
 
         assert_eq!(cfg.default_provider, "ollama");
         assert_eq!(cfg.default_model, "user-model");
@@ -866,7 +871,7 @@ mod tests {
         )
         .unwrap();
 
-        let cfg = load_for_workspace(&user_path, &workspace);
+        let cfg = load_for_workspace(&user_path, &workspace).unwrap();
 
         assert_eq!(
             PathBuf::from(cfg.system_prompt_file),
@@ -884,7 +889,7 @@ mod tests {
         )
         .unwrap();
 
-        let cfg = load_for_workspace(&user_path, &workspace);
+        let cfg = load_for_workspace(&user_path, &workspace).unwrap();
         assert!(cfg.system_prompt_file.is_empty());
 
         let outside = fs::canonicalize(root.join("outside.md")).unwrap();
@@ -895,9 +900,65 @@ mod tests {
         )
         .unwrap();
 
-        let cfg = load_for_workspace(&user_path, &workspace);
+        let cfg = load_for_workspace(&user_path, &workspace).unwrap();
         assert!(cfg.system_prompt_file.is_empty());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_user_config_reports_path_and_parse_error() {
+        let root = temp_test_dir("malformed-user");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let user_path = root.join("config.json");
+        fs::write(&user_path, "{not json").unwrap();
+
+        let error = load_for_workspace(&user_path, &workspace)
+            .err()
+            .expect("malformed user config should fail");
+
+        assert!(error.contains(&user_path.display().to_string()), "{error}");
+        assert!(error.contains("failed to parse config"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_trusted_project_config_reports_path_and_parse_error() {
+        let root = temp_test_dir("malformed-project");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(workspace.join(".cairn")).unwrap();
+        let user_path = root.join("config.json");
+        fs::write(&user_path, user_config_with_trust(&workspace)).unwrap();
+        let project_path = workspace.join(".cairn/config.json");
+        fs::write(&project_path, "[]").unwrap();
+
+        let error = load_for_workspace(&user_path, &workspace)
+            .err()
+            .expect("malformed project config should fail");
+
+        assert!(
+            error.contains(&project_path.display().to_string()),
+            "{error}"
+        );
+        assert!(error.contains("config must be an object"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unreadable_user_config_reports_path_and_read_error() {
+        let root = temp_test_dir("unreadable-user");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let user_path = root.join("config.json");
+        fs::create_dir_all(&user_path).unwrap();
+
+        let error = load_for_workspace(&user_path, &workspace)
+            .err()
+            .expect("unreadable user config should fail");
+
+        assert!(error.contains(&user_path.display().to_string()), "{error}");
+        assert!(error.contains("failed to read config"), "{error}");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1083,6 +1144,20 @@ mod tests {
     }
 
     #[test]
+    fn saving_rejects_non_object_config_without_overwriting_it() {
+        let root = temp_test_dir("save-non-object");
+        let path = root.join("config.json");
+        fs::write(&path, "[]").unwrap();
+
+        let error = save_permissions_to_path(&path, &Config::default()).unwrap_err();
+
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("config must be an object"), "{error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "[]");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn test_env_key_for_known_providers() {
         // env_key_for must return None when the env var is unset, for each known provider.
         // We can't easily unset env vars, so we just check the function returns a String
@@ -1111,6 +1186,8 @@ mod tests {
 
     #[test]
     fn test_apply_key_to_env_and_mask() {
+        let _lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _env = crate::test_support::EnvGuard::capture("OPENAI_API_KEY");
         apply_key_to_env("openai", "sk-test-apply-env-key");
         assert_eq!(
             std::env::var("OPENAI_API_KEY").ok().as_deref(),
@@ -1133,14 +1210,8 @@ mod tests {
 
     #[test]
     fn test_keyring_set_get_delete_roundtrip() {
-        // Distinctly-named test provider so this can never collide with a
-        // real stored credential.
         let provider = "cairn-code-test-provider-roundtrip";
-        // CI runners often have no secret-service / keychain backend.
-        if keyring_set(provider, "sk-roundtrip-test").is_err() {
-            eprintln!("skipping keyring roundtrip: no usable OS keyring backend");
-            return;
-        }
+        keyring_set(provider, "sk-roundtrip-test").unwrap();
         assert_eq!(keyring_get(provider), Some("sk-roundtrip-test".to_string()));
         assert_eq!(keyring_delete(provider), Ok(true));
         assert_eq!(keyring_get(provider), None);
@@ -1151,20 +1222,11 @@ mod tests {
     #[test]
     fn test_migrate_plaintext_keys_moves_to_keyring_and_strips_file() {
         let provider = "cairn-code-test-provider-migrate";
-        let tmp = std::env::temp_dir().join(format!("cairn-test-migrate-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let cfg_path = tmp.join("config.json");
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.json");
         std::fs::write(&cfg_path, format!(
             r#"{{"default_provider":"openrouter","default_model":"m","api_keys":{{"{provider}":"sk-migrate-test"}}}}"#
         )).unwrap();
-
-        // Probe keyring first so headless CI without a backend does not fail.
-        if keyring_set(provider, "probe").is_err() {
-            eprintln!("skipping keyring migration test: no usable OS keyring backend");
-            let _ = std::fs::remove_file(&cfg_path);
-            return;
-        }
-        let _ = keyring_delete(provider);
 
         migrate_plaintext_keys_in_file(&cfg_path);
 
@@ -1184,6 +1246,5 @@ mod tests {
         );
 
         let _ = keyring_delete(provider);
-        let _ = std::fs::remove_file(&cfg_path);
     }
 }
