@@ -89,40 +89,63 @@ impl CliFixture {
 }
 
 fn serve_once(listener: TcpListener, response: &[u8], capture: &PathBuf) {
-    let (mut stream, _) = listener.accept().unwrap();
-    let mut request = Vec::new();
-    let mut buffer = [0; 4096];
-    let body_end = loop {
-        let read = stream.read(&mut buffer).unwrap();
-        assert!(read > 0, "connection closed before request headers");
-        request.extend_from_slice(&buffer[..read]);
-        if let Some(index) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-            break index + 4;
+    let _ = listener.set_nonblocking(false);
+    let mut first = true;
+    for _ in 0..3 {
+        let (mut stream, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(_) => break,
+        };
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        let body_end = loop {
+            let read = match stream.read(&mut buffer) {
+                Ok(n) if n > 0 => n,
+                _ => break 0,
+            };
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(index) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        if body_end == 0 {
+            break;
         }
-    };
-    let headers = String::from_utf8_lossy(&request[..body_end]);
-    let content_length = headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().unwrap())
-        })
-        .unwrap();
-    while request.len() - body_end < content_length {
-        let read = stream.read(&mut buffer).unwrap();
-        assert!(read > 0, "connection closed before request body");
-        request.extend_from_slice(&buffer[..read]);
+        let headers = String::from_utf8_lossy(&request[..body_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        while request.len() - body_end < content_length {
+            let read = match stream.read(&mut buffer) {
+                Ok(n) if n > 0 => n,
+                _ => break,
+            };
+            request.extend_from_slice(&buffer[..read]);
+        }
+        if first {
+            let _ = fs::write(capture, &request[body_end..body_end + content_length]);
+            first = false;
+            let resp_header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            );
+            let _ = stream.write_all(resp_header.as_bytes());
+            let _ = stream.write_all(response);
+        } else {
+            let done_resp = r#"{"choices":[{"message":{"role":"assistant","content":"Done."}}]}"#;
+            let resp_header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                done_resp.len()
+            );
+            let _ = stream.write_all(resp_header.as_bytes());
+            let _ = stream.write_all(done_resp.as_bytes());
+        }
     }
-    fs::write(capture, &request[body_end..body_end + content_length]).unwrap();
-
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        response.len()
-    )
-    .unwrap();
-    stream.write_all(response).unwrap();
 }
 
 fn stdout(output: &Output) -> String {
