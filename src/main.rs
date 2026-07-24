@@ -115,7 +115,7 @@ fn main() -> ExitCode {
         );
         return match agent.run_simple(&prompt) {
             Ok(output) => {
-                println!("{output}");
+                println!("{}", tui::sanitize_terminal_output(&output));
                 ExitCode::SUCCESS
             }
             Err(error) => {
