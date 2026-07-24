@@ -663,10 +663,10 @@ mod tests {
 
     #[cfg(windows)]
     fn create_dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        let target_win = target.to_string_lossy().replace('/', "\\");
+        let link_win = link.to_string_lossy().replace('/', "\\");
         std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
+            .args(["/C", "mklink", "/J", &link_win, &target_win])
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false)
