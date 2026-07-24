@@ -9,6 +9,8 @@ use std::io::{self, Write};
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 use std::thread;
+// Second-tone / multi-BEL patterns need Duration; macOS uses afplay only.
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
 use std::time::Duration;
 
 /// What kind of cue to play.
@@ -49,6 +51,7 @@ pub fn play(kind: Kind) {
     });
 }
 
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
 fn bell() {
     let _ = write!(io::stderr(), "\x07");
     let _ = io::stderr().flush();
