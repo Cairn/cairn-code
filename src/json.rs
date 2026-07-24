@@ -1,6 +1,24 @@
 use std::collections::HashMap;
 use std::fmt;
 
+fn write_string(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
+    f.write_str("\"")?;
+    for character in value.chars() {
+        match character {
+            '"' => f.write_str("\\\"")?,
+            '\\' => f.write_str("\\\\")?,
+            '\u{08}' => f.write_str("\\b")?,
+            '\u{0c}' => f.write_str("\\f")?,
+            '\n' => f.write_str("\\n")?,
+            '\r' => f.write_str("\\r")?,
+            '\t' => f.write_str("\\t")?,
+            character if character <= '\u{1f}' => write!(f, "\\u{:04x}", character as u32)?,
+            character => write!(f, "{character}")?,
+        }
+    }
+    f.write_str("\"")
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsonValue {
     Null,
@@ -17,7 +35,7 @@ impl fmt::Display for JsonValue {
             JsonValue::Null => write!(f, "null"),
             JsonValue::Bool(b) => write!(f, "{b}"),
             JsonValue::Number(n) => write!(f, "{n}"),
-            JsonValue::String(s) => write!(f, "\"{s}\""),
+            JsonValue::String(s) => write_string(f, s),
             JsonValue::Array(arr) => {
                 write!(f, "[")?;
                 for (i, v) in arr.iter().enumerate() {
@@ -32,7 +50,8 @@ impl fmt::Display for JsonValue {
                 for (k, v) in obj {
                     if !first { write!(f, ",")?; }
                     first = false;
-                    write!(f, "\"{k}\":{v}")?;
+                    write_string(f, k)?;
+                    write!(f, ":{v}")?;
                 }
                 write!(f, "}}")
             }
@@ -170,6 +189,8 @@ impl Parser {
                         b'"' => s.push('"'),
                         b'\\' => s.push('\\'),
                         b'/' => s.push('/'),
+                        b'b' => s.push('\u{08}'),
+                        b'f' => s.push('\u{0c}'),
                         b'n' => s.push('\n'),
                         b'r' => s.push('\r'),
                         b't' => s.push('\t'),
@@ -471,6 +492,21 @@ mod tests {
         let s = serialize(&v);
         let back = parse(&s).unwrap();
         assert_eq!(v, back);
+    }
+
+    #[test]
+    fn test_roundtrip_escaped_object_keys_and_values() {
+        let mut obj = HashMap::new();
+        obj.insert(
+            "key\"\\\n\t\u{0001}".into(),
+            JsonValue::String("value\"\\\n\r\t\u{0008}\u{000c}\u{001f}".into()),
+        );
+        let value = JsonValue::Object(obj);
+
+        let serialized = serialize(&value);
+        let parsed = parse(&serialized).unwrap();
+
+        assert_eq!(parsed, value);
     }
 
     #[test]
