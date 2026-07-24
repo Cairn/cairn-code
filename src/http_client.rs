@@ -503,10 +503,10 @@ pub fn request(req: &HttpRequest) -> Result<HttpResponse, String> {
 /// POST an `application/x-www-form-urlencoded` body and return the raw
 /// `(status, body)` for any completed response.
 ///
-/// This reuses the hardened [`curl_command`] invocation (first-argument `-q`
-/// so a user's `.curlrc` cannot redirect/proxy/trace the request, plus
-/// connect/total timeouts and curl exit-status validation). Unlike
-/// [`request`], non-2xx responses are returned instead of folded into an
+/// This reuses the same hardened curl invocation as the streaming/POST paths
+/// (first-argument `-q` so a user's `.curlrc` cannot redirect/proxy/trace the
+/// request, plus connect/total timeouts and curl exit-status validation).
+/// Unlike `request`, non-2xx responses are returned instead of folded into an
 /// error string, because OAuth flows must read error bodies such as
 /// `authorization_pending`. The response is size-bounded and this path does
 /// not emit debug request logs, so credential-bearing bodies never touch disk.
@@ -535,8 +535,8 @@ pub fn form_post(url: &str, form_body: &str) -> Result<(u16, String), String> {
     }
 }
 
-/// Single attempt behind [`form_post`]. Builds the command via [`curl_command`]
-/// directly (rather than [`spawn_curl`]) so credential-bearing OAuth bodies are
+/// Single attempt behind [`form_post`]. Builds the command via `curl_command`
+/// directly (rather than `spawn_curl`) so credential-bearing OAuth bodies are
 /// never written to the debug request log.
 fn request_raw_once(req: &HttpRequest) -> Result<(u16, String), RequestError> {
     let mut child = curl_command(req)
