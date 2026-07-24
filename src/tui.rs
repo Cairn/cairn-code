@@ -68,6 +68,24 @@ const SPINNER_VERBS: &[&str] = &[
     "Unraveling",
     "Working",
 ];
+/// Rows for the `?` shortcuts panel (keys must match real bindings in handle_key).
+const SHORTCUT_ROWS: &[(&str, &str)] = &[
+    ("Ctrl+C", "interrupt turn · press again to exit when idle"),
+    ("Enter", "send message"),
+    ("Tab / →", "accept slash ghost or idle suggestion"),
+    (
+        "Up / Down",
+        "scroll chat when it overflows · else prompt history",
+    ),
+    ("Ctrl+P / Ctrl+N", "previous / next prompt history"),
+    ("PgUp / PgDn", "page scroll"),
+    ("Ctrl+U / Ctrl+D", "half-page scroll"),
+    ("Ctrl+Home / End", "jump to top / bottom of chat"),
+    ("Wheel", "scroll transcript"),
+    ("Ctrl+Y", "copy last assistant message"),
+    ("Ctrl+O", "plain-text select mode"),
+    ("/", "slash commands (Tab completes)"),
+];
 // MiniDot FPS is time.Second/12 (~83ms). Faster ticks look like flicker; slower feels sticky.
 const SPINNER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 12);
 // Cap full-frame redraws while the agent runs. Zero coalesces stream text to ~16ms
@@ -186,6 +204,8 @@ pub struct Tui {
     pending_select: Option<SelectDump>,
     /// Wall clock for the current in-flight thinking stream (for duration labels).
     thinking_started: Option<Instant>,
+    /// Bottom chrome shows keyboard shortcuts (`?` when the composer is empty).
+    show_shortcuts: bool,
 }
 
 impl Tui {
@@ -285,6 +305,7 @@ impl Tui {
             mouse_capture: true,
             pending_select: None,
             thinking_started: None,
+            show_shortcuts: false,
         }
     }
 
@@ -844,6 +865,7 @@ impl Tui {
             || self.show_theme_picker
             || self.show_session_picker
             || self.show_permission_prompt
+            || self.show_shortcuts
             || self.confirm_remove_provider.is_some()
             || self.confirm_history_provider.is_some();
         if !picker_nav {
@@ -914,6 +936,37 @@ impl Tui {
                 }
                 _ => {}
             }
+        }
+
+        if self.show_shortcuts {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => {
+                    self.show_shortcuts = false;
+                }
+                // Keep scroll available while the help panel is open.
+                KeyCode::PageUp => self.scroll_page(false),
+                KeyCode::PageDown => self.scroll_page(true),
+                KeyCode::Char('u') | KeyCode::Char('U')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.scroll_half_page(false);
+                }
+                KeyCode::Char('d') | KeyCode::Char('D')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.scroll_half_page(true);
+                }
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_transcript(-1);
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_transcript(1);
+                }
+                KeyCode::Up => self.scroll_transcript(-3),
+                KeyCode::Down => self.scroll_transcript(3),
+                _ => {}
+            }
+            return true;
         }
 
         if self.show_permission_prompt {
@@ -1222,6 +1275,8 @@ impl Tui {
                         tool_name: String::new(),
                         duration: String::new(),
                     });
+                } else if self.show_shortcuts {
+                    self.show_shortcuts = false;
                 } else if self.show_command_picker || !self.cmd_picker_filtered.is_empty() {
                     self.show_command_picker = false;
                     self.cmd_picker_filtered.clear();
@@ -1475,13 +1530,32 @@ impl Tui {
                 true
             }
             KeyCode::Char(ch) => {
+                // Footer advertises "? for shortcuts" when the composer is empty.
+                // Toggle the panel instead of inserting `?` into the prompt.
+                if ch == '?'
+                    && !self.awaiting_api_key
+                    && self.input_buf.is_empty()
+                    && matches!(self.state, State::Idle)
+                    && !self.show_model_picker
+                    && !self.show_provider_picker
+                    && !self.show_theme_picker
+                    && !self.show_session_picker
+                    && !self.show_permission_prompt
+                    && !self.show_recovery_prompt
+                    && self.confirm_remove_provider.is_none()
+                    && self.confirm_history_provider.is_none()
+                {
+                    self.show_shortcuts = !self.show_shortcuts;
+                    return true;
+                }
                 // Allow typing into the API-key prompt and the normal input
                 // (but not while a list picker is focused).
                 if self.awaiting_api_key
                     || (!self.show_model_picker
                         && !self.show_provider_picker
                         && !self.show_theme_picker
-                        && !self.show_session_picker)
+                        && !self.show_session_picker
+                        && !self.show_shortcuts)
                 {
                     self.input_buf.insert(self.cursor, ch);
                     self.cursor += ch.len_utf8();
@@ -2940,6 +3014,23 @@ impl Tui {
                 "(← → navigate  Enter confirm  Esc cancel)",
                 dim,
             )]));
+        } else if self.show_shortcuts {
+            // Matches the footer hint "? for shortcuts" on an empty idle prompt.
+            chrome.push(Line::from(vec![
+                Span::styled("── Shortcuts ", orange),
+                Span::styled("(? or Esc close) ──", bold_dim),
+            ]));
+            for (keys, desc) in SHORTCUT_ROWS {
+                chrome.push(Line::from(vec![
+                    Span::styled(format!("  {keys:<22}"), orange_fg),
+                    Span::styled(*desc, dim),
+                ]));
+            }
+            chrome.push(Line::from(""));
+            chrome.push(Line::from(vec![
+                Span::styled("  /help", orange_fg),
+                Span::styled("                  slash commands and more", dim),
+            ]));
         } else if self.show_provider_picker {
             chrome.push(Line::from(vec![
                 Span::styled("── Provider ", orange),
@@ -4353,6 +4444,47 @@ mod exit_tests {
                 "{command} should request normal event-loop termination"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod shortcuts_panel_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn question_mark_toggles_shortcuts_when_composer_empty() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        assert!(!tui.show_shortcuts);
+
+        tui.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(tui.show_shortcuts);
+        assert!(tui.input_buf.is_empty(), "must not type ? into the prompt");
+
+        tui.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(!tui.show_shortcuts);
+    }
+
+    #[test]
+    fn question_mark_types_when_composer_has_text() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.input_buf = "what".into();
+        tui.cursor = tui.input_buf.len();
+
+        tui.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+
+        assert!(!tui.show_shortcuts);
+        assert_eq!(tui.input_buf, "what?");
+    }
+
+    #[test]
+    fn esc_closes_shortcuts_panel() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.show_shortcuts = true;
+
+        tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(!tui.show_shortcuts);
     }
 }
 
