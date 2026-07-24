@@ -341,7 +341,16 @@ fn fetch_once(target: &FetchTarget) -> Result<(u16, String, Vec<u8>), String> {
         ));
     }
 
-    let metadata = String::from_utf8_lossy(&stderr);
+    let (status, redirect) = parse_metadata(&stderr)?;
+    Ok((status, redirect, body))
+}
+
+/// Extract the response code and redirect target curl appended to its stderr.
+///
+/// curl opens stderr in text mode on Windows, so the newline in the write-out
+/// format arrives as `\r\n`; trim it before parsing.
+fn parse_metadata(stderr: &[u8]) -> Result<(u16, String), String> {
+    let metadata = String::from_utf8_lossy(stderr);
     let metadata = metadata
         .rsplit_once(CURL_METADATA_MARKER)
         .map(|(_, metadata)| metadata)
@@ -350,9 +359,10 @@ fn fetch_once(target: &FetchTarget) -> Result<(u16, String, Vec<u8>), String> {
         .split_once('\n')
         .ok_or("curl: invalid response metadata")?;
     let status = status
+        .trim()
         .parse::<u16>()
         .map_err(|_| "curl: invalid HTTP status")?;
-    Ok((status, redirect.to_string(), body))
+    Ok((status, redirect.trim().to_string()))
 }
 
 fn read_bounded_and_drain(
@@ -495,6 +505,41 @@ mod tests {
     fn requires_url() {
         assert!(WebFetchTool.execute("{}").is_err());
         assert!(WebFetchTool.execute("not-json").is_err());
+    }
+
+    #[test]
+    fn parses_metadata_with_either_line_ending() {
+        for newline in ["\n", "\r\n"] {
+            let stderr = format!("{CURL_METADATA_MARKER}301{newline}https://example.com/moved");
+            let (status, redirect) = parse_metadata(stderr.as_bytes()).expect(newline);
+            assert_eq!(status, 301, "{newline:?}");
+            assert_eq!(redirect, "https://example.com/moved", "{newline:?}");
+        }
+    }
+
+    #[test]
+    fn parses_metadata_after_curl_diagnostics() {
+        let stderr = format!("curl: (23) Failed writing body\r\n{CURL_METADATA_MARKER}200\r\n");
+        let (status, redirect) = parse_metadata(stderr.as_bytes()).unwrap();
+        assert_eq!(status, 200);
+        assert!(redirect.is_empty(), "{redirect}");
+    }
+
+    #[test]
+    fn rejects_unparseable_metadata() {
+        for stderr in [
+            "",
+            "no marker here",
+            CURL_METADATA_MARKER,
+            "200\nhttps://a/",
+        ] {
+            assert!(
+                parse_metadata(stderr.as_bytes()).is_err(),
+                "accepted metadata: {stderr:?}"
+            );
+        }
+        let stderr = format!("{CURL_METADATA_MARKER}2 0 0\n");
+        assert!(parse_metadata(stderr.as_bytes()).is_err());
     }
 
     #[test]
