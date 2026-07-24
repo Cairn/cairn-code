@@ -542,18 +542,6 @@ fn validate_memory_file(root: &Dir, name: &str, key: &str) -> std::io::Result<()
     open_memory_file(root, name, key, &options).map(|_| ())
 }
 
-#[cfg(test)]
-fn read_memory(root: &Dir, key: &str) -> Result<String, String> {
-    let name = memory_file_name(key)?;
-    read_memory_file(root, &name, key).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            format!("Memory '{}' not found", key)
-        } else {
-            format!("read: {e}")
-        }
-    })
-}
-
 fn read_memory_bounded(
     root: &Dir,
     key: &str,
@@ -829,8 +817,11 @@ mod tests {
         fs::write(&outside, "secret").unwrap();
         symlink(&outside, base.join(".config/cairn-code/memory/linked.md")).unwrap();
 
-        let error = read_memory(&root, "linked").unwrap_err();
-        assert!(error.contains("symlink"), "unexpected error: {error}");
+        let error = read_memory_file(&root, "linked.md", "linked").unwrap_err();
+        assert!(
+            error.to_string().contains("symlink"),
+            "unexpected error: {error}"
+        );
 
         let _ = fs::remove_dir_all(base);
     }
