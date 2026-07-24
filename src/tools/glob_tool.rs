@@ -1,6 +1,8 @@
 use super::registry::Tool;
 use super::workspace::Workspace;
 use cap_std::fs::Dir;
+use glob::Pattern;
+use std::collections::HashSet;
 #[cfg(test)]
 use std::fs;
 use std::path::Path;
@@ -8,6 +10,10 @@ use std::path::Path;
 /// Cap listed paths so broad globs (`src/**/*.rs`) do not flood the transcript.
 /// The total count is always reported so the model knows the full match size.
 const MAX_LISTED_PATHS: usize = 15;
+const MAX_DEPTH: usize = 64;
+const MAX_RESULTS: usize = 1_000;
+const MAX_RESULT_BYTES: usize = 1_048_576;
+const MAX_VISITED_ENTRIES: usize = 100_000;
 
 pub struct GlobTool {
     workspace: Workspace,
@@ -44,12 +50,16 @@ impl Tool for GlobTool {
             .and_then(|v| v.as_str())
             .ok_or("pattern required")?;
 
-        let mut results = glob_match(pattern, &self.workspace)?;
+        let mut results = collect_matches(pattern, &self.workspace)?;
         // Stable order keeps caps deterministic across runs.
-        results.sort();
-        results.dedup();
+        results.paths.sort();
+        results.paths.dedup();
 
-        Ok(format_glob_results(&results, MAX_LISTED_PATHS))
+        let mut output = format_glob_results(&results.paths, MAX_LISTED_PATHS);
+        if results.truncated {
+            output.push_str("\nSearch truncated at safety limit.");
+        }
+        Ok(output)
     }
 }
 
@@ -76,6 +86,10 @@ pub(crate) fn format_glob_results(results: &[String], max_listed: usize) -> Stri
 }
 
 pub(crate) fn glob_match(pattern: &str, workspace: &Workspace) -> Result<Vec<String>, String> {
+    Ok(collect_matches(pattern, workspace)?.paths)
+}
+
+fn collect_matches(pattern: &str, workspace: &Workspace) -> Result<GlobResults, String> {
     if Path::new(pattern).is_absolute() {
         return Err(format!(
             "refusing to access '{pattern}': outside the workspace"
@@ -83,14 +97,57 @@ pub(crate) fn glob_match(pattern: &str, workspace: &Workspace) -> Result<Vec<Str
     }
 
     let pattern = workspace.relative_path(pattern)?;
-    let mut results = Vec::new();
+    let mut results = GlobResults::default();
     let parts: Vec<String> = pattern
         .components()
         .map(|component| component.as_os_str().to_string_lossy().into_owned())
         .collect();
-    walk_pattern(workspace.dir(), &parts, 0, String::new(), &mut results)?;
+    for part in &parts {
+        Pattern::new(part).map_err(|error| format!("invalid pattern: {error}"))?;
+    }
+    if parts.len() > MAX_DEPTH {
+        results.truncated = true;
+        return Ok(results);
+    }
+    walk_pattern(workspace.dir(), &parts, 0, String::new(), 0, &mut results)?;
 
     Ok(results)
+}
+
+#[derive(Default)]
+struct GlobResults {
+    paths: Vec<String>,
+    seen: HashSet<String>,
+    bytes: usize,
+    visited: usize,
+    truncated: bool,
+}
+
+impl GlobResults {
+    fn visit(&mut self) -> bool {
+        if self.visited >= MAX_VISITED_ENTRIES {
+            self.truncated = true;
+            return false;
+        }
+        self.visited += 1;
+        true
+    }
+
+    fn push(&mut self, path: String) -> bool {
+        if self.seen.contains(&path) {
+            return true;
+        }
+        if self.paths.len() >= MAX_RESULTS
+            || self.bytes.saturating_add(path.len()) > MAX_RESULT_BYTES
+        {
+            self.truncated = true;
+            return false;
+        }
+        self.bytes += path.len();
+        self.seen.insert(path.clone());
+        self.paths.push(path);
+        true
+    }
 }
 
 fn walk_pattern(
@@ -98,9 +155,14 @@ fn walk_pattern(
     parts: &[String],
     idx: usize,
     prefix: String,
-    results: &mut Vec<String>,
+    depth: usize,
+    results: &mut GlobResults,
 ) -> Result<(), String> {
     if idx >= parts.len() {
+        return Ok(());
+    }
+    if depth >= MAX_DEPTH {
+        results.truncated = true;
         return Ok(());
     }
 
@@ -113,15 +175,18 @@ fn walk_pattern(
 
         if rest.is_empty() {
             // ** at end - match everything recursively
-            walk_dir_recursive(dir, &prefix, results)?;
+            walk_dir_recursive(dir, &prefix, depth, results)?;
             return Ok(());
         }
 
         // ** followed by more pattern - try at current level and subdirs
-        walk_pattern(dir, rest, 0, prefix.clone(), results)?;
+        walk_pattern(dir, rest, 0, prefix.clone(), depth, results)?;
 
         if let Ok(entries) = dir.entries() {
             for entry in entries.flatten() {
+                if results.truncated || !results.visit() {
+                    break;
+                }
                 let Ok(file_type) = entry.file_type() else {
                     continue;
                 };
@@ -133,34 +198,36 @@ fn walk_pattern(
                         format!("{prefix}/{name}")
                     };
                     if let Ok(child) = entry.open_dir() {
-                        walk_pattern(&child, parts, idx, new_prefix, results)?;
+                        walk_pattern(&child, parts, idx, new_prefix, depth + 1, results)?;
                     }
                 }
             }
         }
-    } else if part.contains('*') || part.contains('?') {
-        // Wildcard pattern. Do not wrap with `^$` as literal characters — SimpleRe
-        // treats those as literals, so `^.*\.rs$` never matched real filenames.
-        let re_pattern = part
-            .replace('.', "\\.")
-            .replace('*', ".*")
-            .replace('?', ".");
-        let re = regex_wrapper(&re_pattern)?;
+    } else if part
+        .chars()
+        .any(|character| matches!(character, '*' | '?' | '['))
+    {
+        let matcher = Pattern::new(part).map_err(|error| format!("invalid pattern: {error}"))?;
 
         if let Ok(entries) = dir.entries() {
             for entry in entries.flatten() {
+                if results.truncated || !results.visit() {
+                    break;
+                }
                 let Ok(file_type) = entry.file_type() else {
                     continue;
                 };
                 let name = entry.file_name().to_string_lossy().to_string();
-                if re.is_full_match(&name) {
+                if matcher.matches(&name) {
                     let new_prefix = if prefix.is_empty() {
                         name.clone()
                     } else {
                         format!("{prefix}/{name}")
                     };
-                    if is_last || file_type.is_dir() {
-                        results.push(new_prefix);
+                    if is_last {
+                        if !results.push(new_prefix) {
+                            break;
+                        }
                     }
                     if !is_last && file_type.is_dir() {
                         if let Ok(child) = entry.open_dir() {
@@ -173,6 +240,7 @@ fn walk_pattern(
                                 } else {
                                     format!("{prefix}/{name}")
                                 },
+                                depth + 1,
                                 results,
                             )?;
                         }
@@ -190,18 +258,23 @@ fn walk_pattern(
 
         if let Ok(entries) = dir.entries() {
             for entry in entries.flatten() {
+                if results.truncated || !results.visit() {
+                    break;
+                }
                 if !names_equal(&entry.file_name(), part) {
                     continue;
                 }
                 if is_last {
-                    results.push(new_prefix);
+                    if !results.push(new_prefix) {
+                        break;
+                    }
                 } else if entry
                     .file_type()
                     .map(|file_type| file_type.is_dir())
                     .unwrap_or(false)
                 {
                     if let Ok(child) = entry.open_dir() {
-                        walk_pattern(&child, parts, idx + 1, new_prefix, results)?;
+                        walk_pattern(&child, parts, idx + 1, new_prefix, depth + 1, results)?;
                     }
                 }
                 break;
@@ -223,9 +296,21 @@ fn names_equal(actual: &std::ffi::OsStr, expected: &str) -> bool {
     }
 }
 
-fn walk_dir_recursive(dir: &Dir, prefix: &str, results: &mut Vec<String>) -> Result<(), String> {
+fn walk_dir_recursive(
+    dir: &Dir,
+    prefix: &str,
+    depth: usize,
+    results: &mut GlobResults,
+) -> Result<(), String> {
+    if depth >= MAX_DEPTH {
+        results.truncated = true;
+        return Ok(());
+    }
     if let Ok(entries) = dir.entries() {
         for entry in entries.flatten() {
+            if results.truncated || !results.visit() {
+                break;
+            }
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
@@ -235,10 +320,12 @@ fn walk_dir_recursive(dir: &Dir, prefix: &str, results: &mut Vec<String>) -> Res
             } else {
                 format!("{prefix}/{name}")
             };
-            results.push(new_prefix.clone());
+            if !results.push(new_prefix.clone()) {
+                break;
+            }
             if file_type.is_dir() {
                 if let Ok(child) = entry.open_dir() {
-                    walk_dir_recursive(&child, &new_prefix, results)?;
+                    walk_dir_recursive(&child, &new_prefix, depth + 1, results)?;
                 }
             }
         }
@@ -340,12 +427,48 @@ mod tests {
     }
 
     #[test]
-    fn simple_re_full_match_star_rs() {
-        let re = regex_wrapper(r".*\.rs").unwrap();
-        assert!(re.is_full_match("main.rs"));
-        assert!(re.is_full_match("lib.rs"));
-        assert!(!re.is_full_match("main.rs.bak"));
-        assert!(!re.is_full_match("README.md"));
+    fn maintained_glob_matcher_matches_full_names() {
+        let pattern = Pattern::new("*.rs").unwrap();
+        assert!(pattern.matches("main.rs"));
+        assert!(pattern.matches("lib.rs"));
+        assert!(!pattern.matches("main.rs.bak"));
+        assert!(!pattern.matches("README.md"));
+    }
+
+    #[test]
+    fn supports_glob_character_classes() {
+        let dir = temp_tree();
+        let workspace = Workspace::new(&dir).unwrap();
+
+        let results = glob_match("src/[ml]*.rs", &workspace).unwrap();
+        assert!(results.iter().any(|path| path == "src/main.rs"));
+        assert!(results.iter().any(|path| path == "src/lib.rs"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_invalid_glob_patterns() {
+        let dir = temp_tree();
+        let tool = GlobTool::new(Workspace::new(&dir).unwrap());
+
+        let error = tool.execute(r#"{"pattern":"missing/["}"#).unwrap_err();
+        assert!(error.contains("invalid pattern"), "{error}");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn does_not_return_intermediate_wildcard_directories() {
+        let dir = temp_tree();
+        fs::create_dir_all(dir.join("src/nested")).unwrap();
+        fs::write(dir.join("src/nested/deep.rs"), "").unwrap();
+        let workspace = Workspace::new(&dir).unwrap();
+
+        let results = glob_match("src/*/*.rs", &workspace).unwrap();
+        assert_eq!(results, vec!["src/nested/deep.rs"]);
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -470,6 +593,57 @@ mod tests {
         let _ = fs::remove_dir_all(workspace_dir);
     }
 
+    #[test]
+    fn recursive_glob_stops_at_depth_limit() {
+        let workspace_dir = temp_tree();
+        let mut deepest = workspace_dir.clone();
+        for index in 0..=MAX_DEPTH {
+            deepest.push(format!("d{index}"));
+            fs::create_dir(&deepest).unwrap();
+        }
+        fs::write(deepest.join("needle.txt"), "").unwrap();
+        let tool = GlobTool::new(Workspace::new(&workspace_dir).unwrap());
+
+        let output = tool.execute(r#"{"pattern":"**/needle.txt"}"#).unwrap();
+        assert!(!output.contains("needle.txt\n"), "{output}");
+        assert!(output.contains("Search truncated"), "{output}");
+
+        let _ = fs::remove_dir_all(workspace_dir);
+    }
+
+    #[test]
+    fn globstar_chain_stops_at_pattern_depth_limit() {
+        let workspace_dir = temp_tree();
+        let tool = GlobTool::new(Workspace::new(&workspace_dir).unwrap());
+        let pattern = std::iter::repeat_n("**", MAX_DEPTH + 1)
+            .collect::<Vec<_>>()
+            .join("/");
+        let input = format!(r#"{{"pattern":"{pattern}"}}"#);
+
+        let output = tool.execute(&input).unwrap();
+        assert_eq!(
+            output,
+            "No matches found.\nSearch truncated at safety limit."
+        );
+
+        let _ = fs::remove_dir_all(workspace_dir);
+    }
+
+    #[test]
+    fn glob_stops_at_result_count_limit() {
+        let workspace_dir = temp_tree();
+        for index in 0..=MAX_RESULTS {
+            fs::write(workspace_dir.join(format!("result-{index}.txt")), "").unwrap();
+        }
+        let tool = GlobTool::new(Workspace::new(&workspace_dir).unwrap());
+
+        let output = tool.execute(r#"{"pattern":"*"}"#).unwrap();
+        assert!(output.contains("1000 total"), "{output}");
+        assert!(output.contains("Search truncated"), "{output}");
+
+        let _ = fs::remove_dir_all(workspace_dir);
+    }
+
     #[cfg(windows)]
     #[test]
     fn accepts_native_windows_separators_and_rejects_backslash_parent() {
@@ -489,10 +663,10 @@ mod tests {
 
     #[cfg(windows)]
     fn create_dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        let target_win = target.to_string_lossy().replace('/', "\\");
+        let link_win = link.to_string_lossy().replace('/', "\\");
         std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
+            .args(["/C", "mklink", "/J", &link_win, &target_win])
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false)
@@ -523,102 +697,4 @@ mod tests {
         assert!(out.contains("2 result(s)"));
         assert!(!out.contains("… and"));
     }
-}
-
-struct SimpleRe {
-    pattern: Vec<Segment>,
-}
-
-enum Segment {
-    Literal(String),
-    AnySeq,  // .*
-    AnyChar, // .
-}
-
-impl SimpleRe {
-    fn new(pattern: &str) -> Result<Self, String> {
-        let mut segments = Vec::new();
-        let mut literal = String::new();
-        let chars: Vec<char> = pattern.chars().collect();
-        let mut i = 0;
-
-        while i < chars.len() {
-            match chars[i] {
-                // Escaped literal (e.g. `\.` from wildcard conversion of `*.rs`).
-                '\\' if i + 1 < chars.len() => {
-                    literal.push(chars[i + 1]);
-                    i += 2;
-                }
-                '.' if i + 1 < chars.len() && chars[i + 1] == '*' => {
-                    if !literal.is_empty() {
-                        segments.push(Segment::Literal(literal.clone()));
-                        literal.clear();
-                    }
-                    segments.push(Segment::AnySeq);
-                    i += 2;
-                }
-                '.' => {
-                    if !literal.is_empty() {
-                        segments.push(Segment::Literal(literal.clone()));
-                        literal.clear();
-                    }
-                    segments.push(Segment::AnyChar);
-                    i += 1;
-                }
-                c => {
-                    literal.push(c);
-                    i += 1;
-                }
-            }
-        }
-        if !literal.is_empty() {
-            segments.push(Segment::Literal(literal));
-        }
-
-        Ok(SimpleRe { pattern: segments })
-    }
-
-    fn is_match(&self, text: &str) -> bool {
-        self.match_from(text, 0, 0)
-    }
-
-    /// Match the entire filename (not a substring).
-    fn is_full_match(&self, text: &str) -> bool {
-        self.is_match(text)
-    }
-
-    fn match_from(&self, text: &str, pi: usize, ti: usize) -> bool {
-        if pi >= self.pattern.len() {
-            return ti >= text.len();
-        }
-
-        match &self.pattern[pi] {
-            Segment::Literal(lit) => {
-                if text[ti..].starts_with(lit) {
-                    self.match_from(text, pi + 1, ti + lit.len())
-                } else {
-                    false
-                }
-            }
-            Segment::AnyChar => {
-                if ti < text.len() {
-                    self.match_from(text, pi + 1, ti + 1)
-                } else {
-                    false
-                }
-            }
-            Segment::AnySeq => {
-                for i in ti..=text.len() {
-                    if self.match_from(text, pi + 1, i) {
-                        return true;
-                    }
-                }
-                false
-            }
-        }
-    }
-}
-
-fn regex_wrapper(pattern: &str) -> Result<SimpleRe, String> {
-    SimpleRe::new(pattern)
 }

@@ -332,13 +332,36 @@ pub fn load_token(provider: &str) -> Option<Token> {
     })
 }
 
+pub fn has_token(provider: &str) -> bool {
+    load_token(provider).is_some()
+}
+
 pub fn delete_token(provider: &str) -> Result<bool, String> {
+    let _guard = REFRESH_LOCK
+        .lock()
+        .map_err(|_| "oauth: credential lock poisoned".to_string())?;
+    let token = load_token(provider);
     let entry =
         keyring::Entry::new("cairn-code", &keyring_user(provider)).map_err(|e| e.to_string())?;
-    match entry.delete_credential() {
+    let result = match entry.delete_credential() {
         Ok(()) => Ok(true),
         Err(keyring::Error::NoEntry) => Ok(false),
         Err(e) => Err(e.to_string()),
+    };
+    if let Some(token) = token {
+        clear_matching_oauth_env(provider, &token.access_token);
+    }
+    result
+}
+
+/// Remove a process environment credential only when it came from OAuth.
+/// This cleans up tokens mirrored by older code without deleting a genuine API key.
+fn clear_matching_oauth_env(provider: &str, access_token: &str) {
+    let Some(var) = crate::config::env_var_name(provider) else {
+        return;
+    };
+    if std::env::var(var).ok().as_deref() == Some(access_token) {
+        std::env::remove_var(var);
     }
 }
 
@@ -403,18 +426,27 @@ pub fn access_token(provider: &str) -> Option<String> {
         return None;
     }
     match refresh_xai_token(&tok.refresh_token) {
-        Ok(mut new_tok) => {
-            if new_tok.refresh_token.is_empty() {
-                new_tok.refresh_token = tok.refresh_token;
-            }
-            if save_token(&provider, &new_tok).is_err() {
-                // Still usable for this process even if keyring write failed.
-            }
-            std::env::set_var("XAI_API_KEY", &new_tok.access_token);
-            Some(new_tok.access_token)
-        }
+        Ok(new_tok) => persist_refreshed_token(&provider, &tok, new_tok, save_token).ok(),
         Err(_) => None,
     }
+}
+
+fn persist_refreshed_token<F>(
+    provider: &str,
+    previous: &Token,
+    mut refreshed: Token,
+    persist: F,
+) -> Result<String, String>
+where
+    F: FnOnce(&str, &Token) -> Result<(), String>,
+{
+    if refreshed.refresh_token.is_empty() {
+        refreshed.refresh_token = previous.refresh_token.clone();
+    }
+    let access_token = refreshed.access_token.clone();
+    persist(provider, &refreshed)?;
+    clear_matching_oauth_env(provider, &previous.access_token);
+    Ok(access_token)
 }
 
 pub fn status_line(provider: &str) -> String {
@@ -512,6 +544,10 @@ pub fn token_from_json_response(resp: &str, fallback_refresh: &str) -> Result<To
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn form_encode_basic() {
@@ -562,5 +598,91 @@ mod tests {
         assert!(access_still_fresh(&t));
         t.expires_at = now_unix() + 10;
         assert!(!access_still_fresh(&t));
+    }
+
+    #[test]
+    fn refreshed_token_is_persisted() {
+        let previous = Token {
+            access_token: "old-access".into(),
+            refresh_token: "old-refresh".into(),
+            token_type: "Bearer".into(),
+            expires_at: 1,
+        };
+        let refreshed = Token {
+            access_token: "new-access".into(),
+            refresh_token: String::new(),
+            token_type: "Bearer".into(),
+            expires_at: now_unix() + 3600,
+        };
+        let saved = RefCell::new(None);
+
+        let access = persist_refreshed_token("xai", &previous, refreshed, |provider, token| {
+            *saved.borrow_mut() = Some((provider.to_string(), token.clone()));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(access, "new-access");
+        let saved = saved.into_inner().unwrap();
+        assert_eq!(saved.0, "xai");
+        assert_eq!(saved.1.access_token, "new-access");
+        assert_eq!(saved.1.refresh_token, "old-refresh");
+    }
+
+    #[test]
+    fn refreshed_token_is_not_used_when_persistence_fails() {
+        let previous = Token {
+            access_token: "old-access".into(),
+            refresh_token: "old-refresh".into(),
+            token_type: "Bearer".into(),
+            expires_at: 1,
+        };
+        let refreshed = Token {
+            access_token: "new-access".into(),
+            refresh_token: "new-refresh".into(),
+            token_type: "Bearer".into(),
+            expires_at: now_unix() + 3600,
+        };
+
+        let result = persist_refreshed_token("xai", &previous, refreshed, |_, _| {
+            Err("keyring unavailable".into())
+        });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn logout_clears_only_matching_oauth_environment_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original = std::env::var_os("XAI_API_KEY");
+
+        std::env::set_var("XAI_API_KEY", "oauth-access");
+        clear_matching_oauth_env("xai", "oauth-access");
+        assert!(std::env::var_os("XAI_API_KEY").is_none());
+
+        std::env::set_var("XAI_API_KEY", "old-oauth-access");
+        let previous = Token {
+            access_token: "old-oauth-access".into(),
+            refresh_token: "old-refresh".into(),
+            token_type: "Bearer".into(),
+            expires_at: 1,
+        };
+        let refreshed = Token {
+            access_token: "new-oauth-access".into(),
+            refresh_token: "new-refresh".into(),
+            token_type: "Bearer".into(),
+            expires_at: now_unix() + 3600,
+        };
+        persist_refreshed_token("xai", &previous, refreshed, |_, _| Ok(())).unwrap();
+        assert!(std::env::var_os("XAI_API_KEY").is_none());
+
+        std::env::set_var("XAI_API_KEY", "user-api-key");
+        clear_matching_oauth_env("xai", "oauth-access");
+        assert_eq!(std::env::var("XAI_API_KEY").unwrap(), "user-api-key");
+
+        match original {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
     }
 }

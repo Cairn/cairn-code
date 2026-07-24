@@ -5,16 +5,17 @@ pub mod http_client;
 pub mod json;
 pub mod llm;
 pub mod markdown;
+pub mod mcp;
 pub mod notify;
 pub mod oauth;
 pub mod redact;
 pub mod session;
+pub mod skills;
 pub mod theme;
 pub mod tools;
 pub mod tui;
 
-#[cfg(test)]
-pub(crate) mod test_support {
+pub mod test_support {
     use std::ffi::OsString;
     use std::sync::Mutex;
 

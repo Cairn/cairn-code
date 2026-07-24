@@ -199,6 +199,7 @@ impl Tui {
                 "/delete".into(),
                 "/exit".into(),
                 "/help".into(),
+                "/mcp".into(),
                 "/model".into(),
                 "/provider".into(),
                 "/quit".into(),
@@ -208,6 +209,7 @@ impl Tui {
                 "/save".into(),
                 "/select".into(),
                 "/sessions".into(),
+                "/skills".into(),
                 "/suggestions".into(),
                 "/theme".into(),
                 "/thinking".into(),
@@ -1063,7 +1065,11 @@ impl Tui {
             }
             KeyCode::Left => {
                 if self.cursor > 0 {
-                    self.cursor -= 1;
+                    self.cursor = self.input_buf[..self.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
                 }
                 true
             }
@@ -1087,7 +1093,11 @@ impl Tui {
                     }
                 }
                 if self.cursor < self.input_buf.len() {
-                    self.cursor += 1;
+                    self.cursor += self.input_buf[self.cursor..]
+                        .chars()
+                        .next()
+                        .map(char::len_utf8)
+                        .unwrap_or(0);
                 }
                 true
             }
@@ -1342,8 +1352,13 @@ impl Tui {
             }
             KeyCode::Backspace => {
                 if self.cursor > 0 && !self.show_model_picker && !self.show_provider_picker {
-                    self.input_buf.remove(self.cursor - 1);
-                    self.cursor -= 1;
+                    let previous = self.input_buf[..self.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                    self.input_buf.remove(previous);
+                    self.cursor = previous;
                     self.update_cmd_picker();
                     if self.input_buf.is_empty() {
                         self.refresh_idle_suggestion();
@@ -1608,9 +1623,83 @@ impl Tui {
             "/help" => {
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
-                    content: "Commands: /auth /clear /compact /copy /cost /delete /exit /help /model /mouse /provider /resume /save /select /sessions /suggestions /theme /thinking\nMouse: wheel scrolls · Shift+drag selects (terminal-native) · /mouse off disables capture\n/select [last|all] or Ctrl+O — plain-text view if you need a full select dump\n/copy or Ctrl+Y — copy last assistant message to clipboard\n/thinking [on|off] · /suggestions [on|off]\nTab completes slash commands · Scroll: PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End\nSounds: CAIRN_SOUND=0 to mute · /provider xai — OAuth; /auth login xai".into(),
+                    content: "Commands: /auth /clear /compact /copy /cost /delete /exit /help /mcp /model /mouse /provider /resume /save /select /sessions /skills /suggestions /theme /thinking\nExtensibility: skills (SKILL.md) + MCP stdio (config mcp.servers or mcpServers)\n/skills · /mcp — list skills and MCP servers\nMouse: wheel scrolls · Shift+drag selects (terminal-native) · /mouse off disables capture\n/select [last|all] or Ctrl+O — plain-text view if you need a full select dump\n/copy or Ctrl+Y — copy last assistant message to clipboard\n/thinking [on|off] · /suggestions [on|off]\nTab completes slash commands · Scroll: PgUp/PgDn · Ctrl+U/D · Ctrl+Home/End\nSounds: CAIRN_SOUND=0 to mute · /provider xai — OAuth; /auth login xai".into(),
                     tool_name: String::new(), duration: String::new(),
                 });
+            }
+            "/skills" => {
+                let cfg = crate::config::Config::load();
+                if let Some(ref d) = cfg.skills_dir {
+                    std::env::set_var("CAIRN_SKILLS_DIR", d);
+                }
+                let list = crate::skills::load_skills();
+                let dir = cfg
+                    .skills_dir
+                    .as_ref()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(crate::skills::default_skills_dir);
+                if list.is_empty() {
+                    self.output_lines.push(OutputLine {
+                        type_: "system".into(),
+                        content: format!(
+                            "No skills found. Add packs as {}/<name>/SKILL.md (or set CAIRN_SKILLS_DIR).",
+                            dir.display()
+                        ),
+                        tool_name: String::new(),
+                        duration: String::new(),
+                    });
+                } else {
+                    let mut body = format!("Skills ({}) from {}:\n", list.len(), dir.display());
+                    for s in &list {
+                        body.push_str(&format!("  {} — {}\n", s.name, s.description));
+                    }
+                    body.push_str("Load in-chat with the skill tool: {\"name\":\"...\"}");
+                    self.output_lines.push(OutputLine {
+                        type_: "system".into(),
+                        content: body,
+                        tool_name: String::new(),
+                        duration: String::new(),
+                    });
+                }
+            }
+            "/mcp" => {
+                let cfg = crate::config::Config::load();
+                if cfg.mcp.servers.is_empty() {
+                    self.output_lines.push(OutputLine {
+                        type_: "system".into(),
+                        content: format!(
+                            "No MCP servers in config. Add mcp.servers (or mcpServers) to {}.",
+                            crate::config::config_path()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "~/.config/cairn-code/config.json".into())
+                        ),
+                        tool_name: String::new(),
+                        duration: String::new(),
+                    });
+                } else {
+                    let mut body = String::from("Configured MCP servers:\n");
+                    let mut names: Vec<_> = cfg.mcp.servers.keys().cloned().collect();
+                    names.sort();
+                    for n in names {
+                        let s = &cfg.mcp.servers[&n];
+                        let state = if s.disabled { "disabled" } else { "enabled" };
+                        let args_str = if s.args.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {}", crate::redact::redact_secrets(&s.args.join(" ")))
+                        };
+                        body.push_str(&format!("  {n} [{state}] — {}{args_str}\n", s.command));
+                    }
+                    body.push_str(
+                        "Tools register at startup as mcp_<server>_<tool> (permission required).",
+                    );
+                    self.output_lines.push(OutputLine {
+                        type_: "system".into(),
+                        content: body,
+                        tool_name: String::new(),
+                        duration: String::new(),
+                    });
+                }
             }
             "/auth" => {
                 let sub = parts.get(1).copied().unwrap_or("status");
@@ -2801,13 +2890,15 @@ impl Tui {
                 Span::raw(after),
             ]));
             chrome.push(Line::from(""));
-            chrome.push(Line::from(vec![
-                Span::styled(format!("Tool '{}' wants to run:", self.perm_tool_name), white),
-            ]));
+            chrome.push(Line::from(vec![Span::styled(
+                format!("Tool '{}' wants to run:", self.perm_tool_name),
+                white,
+            )]));
             if let Some(warning) = permission_risk_warning(&self.perm_tool_name) {
-                chrome.push(Line::from(vec![
-                    Span::styled(format!("  {warning}"), orange_fg),
-                ]));
+                chrome.push(Line::from(vec![Span::styled(
+                    format!("  {warning}"),
+                    orange_fg,
+                )]));
             }
             if !self.perm_tool_input.is_empty() {
                 chrome.push(Line::from(vec![Span::styled(
@@ -3800,6 +3891,41 @@ mod exit_tests {
                 "{command} should request normal event-loop termination"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod unicode_input_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn press(tui: &mut Tui, code: KeyCode) {
+        tui.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn cursor_and_edits_follow_unicode_character_boundaries() {
+        let mut tui = Tui::new("test", "test-model", "test-provider", ".");
+        tui.input_buf = "é界🙂".into();
+        tui.cursor = tui.input_buf.len();
+
+        press(&mut tui, KeyCode::Left);
+        assert_eq!(tui.cursor, "é界".len());
+        press(&mut tui, KeyCode::Left);
+        assert_eq!(tui.cursor, "é".len());
+        press(&mut tui, KeyCode::Right);
+        assert_eq!(tui.cursor, "é界".len());
+
+        press(&mut tui, KeyCode::Backspace);
+        assert_eq!(tui.input_buf, "é🙂");
+        assert_eq!(tui.cursor, "é".len());
+        press(&mut tui, KeyCode::Delete);
+        assert_eq!(tui.input_buf, "é");
+
+        press(&mut tui, KeyCode::Char('界'));
+        press(&mut tui, KeyCode::Char('🙂'));
+        assert_eq!(tui.input_buf, "é界🙂");
+        assert_eq!(tui.cursor, tui.input_buf.len());
     }
 }
 

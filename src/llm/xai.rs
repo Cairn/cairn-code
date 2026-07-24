@@ -36,6 +36,11 @@ impl XaiProvider {
     }
 
     fn get_key(&self) -> String {
+        // OAuth must be checked first so an expired access token is refreshed
+        // instead of being shadowed by a stale token previously copied to env.
+        if crate::oauth::has_token("xai") {
+            return crate::oauth::access_token("xai").unwrap_or_default();
+        }
         if !self.api_key.is_empty() {
             return self.api_key.clone();
         }
@@ -46,9 +51,6 @@ impl XaiProvider {
         }
         if let Some(k) = crate::config::config_get_api_key("xai") {
             return k;
-        }
-        if let Some(tok) = crate::oauth::access_token("xai") {
-            return tok;
         }
         String::new()
     }

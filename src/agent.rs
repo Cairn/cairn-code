@@ -43,14 +43,27 @@ pub struct Agent {
     last_input_tokens: u64,
     /// Mirrors full message history for session autosave (shared with TUI).
     live_mirror: Option<crate::session::LiveMirror>,
+    /// Skill catalog (names/descriptions); bodies loaded via the `skill` tool.
+    skills: Vec<crate::skills::Skill>,
 }
 
 impl Agent {
+    #[allow(dead_code)]
     pub fn new(
         provider: Box<dyn llm::Provider>,
         model: String,
         tools: Registry,
         config: Config,
+    ) -> Self {
+        Self::new_with_skills(provider, model, tools, config, Vec::new())
+    }
+
+    pub fn new_with_skills(
+        provider: Box<dyn llm::Provider>,
+        model: String,
+        tools: Registry,
+        config: Config,
+        skills: Vec<crate::skills::Skill>,
     ) -> Self {
         Agent {
             provider,
@@ -61,6 +74,7 @@ impl Agent {
             usage: Usage::default(),
             last_input_tokens: 0,
             live_mirror: None,
+            skills,
         }
     }
 
@@ -242,7 +256,7 @@ impl Agent {
             content: llm::Content::Text(input.to_string()),
         });
 
-        let system = load_system_prompt(&self.config.system_prompt_file);
+        let system = load_system_prompt(&self.config.system_prompt_file, &self.skills);
         // At most one reactive compact-and-retry per user turn so a provider
         // that keeps returning context errors cannot loop forever.
         let mut reactive_compact_attempted = false;
@@ -454,74 +468,105 @@ impl Agent {
             content: llm::Content::Text(input.to_string()),
         });
 
-        let system = load_system_prompt(&self.config.system_prompt_file);
-        let tool_defs = self.tools.definitions();
-
-        if self.should_proactively_compact() {
-            self.compact_history(None);
-        }
-
-        let (new_msgs, usage) = match self.provider.complete(
-            &self.messages,
-            &tool_defs,
-            &system,
-            &self.model,
-            self.config.max_tokens,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                let err = Self::format_llm_err(e);
-                if crate::http_client::is_context_limit_error(&err)
-                    && self.compact_history(None) > 0
-                {
-                    self.provider
-                        .complete(
-                            &self.messages,
-                            &tool_defs,
-                            &system,
-                            &self.model,
-                            self.config.max_tokens,
-                        )
-                        .map_err(Self::format_llm_err)?
-                } else {
-                    return Err(err);
-                }
-            }
-        };
-
-        self.usage.input_tokens += usage.input_tokens;
-        self.usage.output_tokens += usage.output_tokens;
-        self.last_input_tokens = usage.input_tokens;
-
+        let system = load_system_prompt(&self.config.system_prompt_file, &self.skills);
+        let mut reactive_compact_attempted = false;
         let mut output = String::new();
-        for msg in &new_msgs {
-            self.messages.push(msg.clone());
-            match &msg.content {
-                llm::Content::Text(t) => output.push_str(t),
-                llm::Content::ToolUse(tu) => {
-                    // No interactive channel is available in non-interactive
-                    // (`--print`) mode, so this enforces the same deny/ask/
-                    // auto_allow policy as the TUI loop and fails closed for
-                    // any tool that would otherwise require user approval.
-                    let result = self
+
+        let result = (|| -> Result<String, String> {
+            for _turn in 0..self.config.max_turns {
+                if self.should_proactively_compact() {
+                    self.compact_history(None);
+                }
+
+                let tool_defs = self.tools.definitions();
+                let (new_msgs, usage) = match self.provider.complete(
+                    &self.messages,
+                    &tool_defs,
+                    &system,
+                    &self.model,
+                    self.config.max_tokens,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let err = Self::format_llm_err(e);
+                        if !reactive_compact_attempted
+                            && crate::http_client::is_context_limit_error(&err)
+                        {
+                            reactive_compact_attempted = true;
+                            if self.compact_history(None) > 0 {
+                                continue;
+                            }
+                        }
+                        return Err(err);
+                    }
+                };
+
+                self.usage.input_tokens += usage.input_tokens;
+                self.usage.output_tokens += usage.output_tokens;
+                self.usage.cache_read += usage.cache_read;
+                self.usage.cache_create += usage.cache_create;
+                self.last_input_tokens = usage.input_tokens;
+
+                let tool_uses: Vec<llm::ToolUse> = new_msgs
+                    .iter()
+                    .filter_map(|msg| match &msg.content {
+                        llm::Content::ToolUse(tu) => Some(tu.clone()),
+                        _ => None,
+                    })
+                    .collect();
+
+                for msg in &new_msgs {
+                    self.messages.push(msg.clone());
+                    if let llm::Content::Text(text) = &msg.content {
+                        output.push_str(text);
+                    }
+                }
+
+                if tool_uses.is_empty() {
+                    return Ok(output);
+                }
+
+                for tu in &tool_uses {
+                    // Print mode has no user to prompt, so approval-required
+                    // tools fail closed unless config explicitly auto-allows them.
+                    let tool_result = self
                         .execute_tool_with_policy(tu, None)
                         .unwrap_or_else(|e| format!("Error: {e}"));
-                    output.push_str(&format!("\n[{}({})]: {}", tu.name, tu.input, result));
+                    output.push_str(&format!("\n[{}({})]: {}", tu.name, tu.input, tool_result));
+                    self.messages.push(llm::Message {
+                        role: "user".into(),
+                        content: llm::Content::ToolResult(llm::ToolResult {
+                            tool_use_id: tu.id.clone(),
+                            content: tool_result,
+                        }),
+                    });
                 }
-                _ => {}
             }
-        }
 
-        Ok(output)
+            Err(format!(
+                "Agent reached the maximum of {} turns before completing",
+                self.config.max_turns
+            ))
+        })();
+
+        self.sync_live_mirror();
+        result
     }
 }
 
-fn load_system_prompt(path: &str) -> String {
-    if let Ok(content) = fs::read_to_string(path) {
-        content
-    } else {
-        String::new()
+fn load_system_prompt(path: &str, skills: &[crate::skills::Skill]) -> String {
+    let mut content = fs::read_to_string(path).unwrap_or_default();
+    let catalog = crate::skills::catalog_prompt(skills);
+    if !catalog.is_empty() {
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&catalog);
     }
+    content
 }
 
 /// Index at which to split history for compaction: `messages[..split]` is
@@ -1023,9 +1068,7 @@ mod tests {
         );
     }
 
-    /// Always returns a single assistant `ToolUse` message for the configured
-    /// tool, so a test can drive `run_simple`'s tool-authorization path
-    /// without a network call.
+    /// Returns one tool call, then a final response after receiving its result.
     struct ToolCallMock {
         tool_name: String,
         tool_input: String,
@@ -1084,12 +1127,24 @@ mod tests {
         }
         fn complete(
             &self,
-            _messages: &[llm::Message],
+            messages: &[llm::Message],
             _tools: &[llm::ToolDefinition],
             _system: &str,
             _model: &str,
             _max_tokens: usize,
         ) -> Result<(Vec<llm::Message>, Usage), String> {
+            if messages
+                .iter()
+                .any(|message| matches!(&message.content, llm::Content::ToolResult(_)))
+            {
+                return Ok((
+                    vec![llm::Message {
+                        role: "assistant".into(),
+                        content: llm::Content::Text("tool complete".into()),
+                    }],
+                    Usage::default(),
+                ));
+            }
             Ok((
                 vec![llm::Message {
                     role: "assistant".into(),
@@ -1175,7 +1230,30 @@ mod tests {
         let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
         let output = agent.run_simple("do something").unwrap();
         assert!(output.contains("recorded execution"), "{output}");
+        assert!(output.contains("tool complete"), "{output}");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn run_simple_submits_tool_result_and_continues_to_final_response() {
+        let mut config = Config::default();
+        config.ask.clear();
+        let (mut agent, calls) = agent_with_tool_call("safe", false, config);
+
+        let output = agent.run_simple("use the tool").unwrap();
+
+        assert!(output.contains("recorded execution"), "{output}");
+        assert!(output.ends_with("tool complete"), "{output}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            &agent.messages()[2].content,
+            llm::Content::ToolResult(result)
+                if result.tool_use_id == "1" && result.content == "recorded execution"
+        ));
+        assert!(matches!(
+            &agent.messages()[3].content,
+            llm::Content::Text(text) if text == "tool complete"
+        ));
     }
 
     /// Denied tools must stay denied in print mode too, matching the
