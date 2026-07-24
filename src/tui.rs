@@ -2735,61 +2735,36 @@ impl Tui {
 
         // Welcome box (Claude Code style): full terminal width rounded frame.
         // Inner content width is terminal cols minus the two border glyphs.
+        // Emoji (e.g. 🪨) must use display_width=2 or the right border drops off.
         let pw = (area.width as usize).saturating_sub(2).max(1);
-        let pad = |s: &str| {
-            let dw = display_width(s);
-            if dw < pw {
-                format!("{}{}", s, " ".repeat(pw - dw))
-            } else {
-                let mut out = String::with_capacity(pw);
-                let mut w_used = 0;
-                for c in s.chars() {
-                    let cw = char_width(c);
-                    if w_used + cw > pw {
-                        break;
-                    }
-                    out.push(c);
-                    w_used += cw;
-                }
-                if w_used < pw {
-                    out.push_str(&" ".repeat(pw - w_used));
-                }
-                out
-            }
-        };
+        let pad = |s: &str| pad_to_display_width(s, pw);
         let box_style = orange;
+        let box_row = |inner: String, style: Style| {
+            Line::from(vec![
+                Span::styled("│", box_style),
+                Span::styled(inner, style),
+                Span::styled("│", box_style),
+            ])
+        };
 
         lines.push(Line::from(Span::styled(
             format!("╭{}╮", "─".repeat(pw)),
             box_style,
         )));
-        lines.push(Line::from(vec![
-            Span::styled("│", box_style),
-            Span::styled(pad(&format!("  🪨 Cairn Code v{}", self.version)), bright),
-            Span::styled("│", box_style),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("│", box_style),
-            Span::styled(pad("  open terminal coding agent  ·  /help"), dim),
-            Span::styled("│", box_style),
-        ]));
+        lines.push(box_row(
+            pad(&format!("  🪨 Cairn Code v{}", self.version)),
+            bright,
+        ));
+        lines.push(box_row(pad("  open terminal coding agent  ·  /help"), dim));
         lines.push(Line::from(Span::styled(
             format!("├{}┤", "─".repeat(pw)),
             box_style,
         )));
-        lines.push(Line::from(vec![
-            Span::styled("│", box_style),
-            Span::styled(
-                pad(&format!("  Model   {} / {}", self.provider, self.model)),
-                dim,
-            ),
-            Span::styled("│", box_style),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("│", box_style),
-            Span::styled(pad(&format!("  Path    {}", self.work_dir)), dim),
-            Span::styled("│", box_style),
-        ]));
+        lines.push(box_row(
+            pad(&format!("  Model   {} / {}", self.provider, self.model)),
+            dim,
+        ));
+        lines.push(box_row(pad(&format!("  Path    {}", self.work_dir)), dim));
         lines.push(Line::from(Span::styled(
             format!("╰{}╯", "─".repeat(pw)),
             box_style,
@@ -4603,6 +4578,16 @@ mod claude_chrome_tests {
     }
 
     #[test]
+    fn rock_emoji_is_double_width_for_welcome_pad() {
+        // U+1FAA8 ROCK must count as 2 cols or the welcome right border slips.
+        assert_eq!(char_width('🪨'), 2);
+        // "  " (2) + rock (2) + " Cairn" (6) = 10
+        assert_eq!(display_width("  🪨 Cairn"), 10);
+        let padded = pad_to_display_width("  🪨 Cairn Code v0.1.0", 40);
+        assert_eq!(display_width(&padded), 40);
+    }
+
+    #[test]
     fn ctrl_c_arms_exit_without_transcript_noise() {
         let mut tui = Tui::new("test", "model", "provider", ".");
         assert!(tui.input_buf.is_empty());
@@ -4762,6 +4747,18 @@ mod completion_tests {
 
 fn char_width(c: char) -> usize {
     let cp = c as u32;
+    // Zero-width: combining marks, variation selectors, ZWJ (emoji sequences).
+    if (0x0300..=0x036F).contains(&cp)
+        || (0x1AB0..=0x1AFF).contains(&cp)
+        || (0x1DC0..=0x1DFF).contains(&cp)
+        || (0x20D0..=0x20FF).contains(&cp)
+        || (0xFE00..=0xFE0F).contains(&cp)
+        || (0xE0100..=0xE01EF).contains(&cp)
+        || cp == 0x200D
+        || cp == 0xFEFF
+    {
+        return 0;
+    }
     if cp < 0x1100 {
         1
     } else if cp <= 0x115F {
@@ -4806,13 +4803,29 @@ fn char_width(c: char) -> usize {
         2
     } else if cp >= 0x1B100 && cp <= 0x1B12F {
         2
+    } else if cp >= 0x1F000 && cp <= 0x1F02F {
+        // Mahjong tiles
+        2
+    } else if cp >= 0x1F0A0 && cp <= 0x1F0FF {
+        // Playing cards
+        2
+    } else if cp >= 0x1F100 && cp <= 0x1F1FF {
+        // Enclosed alphanumerics / regional indicators (flags ~2 each)
+        2
     } else if cp >= 0x1F200 && cp <= 0x1F2FF {
+        2
+    } else if cp >= 0x1F300 && cp <= 0x1F9FF {
+        // Misc symbols & pictographs, emoticons, transport, supplemental
+        2
+    } else if cp >= 0x1FA00 && cp <= 0x1FAFF {
+        // Chess symbols, symbols and pictographs extended-A (includes 🪨 U+1FAA8)
         2
     } else if cp >= 0x20000 && cp <= 0x2FFFD {
         2
     } else if cp >= 0x30000 && cp <= 0x3FFFD {
         2
-    } else if cp >= 0x2600 && cp <= 0x26FF {
+    } else if cp >= 0x2600 && cp <= 0x27BF {
+        // Misc symbols + dingbats
         2
     } else {
         1
@@ -4821,6 +4834,31 @@ fn char_width(c: char) -> usize {
 
 fn display_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
+}
+
+/// Pad or truncate `s` to exactly `width` terminal columns (display width).
+fn pad_to_display_width(s: &str, width: usize) -> String {
+    let dw = display_width(s);
+    if dw < width {
+        return format!("{}{}", s, " ".repeat(width - dw));
+    }
+    if dw == width {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut w_used = 0;
+    for c in s.chars() {
+        let cw = char_width(c);
+        if w_used + cw > width {
+            break;
+        }
+        out.push(c);
+        w_used += cw;
+    }
+    if w_used < width {
+        out.push_str(&" ".repeat(width - w_used));
+    }
+    out
 }
 
 fn truncate_summary(summary: &str, max_chars: usize) -> String {
