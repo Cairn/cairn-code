@@ -102,7 +102,16 @@ pub fn run(
     options: &RunOptions,
     cancel: Option<&AtomicBool>,
 ) -> Result<RunResult, RunError> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // stdin is closed rather than inherited. The TUI holds the terminal in raw
+    // mode under an alternate screen, so a child that reads stdin — `git
+    // rebase -i`, `ssh` asking for a passphrase, `npm init`, a bare `read` —
+    // would compete with the composer for keystrokes while the user cannot see
+    // what it is waiting for. Closed stdin turns that into an immediate EOF,
+    // which every one of those commands handles by failing fast.
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     // Overflow (timeout near the end of the monotonic clock) degrades to
     // "no deadline" rather than erroring; cancellation still applies.
@@ -651,6 +660,40 @@ mod tests {
             command.arg("-c").arg(format!("sleep {seconds}"));
         }
         command
+    }
+
+    /// Reads stdin to EOF and reports how many characters it saw.
+    fn read_stdin_command() -> Command {
+        let mut command = Command::new(if cfg!(windows) { "powershell" } else { "bash" });
+        if cfg!(windows) {
+            command
+                .arg("-Command")
+                .arg("$i = [Console]::In.ReadToEnd(); Write-Output \"len=$($i.Length)\"");
+        } else {
+            command.arg("-c").arg("data=$(cat); echo \"len=${#data}\"");
+        }
+        command
+    }
+
+    #[test]
+    fn child_stdin_is_closed_rather_than_inherited() {
+        // A child that reads stdin must get EOF at once. With stdin inherited
+        // it reads the terminal instead, competing with the TUI composer for
+        // keystrokes while the user cannot see what it is waiting for. The
+        // timeout is the real assertion: an inherited terminal stdin blocks
+        // here, so reaching the length check at all is the guarantee.
+        let options = RunOptions {
+            timeout: Some(Duration::from_secs(20)),
+            head_chars: 200,
+            tail_chars: 200,
+        };
+        let result = run(read_stdin_command(), &options, None)
+            .expect("reading stdin must not block: it should be closed, not inherited");
+        assert!(
+            result.stdout.contains("len=0"),
+            "child saw stdin content: {:?}",
+            result.stdout
+        );
     }
 
     fn large_output_command(stderr: bool) -> Command {
