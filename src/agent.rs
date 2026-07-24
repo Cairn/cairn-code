@@ -17,6 +17,9 @@ pub enum AgentEvent {
     TurnEnd(llm::Usage),
     PermissionRequest(String, String),
     Compacted(usize),
+    /// Transcript advanced far enough that the TUI should durable-checkpoint.
+    /// Emitted after user input, assistant messages, tool results, and compact.
+    Checkpoint,
     Done,
 }
 
@@ -91,6 +94,14 @@ impl Agent {
             g.messages = self.messages.clone();
             g.tokens_in = self.usage.input_tokens;
             g.tokens_out = self.usage.output_tokens;
+        }
+    }
+
+    /// Push the live transcript and ask the TUI to flush it to disk.
+    fn checkpoint(&self, tx: Option<&mpsc::Sender<AgentEvent>>) {
+        self.sync_live_mirror();
+        if let Some(tx) = tx {
+            let _ = tx.send(AgentEvent::Checkpoint);
         }
     }
 
@@ -219,6 +230,10 @@ impl Agent {
             let _ = tx.send(AgentEvent::Compacted(split));
         }
 
+        // Durable checkpoint so a crash right after compact still keeps the
+        // shortened history (and does not leave an older, longer file only).
+        self.checkpoint(tx);
+
         split
     }
 
@@ -231,7 +246,6 @@ impl Agent {
                     .into(),
             );
         }
-        self.sync_live_mirror();
         Ok(n)
     }
 
@@ -259,6 +273,9 @@ impl Agent {
             role: "user".into(),
             content: llm::Content::Text(input.to_string()),
         });
+        // Persist the user prompt immediately so a crash during the first LLM
+        // call does not lose the start of the turn.
+        self.checkpoint(Some(&tx));
 
         let system = load_system_prompt(&self.config.system_prompt_file, &self.skills);
         // At most one reactive compact-and-retry per user turn so a provider
@@ -337,6 +354,8 @@ impl Agent {
                 for msg in &new_msgs {
                     self.messages.push(msg.clone());
                 }
+                // Assistant text / tool_use is on the mirror before tools run.
+                self.checkpoint(Some(&tx));
 
                 if tool_uses.is_empty() {
                     return Ok(());
@@ -369,6 +388,9 @@ impl Agent {
                             content: result_str,
                         }),
                     });
+                    // Checkpoint after each tool so long multi-tool turns
+                    // survive process crashes mid-loop.
+                    self.checkpoint(Some(&tx));
                 }
             }
 
