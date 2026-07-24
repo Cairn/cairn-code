@@ -105,6 +105,9 @@ fn serve_once(listener: TcpListener, response: &[u8], capture: &PathBuf) {
                 Err(_) => return,
             }
         };
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
         let mut request = Vec::new();
         let mut buffer = [0; 4096];
         let body_end = loop {
