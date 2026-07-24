@@ -494,6 +494,12 @@ impl ProcessTree {
 #[cfg(windows)]
 struct ProcessTree(windows_sys::Win32::Foundation::HANDLE);
 
+// Job-object HANDLEs are process-wide kernel objects. Readers share
+// `&Mutex<ManagedChild>` across scoped threads for timeout kill; Drop still
+// closes the handle once after those threads join.
+#[cfg(windows)]
+unsafe impl Send for ProcessTree {}
+
 #[cfg(windows)]
 impl ProcessTree {
     fn new() -> Result<Self, String> {
