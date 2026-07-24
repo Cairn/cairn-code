@@ -153,7 +153,7 @@ const SHORTCUT_ROWS: &[(&str, &str)] = &[
     ("Wheel", "scroll transcript"),
     ("Ctrl+Y", "copy last assistant message"),
     ("Ctrl+O", "plain-text select mode"),
-    ("/", "slash commands (Tab completes)"),
+    ("/", "slash commands (↑↓ select · Tab completes)"),
 ];
 // MiniDot FPS is time.Second/12 (~83ms). Faster ticks look like flicker; slower feels sticky.
 const SPINNER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 12);
@@ -316,31 +316,7 @@ impl Tui {
             pending_provider_selection: None,
             api_key_target: None,
             show_command_picker: false,
-            cmd_picker_list: vec![
-                "/auth".into(),
-                "/clear".into(),
-                "/compact".into(),
-                "/cost".into(),
-                "/delete".into(),
-                "/exit".into(),
-                "/help".into(),
-                "/mcp".into(),
-                "/model".into(),
-                "/provider".into(),
-                "/quit".into(),
-                "/copy".into(),
-                "/q".into(),
-                "/reset".into(),
-                "/resume".into(),
-                "/save".into(),
-                "/select".into(),
-                "/sessions".into(),
-                "/skills".into(),
-                "/suggestions".into(),
-                "/theme".into(),
-                "/thinking".into(),
-                "/mouse".into(),
-            ],
+            cmd_picker_list: SLASH_COMMANDS.iter().map(|(c, _)| (*c).into()).collect(),
             cmd_picker_filtered: Vec::new(),
             cmd_picker_sel: 0,
             show_session_picker: false,
@@ -874,11 +850,11 @@ impl Tui {
     /// can skip a redraw for pointer movement or other unhandled events.
     fn handle_mouse(&mut self, kind: MouseEventKind) -> bool {
         // Ignore mouse while list pickers own the chrome (wheel should not fight them).
-        // Slash ghost completion is inline, so scrolling still works while typing `/…`.
         if self.show_model_picker
             || self.show_provider_picker
             || self.show_theme_picker
             || self.show_session_picker
+            || self.show_command_picker
         {
             return false;
         }
@@ -3428,7 +3404,43 @@ impl Tui {
             ));
         } else {
             // Normal composer is drawn later with a ratatui Block (reliable full-width
-            // borders). Here we only build the status byline under it.
+            // borders). Here we only build what sits under it: the command list
+            // while a `/…` is being typed, then the status byline.
+            if !self.cmd_picker_filtered.is_empty() {
+                const VISIBLE: usize = 8;
+                let total = self.cmd_picker_filtered.len();
+                let sel = self.cmd_picker_sel.min(total - 1);
+                // Scroll only once the selection walks past the window.
+                let start = sel.saturating_sub(VISIBLE - 1);
+                let end = (start + VISIBLE).min(total);
+                let rows = &self.cmd_picker_filtered[start..end];
+
+                chrome.push(Line::from(vec![
+                    Span::styled("── Commands ", orange),
+                    Span::styled("(↑↓ select  Tab complete  Esc dismiss) ──", bold_dim),
+                ]));
+                if total > VISIBLE {
+                    chrome.push(Line::from(vec![Span::styled(
+                        format!("  … {}/{}  ↑↓ scroll", sel + 1, total),
+                        dim,
+                    )]));
+                }
+                let name_w = rows.iter().map(|c| display_width(c)).max().unwrap_or(0);
+                for (i, cmd) in rows.iter().enumerate() {
+                    let is_sel = start + i == sel;
+                    let prefix = if is_sel { "▸ " } else { "  " };
+                    let gap = " ".repeat(name_w.saturating_sub(display_width(cmd)));
+                    let mut row = vec![Span::styled(
+                        format!("{prefix}{cmd}{gap}"),
+                        if is_sel { selected } else { dim },
+                    )];
+                    if let Some(help) = slash_completion_help(cmd) {
+                        row.push(Span::styled(format!("  {help}"), bold_dim));
+                    }
+                    chrome.push(Line::from(row));
+                }
+            }
+
             let mut status = Vec::new();
             if self.ctrl_c_exit_armed {
                 status.push(Span::styled(
@@ -4221,11 +4233,130 @@ mod clipboard_tests {
     }
 }
 
+/// Base slash commands paired with the one-line help shown in the composer
+/// picker. This is the source of truth for `cmd_picker_list`, so a new command
+/// only has to be added here to show up in completions and in the list.
+pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/auth", "Manage provider credentials"),
+    ("/clear", "Clear the conversation"),
+    ("/compact", "Summarize the conversation to free context"),
+    ("/copy", "Copy the last reply to the clipboard"),
+    ("/cost", "Show token usage and estimated cost"),
+    ("/delete", "Delete a saved session"),
+    ("/exit", "Exit Cairn"),
+    ("/help", "List commands and keybindings"),
+    ("/mcp", "List configured MCP servers"),
+    ("/model", "Switch the active model"),
+    ("/mouse", "Toggle mouse capture"),
+    ("/provider", "Switch the active provider"),
+    ("/q", "Exit Cairn"),
+    ("/quit", "Exit Cairn"),
+    ("/reset", "Show ChatGPT rate-limit reset times"),
+    ("/resume", "Resume a saved session"),
+    ("/save", "Save the current session"),
+    ("/select", "Plain-text view for terminal selection"),
+    ("/sessions", "List saved sessions"),
+    ("/skills", "List available skills"),
+    ("/suggestions", "Toggle idle prompt suggestions"),
+    ("/theme", "Change the color theme"),
+    ("/thinking", "Toggle thinking output"),
+];
+
+/// One-line help for a picker row: the command's own description for a bare
+/// command, otherwise a label for the argument being completed.
+pub(crate) fn slash_completion_help(completion: &str) -> Option<&'static str> {
+    let parts: Vec<&str> = completion.split_whitespace().collect();
+    match parts.as_slice() {
+        [root] => SLASH_COMMANDS
+            .iter()
+            .find(|(c, _)| *c == *root)
+            .map(|(_, help)| *help),
+        ["/auth", "login"] => Some("Sign in to a provider"),
+        ["/auth", "logout"] => Some("Remove stored credentials"),
+        ["/auth", "status"] => Some("Show credential status"),
+        ["/auth", "key"] => Some("Paste an API key"),
+        ["/theme", "list"] => Some("List theme names"),
+        [_, "on"] => Some("Enable"),
+        [_, "off"] => Some("Disable"),
+        ["/auth", _, _] | ["/provider", _] => Some("provider"),
+        ["/model", ..] => Some("model"),
+        ["/theme", _] => Some("theme"),
+        ["/resume", _] | ["/delete", _] => Some("session id"),
+        _ => None,
+    }
+}
+
+/// Fuzzy-match `query` against `candidate`, case-insensitively.
+///
+/// Returns `None` unless every character of `query` appears in `candidate` in
+/// order, so `/mdl` finds `/model` but `/xyz` finds nothing. The score only has
+/// to order candidates against each other, not mean anything on its own: real
+/// prefixes rank above scattered matches, and consecutive or word-boundary hits
+/// rank above hits buried mid-word.
+pub(crate) fn fuzzy_score(candidate: &str, query: &str) -> Option<i32> {
+    let cand: Vec<char> = candidate.to_ascii_lowercase().chars().collect();
+    let q: Vec<char> = query.to_ascii_lowercase().chars().collect();
+    if q.is_empty() {
+        return Some(0);
+    }
+    if q.len() > cand.len() {
+        return None;
+    }
+
+    let mut score = 0i32;
+    let mut next = 0usize;
+    let mut prev_hit: Option<usize> = None;
+    for &qc in &q {
+        let idx = (next..cand.len()).find(|&i| cand[i] == qc)?;
+        next = idx + 1;
+        // Runs of adjacent characters are what "typing the start of a word"
+        // looks like, so they weigh most.
+        if prev_hit.is_some_and(|p| p + 1 == idx) {
+            score += 8;
+        }
+        // Segment starts (`/auth`, `grok-4.5`, `claude_x`) are strong anchors.
+        if idx == 0 || matches!(cand[idx - 1], '/' | '-' | '_' | '.' | ':' | ' ') {
+            score += 6;
+        }
+        // Early hits beat late ones, but never by enough to outweigh an anchor.
+        score -= (idx as i32).min(10);
+        prev_hit = Some(idx);
+    }
+    // What the user typed verbatim is almost always what they meant.
+    if cand.starts_with(&q) {
+        score += 40;
+    }
+    // Between two matches the tighter one is the better guess — but only once
+    // the query says something. A bare `/` matches everything equally well, and
+    // length is then the only differing term, which would silently re-sort the
+    // whole command list by name length.
+    if q.len() > 1 {
+        score -= ((cand.len() - q.len()) as i32).min(20);
+    }
+    Some(score)
+}
+
+/// Rank `candidates` by fuzzy match against `query`, dropping non-matches.
+///
+/// Equal scores keep the caller's original order, so a bare `/` still lists the
+/// commands in the order they were declared.
+fn fuzzy_rank<F: Fn(&str) -> String>(candidates: &[String], query: &str, format: F) -> Vec<String> {
+    let mut scored: Vec<(i32, usize, &String)> = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| fuzzy_score(c, query).map(|s| (s, i, c)))
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut out: Vec<String> = scored.into_iter().map(|(_, _, c)| format(c)).collect();
+    out.dedup();
+    out
+}
+
 /// Contextual slash-command completions for the composer.
 ///
 /// Supports base commands, `/auth` subcommands + providers, `/theme` names,
 /// `/model` ids for the active provider, `/provider` names, and short session
-/// ids for `/resume` / `/delete`.
+/// ids for `/resume` / `/delete`. Matching is fuzzy throughout, best match first.
 pub(crate) fn slash_completions(
     input: &str,
     base_commands: &[String],
@@ -4245,25 +4376,13 @@ pub(crate) fn slash_completions(
 
     let cmd = parts[0].to_ascii_lowercase();
 
-    // Still typing the root command: `/mo` → `/model`
+    // Still typing the root command: `/mo` → `/model`, `/mdl` → `/model`
     if parts.len() == 1 && !ends_with_space {
-        return base_commands
-            .iter()
-            .filter(|c| c.to_ascii_lowercase().starts_with(&cmd))
-            .cloned()
-            .collect();
+        return fuzzy_rank(base_commands, &cmd, |c| c.to_string());
     }
 
-    let prefix_match = |candidates: &[String], typed: &str, format: &dyn Fn(&str) -> String| {
-        let typed = typed.to_ascii_lowercase();
-        let mut out: Vec<String> = candidates
-            .iter()
-            .filter(|c| c.to_ascii_lowercase().starts_with(&typed))
-            .map(|c| format(c))
-            .collect();
-        out.sort();
-        out.dedup();
-        out
+    let rank_match = |candidates: &[String], typed: &str, format: &dyn Fn(&str) -> String| {
+        fuzzy_rank(candidates, typed, format)
     };
 
     match cmd.as_str() {
@@ -4321,9 +4440,7 @@ pub(crate) fn slash_completions(
                             .collect();
                     }
                     if parts.len() == 3 && !ends_with_space {
-                        return prefix_match(providers, parts[2], &|p| {
-                            format!("/auth {action} {p}")
-                        });
+                        return rank_match(providers, parts[2], &|p| format!("/auth {action} {p}"));
                     }
                 }
             }
@@ -4336,7 +4453,7 @@ pub(crate) fn slash_completions(
                 return v;
             }
             if parts.len() == 2 && !ends_with_space {
-                let mut v = prefix_match(themes, parts[1], &|t| format!("/theme {t}"));
+                let mut v = rank_match(themes, parts[1], &|t| format!("/theme {t}"));
                 if "list".starts_with(&parts[1].to_ascii_lowercase()) {
                     v.insert(0, "/theme list".into());
                 }
@@ -4351,7 +4468,7 @@ pub(crate) fn slash_completions(
             }
             if parts.len() >= 2 && !ends_with_space {
                 let typed = parts[1..].join(" ");
-                return prefix_match(models, &typed, &|m| format!("/model {m}"));
+                return rank_match(models, &typed, &|m| format!("/model {m}"));
             }
             Vec::new()
         }
@@ -4360,7 +4477,7 @@ pub(crate) fn slash_completions(
                 return providers.iter().map(|p| format!("/provider {p}")).collect();
             }
             if parts.len() == 2 && !ends_with_space {
-                return prefix_match(providers, parts[1], &|p| format!("/provider {p}"));
+                return rank_match(providers, parts[1], &|p| format!("/provider {p}"));
             }
             Vec::new()
         }
@@ -4369,7 +4486,7 @@ pub(crate) fn slash_completions(
                 return session_ids.iter().map(|id| format!("{cmd} {id}")).collect();
             }
             if parts.len() == 2 && !ends_with_space {
-                return prefix_match(session_ids, parts[1], &|id| format!("{cmd} {id}"));
+                return rank_match(session_ids, parts[1], &|id| format!("{cmd} {id}"));
             }
             Vec::new()
         }
@@ -4940,6 +5057,82 @@ mod completion_tests {
             "/copy".into(),
             "/select".into(),
         ]
+    }
+
+    fn all() -> Vec<String> {
+        SLASH_COMMANDS.iter().map(|(c, _)| (*c).into()).collect()
+    }
+
+    #[test]
+    fn fuzzy_matches_skipped_characters() {
+        // The whole point: `/mdl` is not a prefix of anything.
+        let c = slash_completions("/mdl", &base(), &[], &[], &[], &[]);
+        assert_eq!(c, vec!["/model".to_string()]);
+        let c = slash_completions("/thnk", &base(), &[], &[], &[], &[]);
+        assert_eq!(c, vec!["/thinking".to_string()]);
+    }
+
+    #[test]
+    fn fuzzy_rejects_out_of_order_and_absent_characters() {
+        assert!(slash_completions("/ldom", &base(), &[], &[], &[], &[]).is_empty());
+        assert!(slash_completions("/zzz", &base(), &[], &[], &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn tighter_matches_rank_first() {
+        // /compact, /copy and /cost all prefix-match; the shortest wins.
+        let c = slash_completions("/co", &all(), &[], &[], &[], &[]);
+        assert_eq!(c.first().map(String::as_str), Some("/copy"), "{c:?}");
+        assert!(c.contains(&"/compact".to_string()), "{c:?}");
+    }
+
+    #[test]
+    fn fuzzy_ranks_arguments_too() {
+        let models = vec!["claude-opus-5".into(), "grok-4.5".into()];
+        let c = slash_completions("/model g45", &base(), &models, &[], &[], &[]);
+        assert_eq!(c, vec!["/model grok-4.5".to_string()]);
+    }
+
+    #[test]
+    fn fuzzy_score_orders_prefix_above_subsequence() {
+        let prefix = fuzzy_score("/model", "/mod").unwrap();
+        let scattered = fuzzy_score("/model", "/mdl").unwrap();
+        assert!(prefix > scattered, "{prefix} vs {scattered}");
+        assert_eq!(fuzzy_score("/model", "/xyz"), None);
+        // An empty query matches everything, so a bare `/` opens the full list.
+        assert_eq!(fuzzy_score("/model", ""), Some(0));
+    }
+
+    #[test]
+    fn bare_slash_lists_every_command_in_declared_order() {
+        let c = slash_completions("/", &all(), &[], &[], &[], &[]);
+        assert_eq!(c, all());
+    }
+
+    #[test]
+    fn every_command_has_help_text() {
+        for (cmd, help) in SLASH_COMMANDS {
+            assert!(!help.is_empty(), "{cmd} has no help text");
+            assert_eq!(slash_completion_help(cmd), Some(*help));
+        }
+    }
+
+    #[test]
+    fn help_describes_argument_completions() {
+        assert_eq!(
+            slash_completion_help("/auth login"),
+            Some("Sign in to a provider")
+        );
+        assert_eq!(slash_completion_help("/auth login xai"), Some("provider"));
+        assert_eq!(slash_completion_help("/model grok-4.5"), Some("model"));
+        assert_eq!(slash_completion_help("/theme dune"), Some("theme"));
+        assert_eq!(
+            slash_completion_help("/resume abc12345"),
+            Some("session id")
+        );
+        assert_eq!(slash_completion_help("/thinking on"), Some("Enable"));
+        assert_eq!(slash_completion_help("/mouse off"), Some("Disable"));
+        assert_eq!(slash_completion_help("not a command"), None);
     }
 
     #[test]
