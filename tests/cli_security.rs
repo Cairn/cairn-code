@@ -41,6 +41,8 @@ impl CliFixture {
 
     fn run(&self, prompt: &str, response: &str) -> Output {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // Non-blocking accept so the fixture server cannot hang forever after
+        // the CLI finishes (or if it never connects).
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let response = response.as_bytes().to_vec();
@@ -92,6 +94,8 @@ impl CliFixture {
 fn serve_once(listener: TcpListener, response: &[u8], capture: &PathBuf) {
     let mut first = true;
     for _ in 0..3 {
+        // Idle-out between connections so a finished CLI cannot leave this
+        // thread blocked on accept forever (main waits on server.join()).
         let idle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let (mut stream, _) = loop {
             match listener.accept() {
@@ -105,6 +109,7 @@ fn serve_once(listener: TcpListener, response: &[u8], capture: &PathBuf) {
                 Err(_) => return,
             }
         };
+        // Bound each client read so a half-open connection cannot hang serve_once.
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
@@ -138,6 +143,11 @@ fn serve_once(listener: TcpListener, response: &[u8], capture: &PathBuf) {
                 _ => break,
             };
             request.extend_from_slice(&buffer[..read]);
+        }
+        // Read timeout can stop body collection early; never slice past what
+        // actually arrived or the server thread panics and join().unwrap fails.
+        if request.len() < body_end.saturating_add(content_length) {
+            continue;
         }
         if first {
             let _ = fs::write(capture, &request[body_end..body_end + content_length]);
