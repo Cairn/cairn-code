@@ -1,3 +1,4 @@
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -174,28 +175,172 @@ fn now_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
+/// Global opt-in for [`debug_log_request`]. Off by default (H-03): request
+/// URLs, headers, and bodies previously landed on disk unconditionally on
+/// every provider call, with only heuristic secret redaction. Set from
+/// `Config::debug_log_requests` at startup, or via `CAIRN_DEBUG_HTTP=1`.
+static DEBUG_LOGGING_ENABLED: AtomicBool = AtomicBool::new(false);
+static DEBUG_LOG_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static DEBUG_LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Enables or disables writing request metadata for troubleshooting. Call
+/// once at startup from the loaded config; defaults to disabled otherwise.
+pub fn set_debug_logging_enabled(enabled: bool) {
+    // Older versions wrote full URLs, header values, prompts, and source code
+    // to this path. Remove that legacy dump on every startup before an
+    // optional metadata-only replacement can be written.
+    remove_legacy_debug_log(&debug_log_path());
+    DEBUG_LOGGING_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+fn remove_legacy_debug_log(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+fn debug_logging_enabled() -> bool {
+    let env_value = std::env::var("CAIRN_DEBUG_HTTP").ok();
+    debug_logging_enabled_for(
+        DEBUG_LOGGING_ENABLED.load(Ordering::Relaxed),
+        env_value.as_deref(),
+    )
+}
+
+fn debug_logging_enabled_for(config_enabled: bool, env_value: Option<&str>) -> bool {
+    config_enabled
+        || env_value
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
+/// When explicitly enabled, records request *metadata* only - the URL origin
+/// without userinfo or path, header names (never values), and body size - to
+/// `~/.config/cairn-code/debug_request.json`. Header values and body content
+/// (which can contain full prompts, source code, and credentials) are never
+/// written, so there is nothing here for heuristic redaction to miss. The
+/// file is overwritten (not appended) on every request, so it never
+/// accumulates history beyond the most recent call; written atomically with
+/// owner-only permissions where the OS supports it.
 fn debug_log_request(req: &HttpRequest) {
-    let dir = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    let path = std::path::PathBuf::from(dir).join(".config/cairn-code/debug_request.json");
+    if !debug_logging_enabled() {
+        return;
+    }
+    let path = debug_log_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let mut dump = format!("URL: {}\n\nHeaders:\n", req.url);
-    for (k, v) in &req.headers {
-        let val = if crate::redact::is_sensitive_header(k) {
-            "[REDACTED]".to_string()
-        } else {
-            crate::redact::redact_secrets(v)
-        };
-        dump.push_str(&format!("{k}: {val}\n"));
+    let _ = write_atomic_private(&path, &debug_dump_content(req));
+}
+
+fn debug_log_path() -> std::path::PathBuf {
+    let dir = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(dir).join(".config/cairn-code/debug_request.json")
+}
+
+/// Pure formatting for [`debug_log_request`], split out so the "no header
+/// values, no body content" contract is easy to test without touching disk.
+fn debug_dump_content(req: &HttpRequest) -> String {
+    let header_names = req.headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ");
+    let body_bytes = req.body.as_ref().map(|b| b.len()).unwrap_or(0);
+    format!(
+        "timestamp_ms: {}\nurl: {}\nheader_names: {}\nbody_bytes: {}\n",
+        now_millis(),
+        sanitize_debug_url(&req.url),
+        header_names,
+        body_bytes,
+    )
+}
+
+fn sanitize_debug_url(url: &str) -> String {
+    const UNSAFE_URL: &str = "<invalid-or-unsafe-url>";
+
+    let (scheme, remainder) = if url.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://")) {
+        ("http", &url[7..])
+    } else if url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")) {
+        ("https", &url[8..])
+    } else {
+        return UNSAFE_URL.into();
+    };
+    let authority_end = remainder.find(|c| c == '/' || c == '\\' || c == '?' || c == '#')
+        .unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    if authority.matches('@').count() > 1 {
+        return UNSAFE_URL.into();
     }
-    dump.push_str("\nBody:\n");
-    if let Some(body) = &req.body {
-        dump.push_str(&crate::redact::redact_secrets(body));
+    let host = authority.rsplit_once('@').map(|(_, host)| host).unwrap_or(authority);
+
+    if !valid_debug_authority(host) {
+        return UNSAFE_URL.into();
     }
-    let _ = std::fs::write(&path, dump);
+
+    // Paths can contain API keys (for example in a configurable proxy base
+    // URL), so retain only the origin rather than attempting to redact them.
+    format!("{scheme}://{host}/")
+}
+
+fn valid_debug_authority(authority: &str) -> bool {
+    fn valid_port(port: &str) -> bool {
+        !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
+    }
+
+    if let Some(ipv6) = authority.strip_prefix('[') {
+        let Some(bracket) = ipv6.find(']') else { return false; };
+        let address = &ipv6[..bracket];
+        let suffix = &ipv6[bracket + 1..];
+        return address.parse::<std::net::Ipv6Addr>().is_ok()
+            && (suffix.is_empty() || suffix.strip_prefix(':').is_some_and(valid_port));
+    }
+
+    if !authority.is_ascii() || authority.contains(['[', ']', '%']) {
+        return false;
+    }
+    let mut parts = authority.split(':');
+    let hostname = parts.next().unwrap_or_default();
+    let port = parts.next();
+    if parts.next().is_some()
+        || hostname.is_empty()
+        || hostname.len() > 253
+        || !hostname.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+                && label.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+    {
+        return false;
+    }
+    port.map(valid_port).unwrap_or(true)
+}
+
+/// Writes `contents` to `path` via a same-directory temp file + rename, so a
+/// reader never observes a partial write, and restricts the file to
+/// owner-read/write where the OS supports Unix permission bits.
+fn write_atomic_private(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let _guard = DEBUG_LOG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sequence = DEBUG_LOG_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp-{}-{sequence}", std::process::id()));
+
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn curl_command(req: &HttpRequest) -> Command {
@@ -699,5 +844,152 @@ mod tests {
     fn test_transport_error_dns() {
         let msg = format_transport_error("Could not resolve host: api.example.com");
         assert!(msg.to_ascii_lowercase().contains("dns") || msg.to_ascii_lowercase().contains("network"), "{msg}");
+    }
+
+    /// H-03 regression: request logging must be off unless explicitly
+    /// enabled, either via config (`set_debug_logging_enabled`) or the
+    /// `CAIRN_DEBUG_HTTP` escape hatch.
+    #[test]
+    fn debug_logging_disabled_by_default() {
+        assert!(!debug_logging_enabled_for(false, None));
+    }
+
+    #[test]
+    fn debug_logging_enabled_via_config_flag() {
+        assert!(debug_logging_enabled_for(true, None));
+    }
+
+    #[test]
+    fn debug_logging_enabled_via_env_var() {
+        assert!(debug_logging_enabled_for(false, Some("1")));
+        assert!(debug_logging_enabled_for(false, Some("TRUE")));
+        assert!(debug_logging_enabled_for(false, Some("True")));
+        assert!(!debug_logging_enabled_for(false, Some("0")));
+    }
+
+    /// H-03: even when logging is enabled, the dump must never contain
+    /// header values or body content — only metadata — so heuristic secret
+    /// redaction has nothing left to fail to catch.
+    #[test]
+    fn debug_dump_never_contains_header_values_or_body() {
+        let req = HttpRequest {
+            url: "https://user:secret-url-password@api.example.com/v1/messages?api_key=secret-query#secret-fragment".into(),
+            headers: vec![
+                ("Authorization".into(), "Bearer sk-ant-supersecretvalue123456".into()),
+                ("Content-Type".into(), "application/json".into()),
+            ],
+            body: Some(r#"{"prompt":"delete all my files","api_key":"sk-supersecret"}"#.into()),
+        };
+        let dump = debug_dump_content(&req);
+
+        assert!(dump.contains("api.example.com"), "{dump}");
+        assert!(!dump.contains("/v1/messages"), "URL paths are intentionally omitted: {dump}");
+        assert!(!dump.contains("secret-url-password"), "leaked URL userinfo: {dump}");
+        assert!(!dump.contains("secret-query"), "leaked URL query: {dump}");
+        assert!(!dump.contains("secret-fragment"), "leaked URL fragment: {dump}");
+        assert!(dump.contains("Authorization"), "header *names* are metadata: {dump}");
+        assert!(dump.contains("Content-Type"), "{dump}");
+        assert!(!dump.contains("sk-ant-supersecretvalue123456"), "leaked header value: {dump}");
+        assert!(!dump.contains("sk-supersecret"), "leaked body secret: {dump}");
+        assert!(!dump.contains("delete all my files"), "leaked prompt content: {dump}");
+        assert!(dump.contains("body_bytes"), "{dump}");
+    }
+
+    #[test]
+    fn sanitize_debug_url_handles_urls_without_credentials() {
+        assert_eq!(
+            sanitize_debug_url("https://api.example.com/v1/messages?debug=true#response"),
+            "https://api.example.com/"
+        );
+        assert_eq!(sanitize_debug_url("not-a-url?secret=value"), "<invalid-or-unsafe-url>");
+    }
+
+    #[test]
+    fn sanitize_debug_url_never_preserves_paths_or_malformed_input() {
+        for (url, expected) in [
+            ("https://proxy.example/tokens/sk-live", "https://proxy.example/"),
+            ("https://user:pw@[2001:db8::1]:11434/path?x#y", "https://[2001:db8::1]:11434/"),
+            ("HTTPS://USER:PW@example.com\\secret", "https://example.com/"),
+            ("mailto:user:secret@example.com", "<invalid-or-unsafe-url>"),
+            ("//user:secret@example.com/path", "<invalid-or-unsafe-url>"),
+            ("https://[invalid/path", "<invalid-or-unsafe-url>"),
+            ("https://api.example.com:secret/path", "<invalid-or-unsafe-url>"),
+            ("https://[secret]/path", "<invalid-or-unsafe-url>"),
+            ("https://user@extra@example.com/path", "<invalid-or-unsafe-url>"),
+            ("https://api.example.com:65536/path", "<invalid-or-unsafe-url>"),
+            ("https://api.example.com\u{2028}secret/path", "<invalid-or-unsafe-url>"),
+            ("💥https://secret.example/path", "<invalid-or-unsafe-url>"),
+        ] {
+            assert_eq!(sanitize_debug_url(url), expected, "input: {url}");
+        }
+    }
+
+    #[test]
+    fn initialization_removes_legacy_full_request_dump() {
+        let dir = std::env::temp_dir().join(format!(
+            "cairn-http-legacy-test-{}-{}",
+            std::process::id(),
+            DEBUG_LOG_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("debug_request.json");
+        std::fs::write(&path, "Body:\nsecret prompt and API key").unwrap();
+
+        remove_legacy_debug_log(&path);
+
+        assert!(!path.exists(), "legacy secret-bearing debug log must be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_private_is_atomic_and_owner_only() {
+        let dir = std::env::temp_dir().join(format!("cairn-http-client-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("debug_request.json");
+
+        write_atomic_private(&path, "first").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+
+        write_atomic_private(&path, "second").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "second",
+            "second write should fully replace the first, not append or corrupt it"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "debug log must be owner-read/write only, got {mode:o}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_debug_writes_publish_only_complete_documents() {
+        let dir = std::env::temp_dir().join(format!(
+            "cairn-http-concurrent-test-{}-{}",
+            std::process::id(),
+            DEBUG_LOG_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = std::sync::Arc::new(dir.join("debug_request.json"));
+        let documents: Vec<String> = (0..8)
+            .map(|i| format!("document-{i}:{}", "x".repeat(4096)))
+            .collect();
+
+        let writers: Vec<_> = documents.iter().cloned().map(|document| {
+            let path = path.clone();
+            std::thread::spawn(move || write_atomic_private(&path, &document).unwrap())
+        }).collect();
+        for writer in writers {
+            writer.join().unwrap();
+            let observed = std::fs::read_to_string(path.as_ref()).unwrap();
+            assert!(documents.contains(&observed), "observed a partial debug document");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

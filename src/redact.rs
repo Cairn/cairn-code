@@ -23,6 +23,7 @@ pub fn redact_secrets(input: &str) -> String {
 }
 
 /// True when a header name is expected to carry credentials.
+#[allow(dead_code)]
 pub fn is_sensitive_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower == "authorization"
