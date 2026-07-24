@@ -47,6 +47,27 @@ enum State {
 
 // Same frames as charmbracelet MiniDot (Grok Build / zero).
 const SPINNER_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+// Claude Code / OpenClaude-style loading verbs (subset of their spinner verb list).
+const SPINNER_VERBS: &[&str] = &[
+    "Thinking",
+    "Brewing",
+    "Composing",
+    "Crafting",
+    "Crunching",
+    "Deciphering",
+    "Exploring",
+    "Figuring",
+    "Forging",
+    "Generating",
+    "Mulling",
+    "Noodling",
+    "Pondering",
+    "Reasoning",
+    "Sculpting",
+    "Synthesizing",
+    "Unraveling",
+    "Working",
+];
 // MiniDot FPS is time.Second/12 (~83ms). Faster ticks look like flicker; slower feels sticky.
 const SPINNER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 12);
 // Cap full-frame redraws while the agent runs. Zero coalesces stream text to ~16ms
@@ -60,6 +81,8 @@ pub struct Tui {
     history: Vec<String>,
     hist_idx: usize,
     spinner_idx: usize,
+    /// Index into SPINNER_VERBS for the current agent turn (Claude Code-style).
+    spinner_verb_idx: usize,
     streaming_text: String,
     stream_thinking: String,
     state: State,
@@ -166,6 +189,7 @@ impl Tui {
             history: Vec::new(),
             hist_idx: 0,
             spinner_idx: 0,
+            spinner_verb_idx: 0,
             streaming_text: String::new(),
             stream_thinking: String::new(),
             state: State::Idle,
@@ -267,6 +291,17 @@ impl Tui {
             .iter()
             .position(|t| t.name == self.theme.name)
             .unwrap_or(0);
+    }
+
+    fn begin_running(&mut self) {
+        self.state = State::Running;
+        // New verb each turn (Claude Code / OpenClaude spinner style).
+        let seed = self
+            .spinner_idx
+            .wrapping_add(self.total_usage.input_tokens as usize)
+            .wrapping_add(self.output_lines.len())
+            .wrapping_add(1);
+        self.spinner_verb_idx = seed % SPINNER_VERBS.len();
     }
 
     pub fn set_show_thinking(&mut self, show: bool) {
@@ -1346,7 +1381,7 @@ impl Tui {
                     tool_name: String::new(),
                     duration: String::new(),
                 });
-                self.state = State::Running;
+                self.begin_running();
                 if let Some(tx) = &self.agent_tx {
                     let _ = tx.send(input);
                 }
@@ -1727,15 +1762,19 @@ impl Tui {
                     }
                     "logout" => {
                         let provider = parts.get(2).copied().unwrap_or("xai").to_ascii_lowercase();
-                        if let Some(tx) = &self.agent_tx {
-                            self.state = State::Running;
-                            let _ = tx.send(format!("__auth_logout__:{provider}"));
+                        if self.agent_tx.is_some() {
+                            self.begin_running();
+                            if let Some(tx) = &self.agent_tx {
+                                let _ = tx.send(format!("__auth_logout__:{provider}"));
+                            }
                         }
                     }
                     "status" | _ => {
-                        if let Some(tx) = &self.agent_tx {
-                            self.state = State::Running;
-                            let _ = tx.send("__auth_status__".into());
+                        if self.agent_tx.is_some() {
+                            self.begin_running();
+                            if let Some(tx) = &self.agent_tx {
+                                let _ = tx.send("__auth_status__".into());
+                            }
                         }
                     }
                 }
@@ -1770,9 +1809,11 @@ impl Tui {
                         tool_name: String::new(),
                         duration: String::new(),
                     });
-                } else if let Some(tx) = &self.agent_tx {
-                    self.state = State::Running;
-                    let _ = tx.send("__compact__".into());
+                } else if self.agent_tx.is_some() {
+                    self.begin_running();
+                    if let Some(tx) = &self.agent_tx {
+                        let _ = tx.send("__compact__".into());
+                    }
                 }
             }
             "/save" => {
@@ -2114,7 +2155,7 @@ impl Tui {
             });
             return;
         }
-        let Some(tx) = &self.agent_tx else {
+        if self.agent_tx.is_none() {
             self.output_lines.push(OutputLine {
                 type_: "error".into(),
                 content: "Agent channel not ready; cannot start OAuth.".into(),
@@ -2122,19 +2163,21 @@ impl Tui {
                 duration: String::new(),
             });
             return;
-        };
+        }
         if let Some(flag) = &self.cancel_flag {
             flag.store(false, Ordering::Relaxed);
         }
         self.pending_model_after_auth = then_model_picker;
-        self.state = State::Running;
+        self.begin_running();
         self.output_lines.push(OutputLine {
             type_: "system".into(),
             content: "Starting xAI browser OAuth (device code)… A browser window should open. Approve the code shown next, or open the URL manually.".into(),
             tool_name: String::new(),
             duration: String::new(),
         });
-        let _ = tx.send(format!("__auth_login__:{provider}"));
+        if let Some(tx) = &self.agent_tx {
+            let _ = tx.send(format!("__auth_login__:{provider}"));
+        }
     }
 
     /// Finish provider/model selection and synchronize the Agent.
@@ -2561,67 +2604,25 @@ impl Tui {
 
         let mut lines: Vec<Line> = Vec::new();
 
-        // Banner
-        let w = area.width.saturating_sub(2) as usize;
-        let pw = w.min(58);
-        let pad = |s: &str| {
-            let dw = display_width(s);
-            if dw < pw {
-                format!("{}{}", s, " ".repeat(pw - dw))
-            } else {
-                let mut out = String::with_capacity(pw);
-                let mut w_used = 0;
-                for c in s.chars() {
-                    let cw = char_width(c);
-                    if w_used + cw > pw {
-                        break;
-                    }
-                    out.push(c);
-                    w_used += cw;
-                }
-                if w_used < pw {
-                    out.push_str(&" ".repeat(pw - w_used));
-                }
-                out
-            }
-        };
-        let sp = " ".repeat((area.width as usize).saturating_sub(pw + 4));
-
-        lines.push(Line::from(Span::styled(
-            format!("╭{}╮", "─".repeat(pw)),
-            dim,
-        )));
+        // Welcome header (Claude Code / OpenClaude style: minimal, no heavy box).
         lines.push(Line::from(vec![
-            Span::styled("│", dim),
-            Span::styled(pad(&format!("  ⚡ Cairn Code v{}", self.version)), bright),
-            Span::styled(format!("│{sp}"), dim),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("│", dim),
-            Span::styled(pad("  open terminal coding agent"), dim),
-            Span::styled(format!("│{sp}"), dim),
+            Span::styled("Cairn Code", bright.add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" v{}", self.version), dim),
         ]));
         lines.push(Line::from(Span::styled(
-            format!("├{}┤", "─".repeat(pw)),
+            "open terminal coding agent  ·  /help for commands",
             dim,
         )));
+        lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("│", dim),
-            Span::styled(
-                pad(&format!("  Model   {} / {}", self.provider, self.model)),
-                dim,
-            ),
-            Span::styled(format!("│{sp}"), dim),
+            Span::styled("  cwd   ", bold_dim),
+            Span::styled(self.work_dir.as_str(), dim),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("│", dim),
-            Span::styled(pad(&format!("  Path    {}", self.work_dir)), dim),
-            Span::styled(format!("│{sp}"), dim),
+            Span::styled("  model ", bold_dim),
+            Span::styled(format!("{}/{}", self.provider, self.model), dim),
         ]));
-        lines.push(Line::from(Span::styled(
-            format!("╰{}╯", "─".repeat(pw)),
-            dim,
-        )));
+        lines.push(Line::from(""));
 
         // Output
         for line in &self.output_lines {
@@ -2738,26 +2739,17 @@ impl Tui {
         }
         // Spinner while waiting / thinking without answer text. Skip when full
         // thinking body is already on screen (show_thinking on).
+        // OpenClaude-style: glyph + rotating verb + ellipsis.
         let show_spin = matches!(self.state, State::Running)
             && self.streaming_text.is_empty()
             && !(self.show_thinking && !self.stream_thinking.is_empty());
         if show_spin {
             let spin = SPINNER_CHARS[self.spinner_idx % SPINNER_CHARS.len()];
+            let verb = SPINNER_VERBS[self.spinner_verb_idx % SPINNER_VERBS.len()];
             lines.push(Line::from(vec![
                 Span::styled(spin, orange),
-                Span::styled(" Thinking…", dim),
+                Span::styled(format!(" {verb}…"), dim),
             ]));
-        }
-
-        // Usage
-        if self.total_usage.input_tokens > 0 {
-            lines.push(Line::from(vec![Span::styled(
-                format!(
-                    "\nTokens: {} in, {} out  •  {}",
-                    self.total_usage.input_tokens, self.total_usage.output_tokens, self.model
-                ),
-                dim,
-            )]));
         }
 
         // Composer / pickers live in a fixed bottom chrome region so typing never
@@ -3121,6 +3113,54 @@ impl Tui {
                 }
                 chrome.push(Line::from(spans));
                 cursor_pos = Some((display_width("❯ ") as u16 + display_width(before) as u16, 0));
+            }
+
+            // Claude Code / OpenClaude-style status row under the prompt.
+            // Shown when the normal composer is active (not pickers/dialogs).
+            if !self.show_command_picker
+                && !self.show_session_picker
+                && !self.show_model_picker
+                && !self.show_provider_picker
+                && !self.show_theme_picker
+                && self.confirm_remove_provider.is_none()
+                && self.confirm_history_provider.is_none()
+            {
+                chrome.push(Line::from(""));
+                let mut status = Vec::new();
+                status.push(Span::styled(
+                    format!("{}/{}", self.provider, self.model),
+                    dim,
+                ));
+                // Shorten home-ish paths for the footer.
+                let path = self.work_dir.as_str();
+                let short_path = path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(path);
+                status.push(Span::styled(" · ", bold_dim));
+                status.push(Span::styled(short_path, dim));
+                if self.total_usage.input_tokens > 0 || self.total_usage.output_tokens > 0 {
+                    let est = crate::cost::estimate_cost(&self.model, &self.total_usage);
+                    let cost_str = crate::cost::format_cost(est);
+                    status.push(Span::styled(" · ", bold_dim));
+                    status.push(Span::styled(
+                        format!(
+                            "{}↓ {}↑",
+                            self.total_usage.input_tokens, self.total_usage.output_tokens
+                        ),
+                        dim,
+                    ));
+                    if est > 0.0 {
+                        status.push(Span::styled(" · ", bold_dim));
+                        status.push(Span::styled(cost_str, dim));
+                    }
+                }
+                if matches!(self.state, State::Idle) && self.input_buf.is_empty() {
+                    status.push(Span::styled(" · ", bold_dim));
+                    status.push(Span::styled("? for shortcuts", bold_dim));
+                }
+                chrome.push(Line::from(status));
             }
         }
 
