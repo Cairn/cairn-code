@@ -273,8 +273,21 @@ fn resolve_workspace_prompt(workspace: &Path, prompt: &str) -> Option<PathBuf> {
     (candidate.is_file() && candidate.starts_with(&workspace)).then_some(candidate)
 }
 
+#[cfg(not(test))]
 fn keyring_entry(provider: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new("cairn-code", provider).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+fn keyring_entry(provider: &str) -> Result<keyring_core::Entry, String> {
+    use std::sync::OnceLock;
+
+    static MOCK_KEYRING: OnceLock<()> = OnceLock::new();
+    MOCK_KEYRING.get_or_init(|| {
+        let store = keyring_core::mock::Store::new().expect("create mock keyring store");
+        keyring_core::set_default_store(store);
+    });
+    keyring_core::Entry::new("cairn-code", provider).map_err(|e| e.to_string())
 }
 
 fn keyring_set(provider: &str, key: &str) -> Result<(), String> {
@@ -1173,6 +1186,8 @@ mod tests {
 
     #[test]
     fn test_apply_key_to_env_and_mask() {
+        let _lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _env = crate::test_support::EnvGuard::capture("OPENAI_API_KEY");
         apply_key_to_env("openai", "sk-test-apply-env-key");
         assert_eq!(
             std::env::var("OPENAI_API_KEY").ok().as_deref(),
@@ -1195,14 +1210,8 @@ mod tests {
 
     #[test]
     fn test_keyring_set_get_delete_roundtrip() {
-        // Distinctly-named test provider so this can never collide with a
-        // real stored credential.
         let provider = "cairn-code-test-provider-roundtrip";
-        // CI runners often have no secret-service / keychain backend.
-        if keyring_set(provider, "sk-roundtrip-test").is_err() {
-            eprintln!("skipping keyring roundtrip: no usable OS keyring backend");
-            return;
-        }
+        keyring_set(provider, "sk-roundtrip-test").unwrap();
         assert_eq!(keyring_get(provider), Some("sk-roundtrip-test".to_string()));
         assert_eq!(keyring_delete(provider), Ok(true));
         assert_eq!(keyring_get(provider), None);
@@ -1213,20 +1222,11 @@ mod tests {
     #[test]
     fn test_migrate_plaintext_keys_moves_to_keyring_and_strips_file() {
         let provider = "cairn-code-test-provider-migrate";
-        let tmp = std::env::temp_dir().join(format!("cairn-test-migrate-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let cfg_path = tmp.join("config.json");
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.json");
         std::fs::write(&cfg_path, format!(
             r#"{{"default_provider":"openrouter","default_model":"m","api_keys":{{"{provider}":"sk-migrate-test"}}}}"#
         )).unwrap();
-
-        // Probe keyring first so headless CI without a backend does not fail.
-        if keyring_set(provider, "probe").is_err() {
-            eprintln!("skipping keyring migration test: no usable OS keyring backend");
-            let _ = std::fs::remove_file(&cfg_path);
-            return;
-        }
-        let _ = keyring_delete(provider);
 
         migrate_plaintext_keys_in_file(&cfg_path);
 
@@ -1246,6 +1246,5 @@ mod tests {
         );
 
         let _ = keyring_delete(provider);
-        let _ = std::fs::remove_file(&cfg_path);
     }
 }

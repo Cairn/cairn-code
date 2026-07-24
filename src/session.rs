@@ -407,9 +407,9 @@ mod tests {
     #[test]
     fn test_save_and_list_and_load() {
         let test_id = format!("test-{}", new_id());
-        let dir = std::env::temp_dir().join("cairn-test-session");
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let dir_str = dir.to_string_lossy().to_string();
-        fs::create_dir_all(&dir).unwrap();
 
         let msgs = vec![
             Message {
@@ -445,9 +445,6 @@ mod tests {
         assert_eq!(loaded.model, "claude-sonnet-4");
         assert_eq!(loaded.tokens_in, 10);
         assert_eq!(loaded.tokens_out, 20);
-
-        // Cleanup
-        let _ = fs::remove_file(dir.join(&test_id));
     }
 
     #[test]

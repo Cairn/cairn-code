@@ -57,6 +57,7 @@ mod tests {
 
     #[test]
     fn missing_key_errors() {
+        let _lock = crate::test_support::ENV_LOCK.lock().unwrap();
         // Clear process-level key for this check without relying on env state.
         let p = OpenAIProvider::new();
         // Only assert empty when env/keyring have no openai key — if they do, skip.

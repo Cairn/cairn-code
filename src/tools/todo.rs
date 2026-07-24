@@ -1,8 +1,15 @@
 use super::registry::Tool;
-use std::fs;
-use std::path::PathBuf;
+use super::workspace::{self, Workspace};
 
-pub struct TodoTool;
+pub struct TodoTool {
+    workspace: Workspace,
+}
+
+impl TodoTool {
+    pub fn new(workspace: Workspace) -> Self {
+        Self { workspace }
+    }
+}
 
 impl Tool for TodoTool {
     fn name(&self) -> &str {
@@ -27,13 +34,14 @@ impl Tool for TodoTool {
             .and_then(|v| v.as_array())
             .ok_or("todos required")?;
 
-        let path = PathBuf::from(".cairn/todos.json");
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
-        }
-
         let pretty = crate::json::serialize(&val);
-        fs::write(&path, &pretty).map_err(|e| format!("write: {e}"))?;
+        let path = self
+            .workspace
+            .relative_path(".cairn/todos.json")?
+            .to_string_lossy()
+            .into_owned();
+        let target = workspace::acquire_in(&self.workspace, &path, true, false)?;
+        workspace::atomic_replace(&target, &pretty)?;
         Ok(format!(
             "Saved {} todo item(s) to .cairn/todos.json",
             todos.len()
@@ -44,14 +52,12 @@ impl Tool for TodoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn writes_todos_file() {
-        // TodoTool always writes relative `.cairn/todos.json` under the process
-        // cwd. Use a unique nested path check by running from a temp workspace
-        // only after snapshotting and carefully restoring cwd (serialized step).
-        // Prefer not racing other tests: write then verify under cwd, then clean up.
-        let tool = TodoTool;
+        let root = tempfile::tempdir().unwrap();
+        let tool = TodoTool::new(Workspace::new(root.path()).unwrap());
         let marker = format!(
             "ship-it-{}",
             std::time::SystemTime::now()
@@ -64,14 +70,15 @@ mod tests {
         );
         let out = tool.execute(&input).unwrap();
         assert!(out.contains("1 todo"), "{out}");
-        let raw = fs::read_to_string(".cairn/todos.json").unwrap();
+        let raw = fs::read_to_string(root.path().join(".cairn/todos.json")).unwrap();
         assert!(raw.contains(&marker), "{raw}");
-        // Leave the file; later runs overwrite. Avoid set_current_dir (races workspace tests).
     }
 
     #[test]
     fn requires_todos_array() {
-        assert!(TodoTool.execute("{}").is_err());
-        assert!(TodoTool.execute(r#"{"todos":"nope"}"#).is_err());
+        let root = tempfile::tempdir().unwrap();
+        let tool = TodoTool::new(Workspace::new(root.path()).unwrap());
+        assert!(tool.execute("{}").is_err());
+        assert!(tool.execute(r#"{"todos":"nope"}"#).is_err());
     }
 }

@@ -156,6 +156,15 @@ pub struct Target {
 /// that exact handle without following directory or final-component symlinks.
 pub fn acquire(path: &str, create_parents: bool, require_existing: bool) -> Result<Target, String> {
     let workspace = Workspace::current()?;
+    acquire_in(&workspace, path, create_parents, require_existing)
+}
+
+pub fn acquire_in(
+    workspace: &Workspace,
+    path: &str,
+    create_parents: bool,
+    require_existing: bool,
+) -> Result<Target, String> {
     let relative = workspace.relative_path(path)?;
     if relative.as_os_str().is_empty() {
         return Err(format!(
